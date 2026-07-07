@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Test / coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+
+# Environment / secrets
+.env
+
+# Per-run telemetry output
+telemetry/
+
+# OS
+.DS_Store
