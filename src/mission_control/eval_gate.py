@@ -164,6 +164,67 @@ def run_gate(
     )
 
 
+def gate_result(
+    *,
+    baseline: str = "golden/baseline.json",
+    tasks: str = "golden/tasks",
+    sandbox: str = "golden/sandbox",
+    k: float | None = None,
+    n: int = 1,
+    demo: bool = False,
+    worker_model: str | None = None,
+    judge_model: str | None = None,
+    out_dir: str = "evals",
+) -> GateResult:
+    """Single-sourced gate contract used by the CLI, the MCP server, and tests.
+
+    ``demo`` selects the deterministic StubWorker + no judge (offline); otherwise
+    the live SdkWorker + Opus judge.
+    """
+    if demo:
+        worker, judge = StubWorker(), None
+    else:
+        worker = SdkWorker(model=worker_model) if worker_model else SdkWorker()
+        judge = LlmJudge(model=judge_model) if judge_model else LlmJudge()
+    task_files = sorted(Path(tasks).glob("*.yaml"))
+    return run_gate(
+        baseline_path=Path(baseline),
+        tasks=task_files,
+        sandbox_src=Path(sandbox),
+        worker=worker,
+        judge=judge,
+        k=k,
+        n=n,
+        out_dir=Path(out_dir),
+    )
+
+
+def call_eval_gate_over_mcp(server_cmd: list[str] | None = None, **params) -> dict:
+    """Invoke the eval-gate tool over MCP (spawns the stdio server) and return its
+    JSON result — the framework-portable path the worker uses instead of a
+    hardcoded call. Result dict is identical to ``GateResult.to_json()``.
+    """
+    import asyncio
+
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    cmd = server_cmd or [sys.executable, "-m", "mission_control.eval_gate_mcp"]
+
+    async def _run() -> dict:
+        sp = StdioServerParameters(command=cmd[0], args=cmd[1:])
+        async with stdio_client(sp) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                res = await session.call_tool("eval_gate", params)
+                sc = res.structuredContent
+                if isinstance(sc, dict):
+                    return sc.get("result", sc)  # FastMCP may wrap under "result"
+                return json.loads(res.content[0].text)
+
+    return asyncio.run(_run())
+
+
 def _resolve_k(cli_k: float | None) -> float | None:
     if cli_k is not None:
         return cli_k
@@ -199,22 +260,16 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = p.parse_args(argv)
 
-    if args.demo:
-        worker, judge = StubWorker(), None  # offline, reproducible
-    else:
-        worker = SdkWorker(model=args.worker_model) if args.worker_model else SdkWorker()
-        judge = LlmJudge(model=args.judge_model) if args.judge_model else LlmJudge()
-    tasks = sorted(Path(args.tasks).glob("*.yaml"))
-
-    result = run_gate(
-        baseline_path=Path(args.baseline),
-        tasks=tasks,
-        sandbox_src=Path(args.sandbox),
-        worker=worker,
-        judge=judge,
+    result = gate_result(
+        baseline=args.baseline,
+        tasks=args.tasks,
+        sandbox=args.sandbox,
         k=_resolve_k(args.k),
         n=_resolve_n(args.n),
-        out_dir=Path(args.out_dir),
+        demo=args.demo,
+        worker_model=args.worker_model,
+        judge_model=args.judge_model,
+        out_dir=args.out_dir,
     )
 
     print(result.human_report())

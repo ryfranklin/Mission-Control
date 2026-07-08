@@ -40,3 +40,6 @@ evals/
 
 # CI demo run output
 ci/demo/out/
+
+# DuckDB analytics rollup output
+analytics/

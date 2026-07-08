@@ -1,0 +1,24 @@
+# Postgres for LangGraph durable state (the PostgresSaver checkpointer lands in L2).
+# `docker compose up` works standalone via the ${VAR:-default} fallbacks; a local
+# .env (see .env.example) overrides them.
+services:
+  postgres:
+    image: postgres:16.8-alpine        # pinned
+    container_name: mc-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mc}
+      POSTGRES_DB: ${POSTGRES_DB:-mission_control}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - mc_pgdata:/var/lib/postgresql/data   # named volume — state survives restarts
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mc} -d ${POSTGRES_DB:-mission_control}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  mc_pgdata:
