@@ -53,3 +53,39 @@ from flapping:
 **Re-baseline** (`python -m mission_control.baseline [N]`) whenever the
 worker/judge model, the golden set, or the sandbox changes — a stale band makes
 the gate meaningless.
+
+## Over MCP (portable tool)
+
+The same gate is exposed as an MCP server so it isn't framework-locked — any MCP
+client (this repo's worker, or another agent/IDE) can invoke it over the protocol
+and read the identical `exit_code` / `passed` contract.
+
+Run the server (stdio transport):
+
+```sh
+python -m mission_control.eval_gate_mcp
+```
+
+Point another agent/IDE at it (MCP stdio config):
+
+```json
+{
+  "mcpServers": {
+    "mission-control-eval-gate": {
+      "command": "python",
+      "args": ["-m", "mission_control.eval_gate_mcp"]
+    }
+  }
+}
+```
+
+The client then calls the `eval_gate` tool (same params as the CLI flags:
+`baseline`, `tasks`, `sandbox`, `k`, `n`, `demo`, `worker_model`, `judge_model`)
+and gets back the gate JSON — `exit_code` 0 = pass, nonzero = regression. The
+contract survives the MCP round-trip unchanged.
+
+This repo consumes it two ways:
+- **Programmatically** — `call_eval_gate_over_mcp(**params)` spawns the server and
+  returns the same dict as a direct call (used instead of a hardcoded gate call).
+- **From the Controller** — `SdkWorker(eval_gate_mcp=True)` wires the stdio server
+  into the worker's `mcp_servers`, so the agent can call `eval_gate` as a tool.

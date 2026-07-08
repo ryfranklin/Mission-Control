@@ -22,6 +22,7 @@ Two load-bearing rules from the build spec:
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 from time import perf_counter
 
@@ -62,9 +63,24 @@ class SdkWorker:
         self,
         model: str = DEFAULT_MODEL,
         max_turns: int = DEFAULT_MAX_TURNS,
+        eval_gate_mcp: bool = False,
     ) -> None:
         self.model = model
         self.max_turns = max_turns
+        # Opt-in: expose the eval-gate to the Controller as a portable MCP tool
+        # (consumed over MCP, not hardcoded). Off by default → behavior unchanged.
+        self.eval_gate_mcp = eval_gate_mcp
+
+    def _mcp_servers(self) -> dict:
+        if not self.eval_gate_mcp:
+            return {}
+        return {
+            "evalgate": {
+                "type": "stdio",
+                "command": sys.executable,
+                "args": ["-m", "mission_control.eval_gate_mcp"],
+            }
+        }
 
     # -- Worker interface --------------------------------------------------
 
@@ -98,6 +114,8 @@ class SdkWorker:
             # hard-blocks mutating tools.
             permission_mode="bypassPermissions",
             disallowed_tools=list(_MUTATING_TOOLS) if read_only else [],
+            # Portable tool: the Controller can call the eval-gate over MCP.
+            mcp_servers=self._mcp_servers(),
         )
 
     async def _investigate(self, task: Task, workdir: Path) -> WorkerResult:
