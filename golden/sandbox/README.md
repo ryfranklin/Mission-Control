@@ -1,12 +1,15 @@
-# calc — golden-set sandbox target
+# toolbox — golden-set sandbox target
 
-A tiny arithmetic library used as the **target repo** for Phase 2 eval tasks.
-Workers run against a fresh checkout of this tree in an isolated worktree.
+**toolbox** is a small utility library used as the target repo for the eval
+tasks. Workers run against a fresh checkout of this tree in an isolated worktree.
 
-- `add(a, b)` — correct, covered by `tests/test_calc.py` (green).
-- `multiply(a, b)` — **intentional bug** (returns `a + b`), covered by
-  `tests/test_multiply.py` (**failing at baseline**).
+## Modules
+- `calc.py` — arithmetic: `add` (correct), `multiply` (**intentional bug**: returns `a + b`).
+- `strings.py` — `shout`, `reverse` (both correct).
+- `inventory.py` — `total_price`, `cheapest` (both correct).
 
-Baseline test state: **2 passing, 1 failing** (the `multiply` bug). This red
-baseline is deliberate — it lets golden tasks assert both `goes_green` (fix the
-bug) and `stays_green` (don't regress the passing tests).
+## Tests
+`tests/` holds the suite. Baseline state: **6 passing, 1 failing** — the single
+failing test is `tests/test_multiply.py`, pinned to the `multiply` bug. That red
+baseline is deliberate: it lets a task assert `goes_green` (fix the bug) while
+others assert `stays_green` (don't regress the passing tests).

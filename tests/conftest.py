@@ -29,3 +29,32 @@ def target_repo(tmp_path: Path) -> Path:
     _run(repo, "add", "-A")
     _run(repo, "commit", "-m", "init")
     return repo
+
+
+class FakeJudge:
+    """Offline stand-in for LlmJudge — canned score + priced (Opus) usage, no LLM."""
+
+    model = "claude-opus-4-8"
+
+    def score(self, *, task_prompt, worker_output, rubric):
+        from mission_control.judge import JudgeResult
+        from mission_control.telemetry import StepUsage
+
+        return JudgeResult(
+            score=0.8,
+            rationale="fake judge",
+            usage=StepUsage(
+                model="claude-opus-4-8",
+                input_tokens=100,
+                output_tokens=50,
+                cache_read_tokens=0,
+                cache_creation_tokens=0,
+                latency_ms=10,
+            ),
+            per_criterion=[],
+        )
+
+
+@pytest.fixture
+def fake_judge() -> FakeJudge:
+    return FakeJudge()

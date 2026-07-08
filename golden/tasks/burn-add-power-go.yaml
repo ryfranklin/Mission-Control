@@ -1,0 +1,27 @@
+id: burn-add-power-go
+task_type: burn
+greenfield: false
+approval: go
+prompt: |
+  Add a power(base, exp) function to calc.py that returns base raised to exp.
+  Keep it consistent with the existing style; do not change unrelated code.
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: true
+    decision: go
+    no_changes: false
+    files_touched:
+      - "calc.py"
+    files_unchanged:
+      - "tests/**"
+    tests: stays_green
+    output_contains:
+      - "power"
+    output_absent: []
+  judge_rubric:
+    - criterion: "power(base, exp) correctly returns base ** exp."
+      weight: 2
+    - criterion: "No unrelated changes (multiply was not also 'fixed', nothing refactored)."
+      weight: 1

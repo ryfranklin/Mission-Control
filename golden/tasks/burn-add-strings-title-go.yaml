@@ -1,0 +1,30 @@
+id: burn-add-strings-title-go
+task_type: burn
+greenfield: false
+approval: go
+prompt: |
+  Add a title(s) function to strings.py that returns s in title case (each word
+  capitalized). Match the existing style; do not change unrelated code.
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: true
+    decision: go
+    no_changes: false
+    files_touched:
+      - "strings.py"
+    files_unchanged:
+      - "tests/**"
+      - "calc.py"
+    tests: stays_green
+    output_contains:
+      - "title"
+    output_absent: []
+  judge_rubric:
+    - criterion: >
+        title(s) returns title-cased text (e.g. "hello world" -> "Hello World"),
+        a reasonable implementation.
+      weight: 2
+    - criterion: "Only strings.py was changed; no unrelated edits."
+      weight: 1

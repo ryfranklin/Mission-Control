@@ -63,7 +63,13 @@ class AssertResult:
 
 @dataclass
 class EvalResult:
-    """Per-task scores + captured telemetry (worker AND judge)."""
+    """Per-task scores + captured telemetry (worker AND judge).
+
+    ``cost_usd`` is TOTAL spend = ``cost_worker + cost_judge`` — the axis the
+    regression check gates on (the Opus judge runs ~4x the worker, so leaving it
+    out of the band hid most of the eval's spend). The two halves stay visible as
+    ``cost_worker`` / ``cost_judge``.
+    """
 
     task_id: str
     task_type: str
@@ -75,13 +81,14 @@ class EvalResult:
     # Documented blend of the two (see QUALITY_*_WEIGHT); == quality_deterministic
     # when there is no rubric.
     quality_total: float
-    # Worker (Phase 1) telemetry:
+    # TOTAL spend = cost_worker + cost_judge — the GATED cost axis.
     cost_usd: float
-    total_tokens: int
-    latency_ms: int
-    # Judge telemetry — kept SEPARATE so the judge's cost is always visible:
+    total_tokens: int  # worker tokens
+    latency_ms: int  # worker latency
+    # Cost breakdown (both folded into cost_usd, kept visible):
+    cost_worker: float = 0.0
+    cost_judge: float = 0.0
     judge_model: str | None = None
-    judge_cost_usd: float = 0.0
     judge_tokens: int = 0
 
 
@@ -105,9 +112,10 @@ class EvalRun:
             "mean_quality_deterministic": _mean(r.quality_deterministic for r in self.results),
             "mean_quality_judge": _mean(r.quality_judge for r in judged),
             "mean_quality_total": _mean(r.quality_total for r in self.results),
-            # Worker vs judge cost, kept separate so the judge's spend is visible.
+            # cost_usd is TOTAL (worker + judge) — the gated axis; breakdown kept visible.
             "cost_usd": round(sum(r.cost_usd for r in self.results), 6),
-            "judge_cost_usd": round(sum(r.judge_cost_usd for r in self.results), 6),
+            "cost_worker": round(sum(r.cost_worker for r in self.results), 6),
+            "cost_judge": round(sum(r.cost_judge for r in self.results), 6),
             "total_tokens": sum(r.total_tokens for r in self.results),
             "judge_tokens": sum(r.judge_tokens for r in self.results),
             "latency_ms": sum(r.latency_ms for r in self.results),
@@ -120,8 +128,8 @@ class EvalRun:
             f"asserts {s['asserts_passed']}✓/{s['asserts_failed']}✗, "
             f"quality det={s['mean_quality_deterministic']:.2f} "
             f"judge={s['mean_quality_judge']:.2f} total={s['mean_quality_total']:.2f}, "
-            f"cost worker=${s['cost_usd']:.6f} judge=${s['judge_cost_usd']:.6f} "
-            f"→ {self.path.name}"
+            f"cost total=${s['cost_usd']:.6f} (worker=${s['cost_worker']:.6f} "
+            f"judge=${s['cost_judge']:.6f}) → {self.path.name}"
         )
 
 
@@ -377,6 +385,7 @@ def evaluate_task(
             "per_criterion": verdict.per_criterion,
         }
 
+    cost_worker = summary["cost_usd"]
     result = EvalResult(
         task_id=spec["id"],
         task_type=spec["task_type"],
@@ -385,11 +394,13 @@ def evaluate_task(
         quality_deterministic=quality_det,
         quality_judge=quality_judge,
         quality_total=quality_total,
-        cost_usd=summary["cost_usd"],
+        # Gate on TOTAL spend = worker + judge.
+        cost_usd=round(cost_worker + judge_cost, 8),
         total_tokens=total_tokens,
         latency_ms=summary["latency_ms"],
+        cost_worker=cost_worker,
+        cost_judge=judge_cost,
         judge_model=judge_model,
-        judge_cost_usd=judge_cost,
         judge_tokens=judge_tokens,
     )
     return result, checks, judge_info
@@ -426,13 +437,18 @@ def run_eval(
         for i, task_path in enumerate(task_paths):
             spec = load_spec(Path(task_path))
             work_dir = out_dir / "work" / f"{stamp}-{i}-{spec['id']}"
-            result, checks, judge_info = evaluate_task(
-                spec,
-                worker=worker,
-                sandbox_src=Path(sandbox_src),
-                work_dir=work_dir,
-                judge=judge,
-            )
+            try:
+                result, checks, judge_info = evaluate_task(
+                    spec,
+                    worker=worker,
+                    sandbox_src=Path(sandbox_src),
+                    work_dir=work_dir,
+                    judge=judge,
+                )
+            except Exception as e:  # noqa: BLE001 — one flaky task shouldn't sink the run
+                # Skip this datapoint (a dropped sample), don't fabricate a score.
+                print(f"[eval] SKIPPED {spec['id']}: {type(e).__name__}: {e}", flush=True)
+                continue
             line = asdict(result)
             line["checks"] = [asdict(c) for c in checks]
             line["judge"] = judge_info  # None when the task had no rubric
@@ -461,14 +477,12 @@ def main() -> None:  # pragma: no cover - live convenience entry point
     )
     for r in run.results:
         judge = (
-            f"judge={r.quality_judge:.2f} (${r.judge_cost_usd:.6f})"
-            if r.quality_judge is not None
-            else "judge=—"
+            f"judge={r.quality_judge:.2f}" if r.quality_judge is not None else "judge=—"
         )
         print(
             f"  {r.task_id:30} det={r.quality_deterministic:.2f} {judge} "
-            f"total={r.quality_total:.2f} "
-            f"({r.asserts_passed}✓/{r.asserts_failed}✗) worker=${r.cost_usd:.6f}"
+            f"total={r.quality_total:.2f} ({r.asserts_passed}✓/{r.asserts_failed}✗) "
+            f"cost=${r.cost_usd:.6f} (w=${r.cost_worker:.6f} j=${r.cost_judge:.6f})"
         )
     print(run.summary_line())
 

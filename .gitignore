@@ -37,3 +37,6 @@ evals/
 
 # OS
 .DS_Store
+
+# CI demo run output
+ci/demo/out/

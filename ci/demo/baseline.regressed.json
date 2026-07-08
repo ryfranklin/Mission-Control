@@ -1,0 +1,92 @@
+{
+  "aggregate": {
+    "cost_usd": {
+      "max": 0.0017765,
+      "mean": 0.001615,
+      "min": 0.0014535,
+      "n": 3,
+      "samples": [
+        0.001615,
+        0.001615,
+        0.001615
+      ],
+      "stddev": 0.0001615
+    },
+    "quality_total": {
+      "max": 1.0,
+      "mean": 1.0,
+      "min": 1.0,
+      "n": 3,
+      "samples": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "stddev": 0.0
+    }
+  },
+  "created": "demo-regressed",
+  "judge_model": null,
+  "k": 2.0,
+  "n": 3,
+  "per_task": {
+    "demo-inspect": {
+      "cost_usd": {
+        "max": 0.00088825,
+        "mean": 0.0008075,
+        "min": 0.00072675,
+        "n": 3,
+        "samples": [
+          0.0008075,
+          0.0008075,
+          0.0008075
+        ],
+        "stddev": 8.075e-05
+      },
+      "quality_total": {
+        "max": 1.0,
+        "mean": 1.0,
+        "min": 1.0,
+        "n": 3,
+        "samples": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "stddev": 0.0
+      }
+    },
+    "demo-investigate": {
+      "cost_usd": {
+        "max": 0.00088825,
+        "mean": 0.0008075,
+        "min": 0.00072675,
+        "n": 3,
+        "samples": [
+          0.0008075,
+          0.0008075,
+          0.0008075
+        ],
+        "stddev": 8.075e-05
+      },
+      "quality_total": {
+        "max": 1.0,
+        "mean": 1.0,
+        "min": 1.0,
+        "n": 3,
+        "samples": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "stddev": 0.0
+      }
+    }
+  },
+  "tasks": [
+    "demo-inspect",
+    "demo-investigate"
+  ],
+  "version": 1,
+  "worker_model": "stub"
+}

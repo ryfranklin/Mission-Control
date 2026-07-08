@@ -1,0 +1,18 @@
+id: burn-fix-multiply-nogo
+task_type: burn
+greenfield: false
+approval: no-go        # the fix is produced but the gate REJECTS it
+prompt: |
+  multiply(a, b) in calc.py returns a + b instead of the product. Fix it so it
+  returns a * b.
+
+known_good:
+  deterministic:
+    outcome: blocked         # a real diff was produced, but go/no-go blocked it
+    applied: false
+    decision: no-go
+    no_changes: true         # blocked burn: target repo unchanged after teardown
+    tests: stays_green       # multiply stays failing (fix not applied) — no passing test breaks
+    output_contains: []
+    output_absent: []
+  judge_rubric: []

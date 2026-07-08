@@ -20,7 +20,9 @@ from pathlib import Path
 from .evals import EvalRun, run_eval
 from .worker import StubWorker, Worker
 
-DEFAULT_N = 5
+# Phase 3 raised this from 5 → 15: per-task stddev estimates need ~15-20 repeats
+# before the band is trustworthy (see docs/PHASE3_FINDINGS.md).
+DEFAULT_N = 15
 DEFAULT_K = 2.0
 
 
@@ -180,12 +182,16 @@ def build_baseline(
             )
         )
 
-    task_ids = [r.task_id for r in runs[0].results]
+    # Union of task ids across runs (first-seen order), so a run that dropped a
+    # task to a transient failure doesn't remove it from the baseline.
+    task_ids = list(dict.fromkeys(r.task_id for run in runs for r in run.results))
     per_task: dict[str, MetricStats] = {}
     for tid in task_ids:
         q, c = [], []
         for run in runs:
-            res = next(r for r in run.results if r.task_id == tid)
+            res = next((r for r in run.results if r.task_id == tid), None)
+            if res is None:
+                continue  # this run didn't produce a sample for this task
             q.append(res.quality_total)
             c.append(res.cost_usd)
         per_task[tid] = MetricStats(Stat.from_samples(q), Stat.from_samples(c))
@@ -356,10 +362,10 @@ def main() -> None:  # pragma: no cover - live convenience entry point
     )
     agg = baseline.aggregate
     print(f"baseline over {baseline.n} runs (worker={baseline.worker_model}, judge={baseline.judge_model})")
-    print(f"  aggregate quality_total: {agg.quality_total.mean:.3f} ± {agg.quality_total.stddev:.3f} "
+    print(f"  aggregate quality_total:      {agg.quality_total.mean:.3f} ± {agg.quality_total.stddev:.3f} "
           f"[{agg.quality_total.min:.3f}, {agg.quality_total.max:.3f}]")
-    print(f"  aggregate cost_usd:      ${agg.cost_usd.mean:.6f} ± ${agg.cost_usd.stddev:.6f} "
-          f"[${agg.cost_usd.min:.6f}, ${agg.cost_usd.max:.6f}]")
+    print(f"  aggregate cost_usd (TOTAL):   ${agg.cost_usd.mean:.6f} ± ${agg.cost_usd.stddev:.6f} "
+          f"[${agg.cost_usd.min:.6f}, ${agg.cost_usd.max:.6f}]  (worker + judge)")
     for tid, m in baseline.per_task.items():
         print(f"    {tid:28} q={m.quality_total.mean:.3f}±{m.quality_total.stddev:.3f} "
               f"cost=${m.cost_usd.mean:.6f}±${m.cost_usd.stddev:.6f}")
