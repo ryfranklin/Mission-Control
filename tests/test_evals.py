@@ -53,6 +53,40 @@ def _burn_spec(task_id: str, approval: str, deterministic: dict) -> dict:
 
 # -- a task whose asserts pass scores 1.0 ------------------------------------
 
+# -- cost_usd is the TOTAL (worker + judge) -----------------------------------
+
+def test_no_rubric_has_zero_judge_cost(tmp_path):
+    spec = _write_spec(tmp_path, "sim-nojudge", _sim_spec("sim-nojudge", {"outcome": "completed"}))
+    run = run_eval([spec], sandbox_src=_sandbox(tmp_path), worker=StubWorker(), out_dir=tmp_path / "out")
+    (r,) = run.results
+    assert r.cost_judge == 0.0
+    assert r.cost_usd == r.cost_worker      # total == worker when judge skipped
+    assert r.cost_worker > 0
+
+
+def test_cost_usd_folds_in_judge(tmp_path, fake_judge):
+    spec = _write_spec(tmp_path, "sim-judged", {
+        "id": "sim-judged",
+        "task_type": roles.SIM,
+        "prompt": "inspect the repo",
+        "known_good": {
+            "deterministic": {"outcome": "completed"},
+            "judge_rubric": [{"criterion": "good analysis", "weight": 1}],
+        },
+    })
+    run = run_eval(
+        [spec], sandbox_src=_sandbox(tmp_path), worker=StubWorker(),
+        judge=fake_judge, out_dir=tmp_path / "out",
+    )
+    (r,) = run.results
+    assert r.cost_judge > 0                                   # judge ran and cost something
+    assert r.cost_usd == round(r.cost_worker + r.cost_judge, 8)  # gated axis = total
+    assert r.cost_usd > r.cost_worker                          # judge is folded in
+    # run-level aggregate keeps the breakdown visible and totals correctly.
+    s = run.summary()
+    assert s["cost_usd"] == round(s["cost_worker"] + s["cost_judge"], 6)
+
+
 def test_passing_task_scores_one(tmp_path):
     spec = _write_spec(
         tmp_path,

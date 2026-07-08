@@ -1,0 +1,19 @@
+id: sim-list-modules
+task_type: sim
+greenfield: false
+prompt: |
+  List the Python module filenames (*.py) at the repository root, one per line.
+  Do not modify any files.
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: false
+    no_changes: true
+    tests: ignore
+    output_contains:
+      - "calc.py"
+      - "strings.py"
+      - "inventory.py"
+    output_absent: []
+  judge_rubric: []

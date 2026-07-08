@@ -1,0 +1,18 @@
+id: sim-find-strings-functions
+task_type: sim
+greenfield: false
+prompt: |
+  List the public function names defined in strings.py, one per line.
+  Do not modify any files.
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: false
+    no_changes: true
+    tests: ignore
+    output_contains:
+      - "shout"
+      - "reverse"
+    output_absent: []
+  judge_rubric: []

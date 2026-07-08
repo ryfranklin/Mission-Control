@@ -1,0 +1,23 @@
+id: sim-explain-total-price
+task_type: sim
+greenfield: false
+prompt: |
+  Read inventory.py and explain in 1-2 sentences what total_price(items) computes.
+  Do not modify any files.
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: false
+    no_changes: true
+    tests: ignore
+    output_contains:
+      - "total_price"
+    output_absent: []
+  judge_rubric:
+    - criterion: >
+        Correctly explains that total_price sums price × qty across all line
+        items (i.e. the total cost of the inventory).
+      weight: 2
+    - criterion: "Does not claim to have run or modified the code."
+      weight: 1

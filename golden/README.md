@@ -141,17 +141,25 @@ Not wired into CI (Phase 3) — it's a callable check + report. Rebuild the base
 golden set, or the sandbox changes; a stale baseline makes the band meaningless.
 `stddev` from N=5 is itself a coarse estimate — see the noisy-signal caveat below.
 
-## Task inventory (8 tasks: 4 sim / 4 burn; 4 deterministic-only)
+## Task inventory (16 tasks: 8 sim / 8 burn; 9 deterministic-only, 7 rubric)
 
 | task | type | gate | key deterministic signal | judge? |
 |------|------|------|--------------------------|:------:|
-| `sim-list-public-functions` | sim | — | no changes; output lists `add`, `multiply` | — |
-| `sim-count-tests` | sim | — | no changes; output == `3` | — |
+| `sim-list-public-functions` | sim | — | no changes; lists `add`, `multiply` | — |
+| `sim-count-tests` | sim | — | no changes; output == `7` | — |
+| `sim-list-modules` | sim | — | no changes; lists the 3 `*.py` modules | — |
+| `sim-find-strings-functions` | sim | — | no changes; lists `shout`, `reverse` | — |
+| `sim-readme-project-name` | sim | — | no changes; output has `toolbox` | — |
 | `sim-diagnose-multiply-bug` | sim | — | no changes; mentions `multiply` | ✓ root-cause |
 | `sim-inception-scope` | sim | — | no changes (AI-DLC INCEPTION, greenfield) | ✓ scope quality |
+| `sim-explain-total-price` | sim | — | no changes; mentions `total_price` | ✓ correctness |
 | `burn-fix-multiply-go` | burn | go | `calc.py` touched; tests **goes_green** | — |
-| `burn-add-subtract-go` | burn | go | `calc.py` touched; tests **stays_green** | ✓ correctness |
 | `burn-add-docstring-nogo` | burn | no-go | **blocked**; target unchanged | — |
+| `burn-add-readme-section-go` | burn | go | `README.md` touched; code untouched | — |
+| `burn-fix-multiply-nogo` | burn | no-go | **blocked**; target unchanged | — |
+| `burn-add-subtract-go` | burn | go | `calc.py` touched; **stays_green** | ✓ correctness |
+| `burn-add-power-go` | burn | go | `calc.py` touched; **stays_green** | ✓ correctness |
+| `burn-add-strings-title-go` | burn | go | `strings.py` touched; **stays_green** | ✓ correctness |
 | `burn-inception-docs-go` | burn | go | `aidlc-docs/**` created; code untouched | ✓ doc quality |
 
 ## ⚠️ CAVEAT — this signal is NOISY

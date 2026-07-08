@@ -6,13 +6,16 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "claude-agent-sdk",
+    "pyyaml",  # loads golden-set task specs; needed by the eval-gate console script
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
-    "pyyaml",  # loads the Phase 2 golden-set task specs (golden/tasks/*.yaml)
 ]
+
+[project.scripts]
+eval-gate = "mission_control.eval_gate:main"
 
 [build-system]
 requires = ["hatchling"]

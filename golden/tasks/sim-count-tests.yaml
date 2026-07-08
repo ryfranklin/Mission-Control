@@ -12,6 +12,6 @@ known_good:
     no_changes: true
     tests: ignore
     output_contains:
-      - "3"                   # 2 in test_calc.py + 1 in test_multiply.py
+      - "7"                   # test_calc(2) + test_multiply(1) + test_strings(2) + test_inventory(2)
     output_absent: []
   judge_rubric: []

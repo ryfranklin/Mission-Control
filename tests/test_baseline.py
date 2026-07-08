@@ -143,6 +143,24 @@ def test_fresh_stub_run_passes_against_its_baseline(tmp_path):
     assert rep.passed  # identical to baseline → within (zero) band
 
 
+def test_baseline_cost_axis_includes_judge(tmp_path, fake_judge):
+    # A rubric task → judge runs → the gated cost is worker + judge, not worker only.
+    spec = tmp_path / "j.yaml"
+    spec.write_text(yaml.safe_dump({
+        "id": "j", "task_type": roles.SIM, "prompt": "x",
+        "known_good": {"deterministic": {"outcome": "completed"},
+                       "judge_rubric": [{"criterion": "c", "weight": 1}]},
+    }))
+    bl = build_baseline(
+        [spec], sandbox_src=_sandbox(tmp_path), worker=StubWorker(),
+        judge=fake_judge, n=3, out_dir=tmp_path / "out",
+    )
+    # Stub worker sim ≈ $0.00323; folding in the (Opus-priced) fake judge pushes
+    # the gated total clearly above the worker-only figure.
+    assert bl.aggregate.cost_usd.mean > 0.004
+    assert bl.per_task["j"].cost_usd.mean > 0.004
+
+
 def test_degraded_run_is_flagged(tmp_path):
     specs = [_spec(tmp_path, "a")]
     bl = build_baseline(specs, sandbox_src=_sandbox(tmp_path), worker=StubWorker(),

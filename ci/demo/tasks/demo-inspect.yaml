@@ -1,0 +1,17 @@
+id: demo-inspect
+task_type: sim
+greenfield: false
+prompt: |
+  Inspect the repo. (Demo task — the StubWorker satisfies these asserts
+  deterministically so the pipeline outcome is reproducible.)
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: false
+    no_changes: true
+    tests: ignore
+    output_contains:
+      - "stub"
+    output_absent: []
+  judge_rubric: []

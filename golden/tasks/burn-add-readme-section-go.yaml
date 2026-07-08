@@ -1,0 +1,25 @@
+id: burn-add-readme-section-go
+task_type: burn
+greenfield: false
+approval: go
+prompt: |
+  Append a new "## Usage" section to README.md with a one-line example of calling
+  add() from calc.py. Only edit README.md.
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: true
+    decision: go
+    no_changes: false
+    files_touched:
+      - "README.md"
+    files_unchanged:
+      - "calc.py"
+      - "strings.py"
+      - "tests/**"
+    tests: stays_green
+    output_contains: []
+    output_absent: []
+  # Purely structural (a docs edit to one file) — deterministically checkable.
+  judge_rubric: []

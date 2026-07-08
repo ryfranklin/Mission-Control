@@ -1,0 +1,16 @@
+id: sim-readme-project-name
+task_type: sim
+greenfield: false
+prompt: |
+  Read README.md and reply with the project's name only. Do not modify any files.
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: false
+    no_changes: true
+    tests: ignore
+    output_contains:
+      - "toolbox"
+    output_absent: []
+  judge_rubric: []

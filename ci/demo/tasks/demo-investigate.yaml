@@ -1,0 +1,16 @@
+id: demo-investigate
+task_type: sim
+greenfield: false
+prompt: |
+  Investigate the repo. (Demo task — deterministic under the StubWorker.)
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: false
+    no_changes: true
+    tests: ignore
+    output_contains:
+      - "investigated"
+    output_absent: []
+  judge_rubric: []
