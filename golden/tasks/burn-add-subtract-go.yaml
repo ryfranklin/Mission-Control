@@ -1,0 +1,31 @@
+id: burn-add-subtract-go
+task_type: burn         # side-effectful
+greenfield: false
+approval: go
+prompt: |
+  Add a subtract(a, b) function to calc.py that returns a - b. Keep it consistent
+  with the existing style. Do not change unrelated code.
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: true
+    decision: go
+    no_changes: false
+    files_touched:
+      - "calc.py"
+    files_unchanged:
+      - "tests/**"
+    tests: stays_green        # must not break the two passing add() tests
+    output_contains:
+      - "subtract"
+    output_absent: []
+  judge_rubric:
+    - criterion: >
+        subtract() correctly computes a - b (correct operand order) and matches
+        the module's existing simple style.
+      weight: 2
+    - criterion: >
+        No unrelated changes were introduced (e.g. multiply was not also
+        "fixed", nothing else refactored).
+      weight: 1

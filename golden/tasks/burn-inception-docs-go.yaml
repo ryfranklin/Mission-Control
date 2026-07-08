@@ -1,0 +1,31 @@
+id: burn-inception-docs-go
+task_type: burn         # side-effectful (AI-DLC: persist INCEPTION output as docs)
+greenfield: true        # exercises the "Using AI-DLC, …" opener
+approval: go
+prompt: |
+  Following AI-DLC, write aidlc-docs/inception.md capturing the intent for this
+  project (what calc.py is and the near-term roadmap). Do not modify calc.py or
+  the tests — only create the doc.
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: true
+    decision: go
+    no_changes: false
+    files_touched:
+      - "aidlc-docs/**"
+    files_unchanged:
+      - "calc.py"
+      - "tests/**"
+    tests: stays_green
+    output_contains: []
+    output_absent: []
+  judge_rubric:
+    - criterion: >
+        aidlc-docs/inception.md states what calc.py provides and a plausible
+        near-term roadmap (e.g. fixing multiply, adding functions/tests).
+      weight: 2
+    - criterion: >
+        Content reads as INCEPTION scope/intent, not implementation detail.
+      weight: 1

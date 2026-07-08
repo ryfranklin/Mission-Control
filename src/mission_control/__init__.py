@@ -5,6 +5,7 @@ telemetry, and gates their side effects.
 """
 
 from .aidlc import AidlcSteering, Phase, probe, task_type_for_phase
+from .judge import DEFAULT_JUDGE_MODEL, JudgeResult, LlmJudge
 from .orchestrator import Orchestrator, RunResult, TaskRun
 from .sdk_worker import SdkWorker, WorkerError
 from .tasks import Task, TaskType
@@ -32,4 +33,7 @@ __all__ = [
     "Phase",
     "probe",
     "task_type_for_phase",
+    "LlmJudge",
+    "JudgeResult",
+    "DEFAULT_JUDGE_MODEL",
 ]

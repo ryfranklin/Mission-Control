@@ -1,0 +1,17 @@
+id: sim-count-tests
+task_type: sim          # read-only
+greenfield: false
+prompt: |
+  Count the functions whose names start with "test_" under the tests/ directory.
+  Reply with only that integer. Do not modify any files.
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: false
+    no_changes: true
+    tests: ignore
+    output_contains:
+      - "3"                   # 2 in test_calc.py + 1 in test_multiply.py
+    output_absent: []
+  judge_rubric: []

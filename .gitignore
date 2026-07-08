@@ -32,5 +32,8 @@ htmlcov/
 # Per-run telemetry output
 telemetry/
 
+# Eval runner output
+evals/
+
 # OS
 .DS_Store

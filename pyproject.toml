@@ -11,6 +11,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "pyyaml",  # loads the Phase 2 golden-set task specs (golden/tasks/*.yaml)
 ]
 
 [build-system]

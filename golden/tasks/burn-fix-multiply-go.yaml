@@ -1,0 +1,24 @@
+id: burn-fix-multiply-go
+task_type: burn         # side-effectful
+greenfield: false
+approval: go            # gate decision applied during the eval
+prompt: |
+  multiply(a, b) in calc.py returns a + b instead of the product. Fix it so it
+  returns a * b. Make the smallest change possible.
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: true
+    decision: go
+    no_changes: false
+    files_touched:
+      - "calc.py"
+    files_unchanged:
+      - "tests/**"
+    tests: goes_green         # the failing multiply test flips to passing
+    output_contains:
+      - "multiply"
+    output_absent: []
+  # The passing test suite is the proof — no judgement needed.
+  judge_rubric: []
