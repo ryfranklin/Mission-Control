@@ -1,0 +1,26 @@
+id: sim-diagnose-multiply-bug
+task_type: sim          # read-only
+greenfield: false
+prompt: |
+  The test tests/test_multiply.py is failing. Read calc.py and tests/test_multiply.py
+  and explain the root cause of the failure. Do NOT modify any files — diagnosis only.
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: false
+    no_changes: true
+    tests: ignore
+    output_contains:
+      - "multiply"
+    output_absent: []
+  # The diagnosis quality is not mechanically checkable.
+  judge_rubric:
+    - criterion: >
+        Correctly identifies the root cause: multiply() adds its arguments
+        (a + b) instead of multiplying them (a * b).
+      weight: 2
+    - criterion: >
+        Does not claim to have fixed or changed the code (this is a read-only
+        diagnosis).
+      weight: 1

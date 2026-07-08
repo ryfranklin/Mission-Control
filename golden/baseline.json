@@ -1,0 +1,290 @@
+{
+  "aggregate": {
+    "cost_usd": {
+      "max": 0.036473,
+      "mean": 0.0340794,
+      "min": 0.03239,
+      "n": 5,
+      "samples": [
+        0.036473,
+        0.033344,
+        0.033191,
+        0.034999,
+        0.03239
+      ],
+      "stddev": 0.00164006
+    },
+    "quality_total": {
+      "max": 0.9227625,
+      "mean": 0.90568,
+      "min": 0.8883875,
+      "n": 5,
+      "samples": [
+        0.9071375,
+        0.9227625,
+        0.89985,
+        0.9102625,
+        0.8883875
+      ],
+      "stddev": 0.01272748
+    }
+  },
+  "created": "20260708-120846",
+  "judge_model": "claude-opus-4-8",
+  "k": 2.0,
+  "n": 5,
+  "per_task": {
+    "burn-add-docstring-nogo": {
+      "cost_usd": {
+        "max": 0.003361,
+        "mean": 0.0031574,
+        "min": 0.002845,
+        "n": 5,
+        "samples": [
+          0.002845,
+          0.003247,
+          0.003361,
+          0.003087,
+          0.003247
+        ],
+        "stddev": 0.00020004
+      },
+      "quality_total": {
+        "max": 0.8,
+        "mean": 0.8,
+        "min": 0.8,
+        "n": 5,
+        "samples": [
+          0.8,
+          0.8,
+          0.8,
+          0.8,
+          0.8
+        ],
+        "stddev": 0.0
+      }
+    },
+    "burn-add-subtract-go": {
+      "cost_usd": {
+        "max": 0.00361,
+        "mean": 0.003369,
+        "min": 0.003161,
+        "n": 5,
+        "samples": [
+          0.00361,
+          0.003558,
+          0.003207,
+          0.003161,
+          0.003309
+        ],
+        "stddev": 0.00020427
+      },
+      "quality_total": {
+        "max": 0.6952,
+        "mean": 0.62188,
+        "min": 0.5119,
+        "n": 5,
+        "samples": [
+          0.5952,
+          0.6952,
+          0.5119,
+          0.6119,
+          0.6952
+        ],
+        "stddev": 0.07690687
+      }
+    },
+    "burn-fix-multiply-go": {
+      "cost_usd": {
+        "max": 0.003092,
+        "mean": 0.0029888,
+        "min": 0.002868,
+        "n": 5,
+        "samples": [
+          0.003024,
+          0.002912,
+          0.002868,
+          0.003048,
+          0.003092
+        ],
+        "stddev": 9.472e-05
+      },
+      "quality_total": {
+        "max": 1.0,
+        "mean": 1.0,
+        "min": 1.0,
+        "n": 5,
+        "samples": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "stddev": 0.0
+      }
+    },
+    "burn-inception-docs-go": {
+      "cost_usd": {
+        "max": 0.005013,
+        "mean": 0.0045364,
+        "min": 0.003815,
+        "n": 5,
+        "samples": [
+          0.004858,
+          0.005013,
+          0.004802,
+          0.003815,
+          0.004194
+        ],
+        "stddev": 0.0005096
+      },
+      "quality_total": {
+        "max": 0.8869,
+        "mean": 0.87356,
+        "min": 0.8619,
+        "n": 5,
+        "samples": [
+          0.8619,
+          0.8869,
+          0.8869,
+          0.8702,
+          0.8619
+        ],
+        "stddev": 0.01264033
+      }
+    },
+    "sim-count-tests": {
+      "cost_usd": {
+        "max": 0.006912,
+        "mean": 0.004533,
+        "min": 0.002759,
+        "n": 5,
+        "samples": [
+          0.006838,
+          0.003083,
+          0.003073,
+          0.006912,
+          0.002759
+        ],
+        "stddev": 0.00214207
+      },
+      "quality_total": {
+        "max": 1.0,
+        "mean": 0.95,
+        "min": 0.75,
+        "n": 5,
+        "samples": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          0.75
+        ],
+        "stddev": 0.1118034
+      }
+    },
+    "sim-diagnose-multiply-bug": {
+      "cost_usd": {
+        "max": 0.008707,
+        "mean": 0.008512,
+        "min": 0.008231,
+        "n": 5,
+        "samples": [
+          0.008528,
+          0.008707,
+          0.008563,
+          0.008531,
+          0.008231
+        ],
+        "stddev": 0.00017335
+      },
+      "quality_total": {
+        "max": 1.0,
+        "mean": 1.0,
+        "min": 1.0,
+        "n": 5,
+        "samples": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "stddev": 0.0
+      }
+    },
+    "sim-inception-scope": {
+      "cost_usd": {
+        "max": 0.005134,
+        "mean": 0.0045794,
+        "min": 0.004062,
+        "n": 5,
+        "samples": [
+          0.004371,
+          0.00442,
+          0.00491,
+          0.004062,
+          0.005134
+        ],
+        "stddev": 0.000434
+      },
+      "quality_total": {
+        "max": 1.0,
+        "mean": 1.0,
+        "min": 1.0,
+        "n": 5,
+        "samples": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "stddev": 0.0
+      }
+    },
+    "sim-list-public-functions": {
+      "cost_usd": {
+        "max": 0.002424,
+        "mean": 0.0024034,
+        "min": 0.002383,
+        "n": 5,
+        "samples": [
+          0.002399,
+          0.002404,
+          0.002407,
+          0.002383,
+          0.002424
+        ],
+        "stddev": 1.477e-05
+      },
+      "quality_total": {
+        "max": 1.0,
+        "mean": 1.0,
+        "min": 1.0,
+        "n": 5,
+        "samples": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "stddev": 0.0
+      }
+    }
+  },
+  "tasks": [
+    "burn-add-docstring-nogo",
+    "burn-add-subtract-go",
+    "burn-fix-multiply-go",
+    "burn-inception-docs-go",
+    "sim-count-tests",
+    "sim-diagnose-multiply-bug",
+    "sim-inception-scope",
+    "sim-list-public-functions"
+  ],
+  "version": 1,
+  "worker_model": "claude-haiku-4-5"
+}

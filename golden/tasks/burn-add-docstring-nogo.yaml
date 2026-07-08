@@ -1,0 +1,19 @@
+id: burn-add-docstring-nogo
+task_type: burn         # side-effectful
+greenfield: false
+approval: no-go         # the gate REJECTS the change — this task tests the block path
+prompt: |
+  Add a module-level docstring to the top of calc.py describing what the module
+  provides.
+
+known_good:
+  deterministic:
+    outcome: blocked          # produced a diff, but go/no-go blocked it
+    applied: false
+    decision: no-go
+    no_changes: true          # blocked burn: target repo must be unchanged after teardown
+    tests: stays_green
+    output_contains: []
+    output_absent: []
+  # Purely about the gate + teardown behavior — no quality judgement.
+  judge_rubric: []

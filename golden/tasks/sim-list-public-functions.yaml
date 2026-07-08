@@ -1,0 +1,19 @@
+id: sim-list-public-functions
+task_type: sim          # read-only
+greenfield: false
+prompt: |
+  List the public function names defined in calc.py, one per line.
+  Do not modify any files.
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: false
+    no_changes: true          # read-only: target must be byte-identical to baseline
+    tests: ignore
+    output_contains:
+      - "add"
+      - "multiply"
+    output_absent: []
+  # Fully checkable from output + git state — no model judgement needed.
+  judge_rubric: []

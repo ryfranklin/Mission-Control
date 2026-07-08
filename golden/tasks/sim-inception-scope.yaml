@@ -1,0 +1,26 @@
+id: sim-inception-scope
+task_type: sim          # read-only (AI-DLC INCEPTION)
+greenfield: true        # exercises the "Using AI-DLC, …" prompt opener
+prompt: |
+  Scope this project: summarize what calc.py does and propose the single most
+  valuable next improvement. Read-only — do not modify any files.
+
+known_good:
+  deterministic:
+    outcome: completed
+    applied: false
+    no_changes: true          # INCEPTION here is read-only; docs are not persisted by a sim
+    tests: ignore
+    output_contains:
+      - "add"
+      - "multiply"
+    output_absent: []
+  judge_rubric:
+    - criterion: >
+        Accurately summarizes calc.py as a small arithmetic module exposing
+        add() and multiply().
+      weight: 1
+    - criterion: >
+        Proposes a sensible, minimal next improvement (e.g. fix the multiply
+        bug, add tests/type hints) rather than a sweeping rewrite.
+      weight: 1
