@@ -1,44 +1,190 @@
 # Mission Control
 
-An **agent-orchestration runtime**. Mission Control spawns workers, isolates each
-in its own git worktree, supervises them, records per-step telemetry, and gates
-their side effects behind an approval step.
+**Durable, observable, cost-aware orchestration for coding agents.**
 
-Skeleton only — no runtime logic yet.
+Mission Control runs AI coding workers the way you'd run anything you actually
+trust in production: each task is **isolated** in its own git worktree, **metered**
+with per-step token/cost telemetry, **gated** behind a human go/no-go before any
+change lands, and **durable** — a run survives a process crash and resumes without
+re-paying for the LLM work it already did.
 
-## Requirements
+It ships with an **eval harness** (golden tasks → deterministic asserts + an LLM
+judge → a variance-aware baseline) and a single **CI gate** (`eval-gate`, exit
+0/nonzero) that a pipeline calls to block a regression from being promoted.
 
-- Python 3.12+
-- [`claude-agent-sdk`](https://pypi.org/project/claude-agent-sdk/)
+```
+ Flight Director ── dispatch ──►  git worktree (isolated)  ──►  Controller
+ (orchestrator)                        │                        (Claude Agent SDK)
+                                       │  per-step telemetry (JSONL: tokens, $, latency)
+                                       ▼
+                           go / no-go gate ──► apply change (burn)  ─┐
+                                       └────►  scrub (discard)       │
+                                       ▼                             │
+                                   teardown ◄───────────────────────┘   (no worktree leaks)
+```
 
-## Setup
+---
+
+## Why it's different
+
+| Capability | What it means |
+|---|---|
+| 🧭 **Isolated by default** | Every task runs in a throwaway `git worktree`; teardown leaves no leaks. |
+| 💵 **Cost is first-class** | Per-step JSONL telemetry (input/output/cache tokens, `cost_usd`, latency) priced from a single model→price table. |
+| ✅ **Human-gated side effects** | A `go`/`no-go` gate; nothing is applied without an approval on record. |
+| ♻️ **Durable & resumable** | Runs are a LangGraph state machine checkpointed to Postgres — kill it mid-flight, resume, **don't re-pay** for completed steps. |
+| 🧪 **Evals + regression gate** | Golden tasks scored by deterministic asserts **and** an LLM judge; a k·σ noise band tells a real regression from variance. |
+| 🔌 **Portable tools (MCP)** | The eval-gate is exposed as an MCP server; any agent/IDE can call it — same exit-code contract. |
+| 🧱 **Framework-thin** | The worker is a plain `Worker` interface; the SDK worker slots in unchanged whether orchestration is imperative or a LangGraph graph. |
+
+---
+
+## Quickstart
+
+**Requirements:** Python 3.12+, Docker (for durable state), and an authenticated
+[Claude Agent SDK](https://pypi.org/project/claude-agent-sdk/) (a logged-in
+`claude` CLI or `ANTHROPIC_API_KEY`).
 
 ```sh
-uv venv --python 3.12
-uv pip install -e ".[dev]"
+# install
+uv venv --python 3.12 && uv pip install -e ".[dev]"      # or: python3.12 -m venv .venv && pip install -e ".[dev]"
+
+# stand up Postgres for durable state
+cp .env.example .env
+docker compose up -d          # postgres:16.8-alpine, healthchecked
+
+# run the tests
+pytest                        # ~90 tests; Postgres/live-LLM tests skip if unavailable
 ```
 
-Or with stock tooling:
+**See it work (no LLM needed — deterministic StubWorker):**
 
 ```sh
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+python -m mission_control.demo_graph      # a run through the durable LangGraph shell
+python -m mission_control.demo_resume     # kill a run mid-flight → resume, no re-pay, no leak
+python -m mission_control.demo_gate       # pause at go/no-go → kill → restart → decide
 ```
 
-## Test
+**With the real Claude worker** (makes live calls — defaults to the cheap Haiku tier):
 
 ```sh
-pytest
+python -m mission_control.demo_sdk        # a Controller investigating a sandbox repo
+python -m mission_control.demo_phase4 --sdk   # the full flow, end to end
 ```
 
-## Layout
+---
+
+## How it works
+
+**Worker (the Controller).** A minimal `Worker` interface (`investigate(task,
+workdir)`). `SdkWorker` wraps the Claude Agent SDK with **fully explicit context**
+(`setting_sources=[]` — no ambient CLAUDE.md/settings), probes the target repo for
+an **AI-DLC** install and composes its rules into the system prompt, and reports
+per-step usage. `StubWorker` is a deterministic, offline stand-in.
+
+**Orchestration.** Two interchangeable shells over the *same* worker:
+- **Imperative** (`Orchestrator`) — dispatch → run → gate → apply/scrub → teardown.
+- **Durable** (`graph.py`, LangGraph `StateGraph`) — the same lifecycle as nodes,
+  checkpointed to Postgres, resumable, with an `interrupt()`-based go/no-go that
+  survives a restart. Nodes are idempotent (recovery is at node boundaries), and
+  **apply-burn is its own node** so a crash never half-applies a change.
+
+**Telemetry & cost.** Every model request is one JSONL row (tokens, cache split,
+`cost_usd`, latency, model, step ids). Pricing lives in exactly one module.
+
+**Evals.** A golden set of `sim`/`burn` tasks with a split contract:
+*deterministic asserts* (files touched, tests green, output substrings, outcome)
+plus a *judge rubric* scored by a stronger model. `baseline.py` runs the suite N
+times and records mean/σ/min-max; the regression check flags a drop only **outside
+a k·σ band** — separating signal from LLM noise.
+
+**The gate & CI.** `eval-gate` runs the suite, compares to `baseline.json`, and
+**exits 0 (pass) / nonzero (regression)** on quality *or* total cost — emitting
+both a human report and machine JSON. The `Jenkinsfile` mirrors a Liquibase-style
+pipeline: a nonprod stage runs the gate (fails the build on regression), and a
+prod stage is a **manual go/no-go** reachable only if nonprod passed.
+
+**Analytics (mini-medallion).** JSONL is the raw/bronze spine; **DuckDB** queries
+it in place (`read_json_auto`, zero ETL) for cross-run cost/quality; **Postgres**
+is the transactional system-of-record for run state. Different tools, different
+jobs — nothing crammed into one store.
+
+---
+
+## Entrypoints
+
+| Command | What it does |
+|---|---|
+| `eval-gate` · `python -m mission_control.eval_gate` | The CI contract: run evals, gate vs `baseline.json`, exit 0/nonzero. `--k`/`--n`/`--demo`. |
+| `python -m mission_control.baseline [N]` | Build/refresh `golden/baseline.json` (N repeats). |
+| `python -m mission_control.analytics` | DuckDB cross-run cost/quality report over the JSONL. |
+| `python -m mission_control.eval_gate_mcp` | Serve the eval-gate as an MCP tool (stdio). |
+| `python -m mission_control.demo_phase4 [--sdk]` | Full durable run → analytics → eval-gate over MCP. |
+| `ci/run_pipeline_demo.sh {clean\|regression}` | Local mirror of the Jenkins pipeline. |
+
+---
+
+## Design principles
+
+- **One vocabulary, one file.** The domain metaphor (Flight Director, Controller,
+  `sim`/`burn`, `go`/`no-go`, `scrub`) lives *only* in `roles.py`; everything else
+  uses functional names, so a rename is a one-file change.
+- **Explicit context.** The worker sees only what we compose — no ambient config —
+  keeping runs reproducible and telemetry honest.
+- **Idempotent by design.** Durable recovery re-runs whole nodes, so each node is
+  safe to re-run; the change-applying step is isolated to its own boundary.
+- **JSONL is the spine.** Bronze/raw everywhere; query layers (DuckDB) sit on top.
+
+---
+
+## Testing
+
+```sh
+pytest                       # full suite
+pytest -k "not postgres"     # skip durability tests that need Docker Postgres
+MC_LIVE_JUDGE=1 pytest -k tolerance   # opt-in live judge meta-eval
+```
+
+Tests are offline and deterministic by default (StubWorker); tests needing
+Postgres or live LLM calls **skip** when those aren't available.
+
+---
+
+## Repository layout
 
 ```
-src/mission_control/    package (src layout)
-  roles.py              the metaphor vocabulary — the ONLY place metaphor terms live
-tests/                  test suite
+src/mission_control/
+  roles.py            metaphor vocabulary — the ONLY place metaphor terms live
+  worker.py           Worker interface + StubWorker
+  sdk_worker.py       Claude Agent SDK worker (explicit context, AI-DLC steering)
+  orchestrator.py     imperative dispatch → gate → apply/scrub → teardown
+  graph.py            durable LangGraph shell + PostgresSaver + interrupt() gate
+  worktree.py         git-worktree isolation
+  telemetry.py        per-step JSONL events
+  pricing.py          the single model→price table
+  evals.py            golden-set runner (deterministic asserts)
+  judge.py            LLM-as-judge for rubric scoring
+  baseline.py         N-run baseline + variance-aware regression check
+  eval_gate.py        the eval-gate CLI (exit-code contract)
+  eval_gate_mcp.py    eval-gate exposed as an MCP server
+  analytics.py        DuckDB analytics over the JSONL spine
+golden/               golden tasks, sandbox fixture, baseline.json
+ci/                   Jenkins pipeline demo (local runnable)
+docs/                 PHASE1–4 findings, EVAL_GATE.md
+docker-compose.yml    Postgres for durable state
 ```
 
-See `CLAUDE.MD` for build-scope conventions (the metaphor rule, worktree
-isolation, telemetry fields, and the AI-DLC boundary).
+Deeper reading: `docs/EVAL_GATE.md`, the `docs/PHASE*_FINDINGS.md` (data-driven
+notes on cost, judge reliability, the noise band, and durability), `golden/README.md`
+(spec format), and `ci/README.md`. Build-scope conventions are in `CLAUDE.MD`.
+
+---
+
+## Status
+
+Phases 1–4 are complete: instrumented worker, eval harness + judge, baseline +
+CI gate, and durable execution (LangGraph + Postgres) with MCP tool exposure.
+**Demo-grade** by design (single-box Postgres, node-granularity recovery, local
+creds); the documented production graduation path is **Temporal** for multi-host,
+long-lived runs. See `docs/PHASE4_FINDINGS.md` for the honest demo-vs-production
+breakdown.
