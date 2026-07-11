@@ -1,8 +1,7 @@
 """AI-DLC steering — detect a target repo's AI-DLC install and compose it in.
 
-AI-DLC is a methodology the runtime applies to *target* repos at run time (see
-the AI-DLC config-placement spec). Mission Control itself is not built
-under AI-DLC. AI-DLC installs into agent-specific locations inside the target
+AI-DLC is a methodology the runtime applies to *target* repos at run time (per the
+AI-DLC config-placement spec). Mission Control itself is not built under AI-DLC. AI-DLC installs into agent-specific locations inside the target
 repo, so detection is a **multi-location probe** in priority order that takes the
 first hit and normalizes it to ``(core_rules_text, detail_rules_dir | None,
 flavor)``.

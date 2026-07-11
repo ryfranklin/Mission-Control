@@ -12,6 +12,12 @@ It ships with an **eval harness** (golden tasks → deterministic asserts + an L
 judge → a variance-aware baseline) and a single **CI gate** (`eval-gate`, exit
 0/nonzero) that a pipeline calls to block a regression from being promoted.
 
+You drive it over **one HTTP seam**: a FastAPI **service** wraps the runtime, and a
+**CLI** plus a server-rendered **web UI** (the "control room") are thin clients of
+it — launch a run, watch a live SSE feed of node transitions and priced telemetry,
+approve/reject at the go/no-go gate, and read cross-run cost — none of them
+re-implementing any orchestration.
+
 ```
  Flight Director ── dispatch ──►  git worktree (isolated)  ──►  Controller
  (orchestrator)                        │                        (Claude Agent SDK)
@@ -36,6 +42,7 @@ judge → a variance-aware baseline) and a single **CI gate** (`eval-gate`, exit
 | 🧪 **Evals + regression gate** | Golden tasks scored by deterministic asserts **and** an LLM judge; a k·σ noise band tells a real regression from variance. |
 | 🔌 **Portable tools (MCP)** | The eval-gate is exposed as an MCP server; any agent/IDE can call it — same exit-code contract. |
 | 🧱 **Framework-thin** | The worker is a plain `Worker` interface; the SDK worker slots in unchanged whether orchestration is imperative or a LangGraph graph. |
+| 🎛️ **One seam, many clients** | An HTTP service wraps the runtime; a CLI and a server-rendered htmx web UI are thin clients — launch, live-stream (SSE), gate, and inspect cost over the same API, no duplicated orchestration. |
 
 ---
 
@@ -54,7 +61,7 @@ cp .env.example .env
 docker compose up -d          # postgres:16.8-alpine, healthchecked
 
 # run the tests
-pytest                        # ~90 tests; Postgres/live-LLM tests skip if unavailable
+pytest                        # Postgres/live-LLM/web tests skip if unavailable
 ```
 
 **See it work (no LLM needed — deterministic StubWorker):**
@@ -70,6 +77,14 @@ python -m mission_control.demo_gate       # pause at go/no-go → kill → resta
 ```sh
 python -m mission_control.demo_sdk        # a Controller investigating a sandbox repo
 python -m mission_control.demo_phase4 --sdk   # the full flow, end to end
+```
+
+**Drive the control room (HTTP service → web UI + CLI):**
+
+```sh
+python -m mission_control.service         # FastAPI seam on 127.0.0.1:8000 (localhost, no auth)
+# open http://127.0.0.1:8000/ui           # fleet dashboard, live run view (SSE), metrics
+mission-control launch /path/to/repo --type burn --watch   # CLI: a client of the same API
 ```
 
 ---
@@ -122,10 +137,18 @@ launches / resolves / streams / queries runs, but owns **no orchestration logic*
 | `GET /runs/{id}/events` | **SSE** stream of the merged live feed: node transitions + priced telemetry + gate-waiting. |
 | `GET /metrics` | Cross-run cost/quality from the DuckDB pass. |
 
-**Every UI is a client of these same endpoints.** The **CLI** (this phase) is the
-first client — it drives the runtime purely over HTTP and never imports the graph.
-The **web UI (5b)** and **Slack app (5c)** will be *additional clients of the exact
-same API* — no client re-implements orchestration; they all talk to the seam.
+**Every UI is a client of these same endpoints.** The **CLI** and the server-rendered
+**web UI** (5b, served at `/ui`) both drive the runtime purely over HTTP and never
+import the graph; a **Slack app** (5c) is planned as another client of the exact
+same API. No client re-implements orchestration — they all talk to the seam.
+
+**The control room (5b).** A server-rendered UI (Jinja + htmx + the htmx SSE
+extension, **no JS build**) at `/ui`: a **fleet dashboard** (polled), a per-run
+**live station** (an SSE timeline that replays durable history from a `run_events`
+log before tailing live, so a reload or restart shows the *whole* run — not just
+the resume leg), wired **go/no-go/scrub/cancel** actions, and a **cost/perf
+dashboard**. Cost is labeled honestly: it only reconciles at teardown, so an
+in-flight run reads *"not yet reconciled,"* never `$0`/free.
 
 ---
 
@@ -181,7 +204,7 @@ src/mission_control/
   graph.py            durable LangGraph shell + PostgresSaver + interrupt() gate
   live.py             the merged live feed (node transitions + priced telemetry)
   runs_store.py       the Postgres runs registry (status/cost ledger)
-  service/            FastAPI service — the seam wrapping graph.py (5a)
+  service/            FastAPI seam wrapping graph.py (5a) + web/ control-room UI (5b)
   cli.py              CLI: a client of the service API (never imports the graph)
   worktree.py         git-worktree isolation
   telemetry.py        per-step JSONL events
@@ -194,7 +217,7 @@ src/mission_control/
   analytics.py        DuckDB analytics over the JSONL spine
 golden/               golden tasks, sandbox fixture, baseline.json
 ci/                   Jenkins pipeline demo (local runnable)
-docs/                 PHASE1–4 findings, EVAL_GATE.md
+docs/                 PHASE1–5 findings, EVAL_GATE.md
 docker-compose.yml    Postgres for durable state
 ```
 
@@ -206,9 +229,13 @@ notes on cost, judge reliability, the noise band, and durability), `golden/READM
 
 ## Status
 
-Phases 1–4 are complete: instrumented worker, eval harness + judge, baseline +
-CI gate, and durable execution (LangGraph + Postgres) with MCP tool exposure.
-**Demo-grade** by design (single-box Postgres, node-granularity recovery, local
-creds); the documented production graduation path is **Temporal** for multi-host,
-long-lived runs. See `docs/PHASE4_FINDINGS.md` for the honest demo-vs-production
-breakdown.
+Phases 1–5b are complete: instrumented worker, eval harness + judge, baseline +
+CI gate, durable execution (LangGraph + Postgres) with MCP tool exposure, an HTTP
+**service seam** (+ CLI), and a server-rendered **control-room web UI** (htmx + SSE,
+with durable event replay).
+
+**Demo-grade** by design — single-box Postgres, node-granularity recovery, and
+**localhost / no auth**. The graduation gate to production is **auth + identity**
+on every client and **multi-host durability** (a shared broker for live SSE
+fan-out; a real job queue for launches). See `docs/PHASE4_FINDINGS.md` and the
+`docs/PHASE5*_FINDINGS.md` for the honest demo-vs-production breakdowns.

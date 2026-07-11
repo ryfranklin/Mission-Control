@@ -37,9 +37,8 @@ a future metaphor swap must be a one-file change.
   itself built under AI-DLC.
 
 ## Where things live
-- Code: here (`/path/to/mission_control`).
-- Planning/decisions/research: an external planning space. Don't
-  duplicate design notes here; link out in commit messages if useful.
+- Code lives in this repository.
+- Planning/decisions/research live outside the repo; don't duplicate design notes here.
 
 ## Verify before commit
 - `pytest` green; a manual run shows a Flight Director dispatching a Controller with clean
