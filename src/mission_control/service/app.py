@@ -8,21 +8,24 @@ NO auth (see ``__main__`` for the 127.0.0.1 bind).
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from sse_starlette.sse import EventSourceResponse
 from starlette.concurrency import run_in_threadpool
 
-from .. import analytics
 from .manager import RunConflict, RunManager, RunNotFound
+from .metrics import compute_metrics
 from .models import (
     DecisionResponse,
     LaunchRequest,
     MetricsResponse,
     RunDetail,
     RunList,
+    TargetList,
 )
+from .web import mount_web
 
 # How often to emit an SSE keepalive comment (seconds) — keeps proxies/clients
 # from timing out an idle stream and plays nicely with auto-reconnect.
@@ -77,16 +80,31 @@ def create_app(manager: RunManager) -> FastAPI:
     async def scrub(run_id: str, mgr: RunManager = Depends(get_manager)) -> DecisionResponse:
         return _decision(mgr.scrub, run_id)
 
+    @app.post("/runs/{run_id}/cancel", response_model=DecisionResponse)
+    async def cancel(run_id: str, mgr: RunManager = Depends(get_manager)) -> DecisionResponse:
+        # Distinct from scrub: stops an IN-FLIGHT (mid-node) run at the next node
+        # boundary and tears down; scrub only resolves a run paused at the gate.
+        return _decision(mgr.cancel, run_id)
+
     # -- queries -----------------------------------------------------------
 
     @app.get("/runs", response_model=RunList)
     def list_runs(
         status: Optional[str] = None,
         target: Optional[str] = None,
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        order: str = Query("desc", pattern="^(asc|desc)$"),
+        created_from: Optional[datetime] = None,
+        created_to: Optional[datetime] = None,
         mgr: RunManager = Depends(get_manager),
     ) -> RunList:
-        rows = mgr.list_runs(status=status, target=target)
-        return RunList(runs=[RunDetail.from_row(r) for r in rows])
+        rows, total = mgr.list_runs(
+            status=status, target=target, limit=limit, offset=offset, order=order,
+            created_from=created_from, created_to=created_to,
+        )
+        return RunList(runs=[RunDetail.from_row(r) for r in rows],
+                       total=total, limit=limit, offset=offset)
 
     @app.get("/runs/{run_id}", response_model=RunDetail)
     def get_run(run_id: str, mgr: RunManager = Depends(get_manager)) -> RunDetail:
@@ -94,6 +112,10 @@ def create_app(manager: RunManager) -> FastAPI:
             return RunDetail.from_row(mgr.get_run(run_id))
         except RunNotFound:
             raise HTTPException(status_code=404, detail=f"no such run: {run_id}")
+
+    @app.get("/targets", response_model=TargetList)
+    def list_targets(mgr: RunManager = Depends(get_manager)) -> TargetList:
+        return TargetList(targets=mgr.list_targets())
 
     # -- live feed (SSE) ---------------------------------------------------
 
@@ -113,9 +135,20 @@ def create_app(manager: RunManager) -> FastAPI:
     # -- cross-run metrics -------------------------------------------------
 
     @app.get("/metrics", response_model=MetricsResponse)
-    async def metrics() -> MetricsResponse:
-        # DuckDB pass is blocking → run off the event loop.
-        result = await run_in_threadpool(analytics.analyze)
-        return MetricsResponse(**result.to_dict())
+    async def metrics(
+        target: Optional[str] = None,
+        from_: Optional[datetime] = Query(None, alias="from"),
+        to: Optional[datetime] = Query(None, alias="to"),
+        mgr: RunManager = Depends(get_manager),
+    ) -> MetricsResponse:
+        # Global DuckDB rollup + an exact registry aggregate scoped to target/window
+        # (shared with the /ui/metrics dashboard). Blocking → off the loop.
+        data = await run_in_threadpool(
+            compute_metrics, mgr, target=target, created_from=from_, created_to=to
+        )
+        return MetricsResponse(**data)
+
+    # Server-rendered control-room UI (htmx, no JS build) over the same seam.
+    mount_web(app)
 
     return app

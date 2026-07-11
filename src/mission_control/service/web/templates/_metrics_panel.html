@@ -1,0 +1,62 @@
+<section class="panel">
+  <h2>Rollup · {% if m.scope %}scoped{% else %}global{% endif %}</h2>
+  <div class="stat-grid">
+    <div class="stat"><span class="stat-num">{{ rs.runs }}</span><span class="stat-label">runs</span></div>
+    <div class="stat"><span class="stat-num">{{ rs.steps }}</span><span class="stat-label">priced steps</span></div>
+    <div class="stat"><span class="stat-num">${{ '%.6f'|format(rs.cost_usd) }}</span><span class="stat-label">reconciled cost</span></div>
+  </div>
+  <p class="muted">
+    Cost reconciles at <b>teardown</b> — in-flight runs contribute $0 to the total until they
+    finish. That's <b>unreconciled, not free</b>.
+  </p>
+
+  <h3>{{ labels.sim }} vs {{ labels.burn }}</h3>
+  <table class="fleet">
+    <thead><tr><th>type</th><th>runs</th><th>reconciled cost</th></tr></thead>
+    <tbody>
+      {% for r in rs.by_task_type %}
+      <tr>
+        <td><span class="badge badge-{{ r.task_type }}">{{ r.task_type }}</span></td>
+        <td>{{ r.runs }}</td>
+        <td>${{ '%.6f'|format(r.cost_usd) }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="3" class="muted">no runs in scope</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h3>Per target</h3>
+  <table class="fleet">
+    <thead><tr><th>target</th><th>runs</th><th>reconciled cost</th></tr></thead>
+    <tbody>
+      {% for r in rs.by_target %}
+      <tr><td class="target">{{ r.target }}</td><td>{{ r.runs }}</td><td>${{ '%.6f'|format(r.cost_usd) }}</td></tr>
+      {% else %}
+      <tr><td colspan="3" class="muted">no runs in scope</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>Historical trend · DuckDB over the JSONL spine</h2>
+  <p class="muted">History lives in the JSONL spine + the registry — never the live SSE feed.</p>
+  {% if m.per_run %}
+  <table class="fleet">
+    <thead><tr><th>run</th><th>tasks</th><th>cost</th><th>quality</th></tr></thead>
+    <tbody>
+      {% for r in m.per_run %}
+      <tr>
+        <td class="target">{{ r.run }}</td>
+        <td>{{ r.tasks }}</td>
+        <td>${{ '%.6f'|format(r.cost_usd) }}</td>
+        <td>{{ '%.3f'|format(r.quality_total) if r.quality_total is not none else '—' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No eval history on the spine yet.</p>
+  {% endif %}
+</section>

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="panel">
+  <h2>Dispatch a {{ labels.worker }}</h2>
+  <form class="launch" method="post" action="/ui/launch">
+    <label>Target repository
+      <input name="target" list="known-targets" placeholder="/path/to/repo" required>
+      <datalist id="known-targets">
+        {% for t in targets %}<option value="{{ t }}"></option>{% endfor %}
+      </datalist>
+    </label>
+    <label>Task type
+      <select name="task_type">
+        <option value="{{ labels.sim }}">{{ labels.sim }} · read-only</option>
+        <option value="{{ labels.burn }}">{{ labels.burn }} · side-effectful</option>
+      </select>
+    </label>
+    <button type="submit">Dispatch</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>Fleet · {{ labels.worker }}s at station</h2>
+  <!-- Cheap POLLED snapshot: refresh the fragment every 4s, but only while the
+       tab is visible. No SSE fleet feed (SSE is reserved for the run live view). -->
+  <div id="fleet"
+       hx-get="/ui/fleet?page={{ page }}"
+       hx-trigger="every 4s [document.visibilityState=='visible']"
+       hx-swap="innerHTML">
+    {% include "_fleet_table.html" %}
+  </div>
+</section>
+
+{% endblock %}

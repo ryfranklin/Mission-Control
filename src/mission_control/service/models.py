@@ -57,14 +57,24 @@ class RunDetail(BaseModel):
 
 
 class RunList(BaseModel):
-    """Response for ``GET /runs``."""
+    """A page of runs (``GET /runs``). ``total`` is the full match count (ignoring
+    limit/offset) so a client can page."""
 
     runs: list[RunDetail]
+    total: int
+    limit: int
+    offset: int
+
+
+class TargetList(BaseModel):
+    """Response for ``GET /targets`` — distinct targets the registry has seen."""
+
+    targets: list[str]
 
 
 class DecisionResponse(BaseModel):
-    """Response for approve / reject / scrub — the transition was accepted; the
-    run resolves asynchronously (poll ``GET /runs/{id}`` or the SSE feed)."""
+    """Response for approve / reject / scrub / cancel — the transition was accepted;
+    the run resolves asynchronously (poll ``GET /runs/{id}`` or the SSE feed)."""
 
     run_id: str
     status: str
@@ -72,10 +82,14 @@ class DecisionResponse(BaseModel):
 
 
 class MetricsResponse(BaseModel):
-    """Cross-run cost/quality summary from the DuckDB analytics pass."""
+    """Cross-run cost/quality summary. The ``per_run``/``by_task_type``/… fields are
+    the global DuckDB analytics rollup. ``runs_summary`` is an exact aggregate over
+    the runs registry, narrowed to ``scope`` (target + time window) when given."""
 
     per_run: list[dict]
     by_task_type: list[dict]
     worker_vs_judge: dict
     quality_trend: list[dict]
     telemetry_rollup: dict
+    scope: Optional[dict] = None
+    runs_summary: dict = Field(default_factory=dict)

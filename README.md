@@ -133,7 +133,7 @@ same API* — no client re-implements orchestration; they all talk to the seam.
 
 | Command | What it does |
 |---|---|
-| `python -m mission_control.service` | Run the FastAPI service (the seam) on `127.0.0.1:8000`. v1 = **localhost, no auth**. `MC_SERVICE_SDK=1` for the real worker. |
+| `python -m mission_control.service` | Run the FastAPI service (the seam) on `127.0.0.1:8000`. v1 = **localhost, no auth**. `MC_SERVICE_SDK=1` for the real worker. The control-room web UI is served at **`/ui`** (server-rendered Jinja + htmx, no JS build). |
 | `mission-control` · `python -m mission_control.cli` | CLI over the service API: `launch` · `watch`/`follow` · `runs` · `approve`/`reject`/`scrub`. `--base-url`/`$MC_SERVICE_URL`. |
 | `eval-gate` · `python -m mission_control.eval_gate` | The CI contract: run evals, gate vs `baseline.json`, exit 0/nonzero. `--k`/`--n`/`--demo`. |
 | `python -m mission_control.baseline [N]` | Build/refresh `golden/baseline.json` (N repeats). |

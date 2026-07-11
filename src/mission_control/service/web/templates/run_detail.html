@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="panel">
+  <a href="/ui" class="muted">&larr; fleet</a>
+  <h2>{{ labels.worker }} · {{ run.run_id }}</h2>
+  <dl class="detail">
+    <dt>target</dt><dd>{{ run.target or "—" }}</dd>
+    <dt>type</dt><dd><span class="badge badge-{{ run.task_type }}">{{ run.task_type }}</span></dd>
+    <dt>status</dt><dd><span class="status status-{{ run.status }}">{{ run.status }}</span></dd>
+    <dt>running cost</dt><dd>{{ cost_label }}</dd>
+    <dt>created</dt><dd class="muted">{{ run.created_at | ts }}</dd>
+    <dt>started</dt><dd class="muted">{{ run.started_at | ts }}</dd>
+    <dt>ended</dt><dd class="muted">{{ run.ended_at | ts }}</dd>
+    {% if run.detail %}<dt>summary</dt><dd>{{ run.detail }}</dd>{% endif %}
+  </dl>
+</section>
+
+<!-- The timeline is fed by the SSE endpoint (htmx SSE ext): durable history
+     replays first, then the live tail; sse-close stops on the terminal event. -->
+<section class="panel" sse-connect="/ui/runs/{{ run.run_id }}/events" sse-close="terminal">
+  <h2>Live event timeline</h2>
+
+  <div id="final-banner">
+    {% if run.ended_at %}
+      {% with fstatus = run.status, fcost = run.cost_usd %}{% include "_final_banner.html" %}{% endwith %}
+    {% endif %}
+  </div>
+
+  {% with run_id = run.run_id, status = run.status, ended = run.ended_at %}
+    {% include "_run_controls.html" %}
+  {% endwith %}
+
+  <p class="muted timeline-legend">
+    Durable history replays first (dimmed), then the live tail. Cost is
+    <b>not reconciled</b> until the run finishes.
+  </p>
+  <ul id="timeline" class="timeline"
+      sse-swap="node_transition,step_metric,gate_waiting,terminal" hx-swap="beforeend"></ul>
+</section>
+
+{% endblock %}
