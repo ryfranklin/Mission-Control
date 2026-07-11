@@ -6,7 +6,9 @@ telemetry, and gates their side effects.
 
 from .aidlc import AidlcSteering, Phase, probe, task_type_for_phase
 from .judge import DEFAULT_JUDGE_MODEL, JudgeResult, LlmJudge
+from .live import GateWaiting, LiveEvent, NodeTransition, StepMetric, stream_run
 from .orchestrator import Orchestrator, RunResult, TaskRun
+from .runs_store import RunRow, RunStore
 from .sdk_worker import SdkWorker, WorkerError
 from .tasks import Task, TaskType
 from .telemetry import RunTelemetry, StepEvent, StepUsage, TelemetrySink
@@ -36,4 +38,11 @@ __all__ = [
     "LlmJudge",
     "JudgeResult",
     "DEFAULT_JUDGE_MODEL",
+    "stream_run",
+    "LiveEvent",
+    "NodeTransition",
+    "StepMetric",
+    "GateWaiting",
+    "RunStore",
+    "RunRow",
 ]
