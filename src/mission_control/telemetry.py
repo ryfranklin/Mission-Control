@@ -9,6 +9,7 @@ a JSONL file — one file per run.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -87,6 +88,39 @@ class StepEvent:
             latency_ms=usage.latency_ms,
             outcome=outcome,
         )
+
+
+def events_from_steps(
+    steps: Iterable[StepUsage],
+    *,
+    task_id: str,
+    task_type: str,
+    outcome: str,
+) -> list[StepEvent]:
+    """Enrich a worker's raw per-step usage into priced :class:`StepEvent` records.
+
+    The single source of truth for how a run's steps become telemetry lines: step
+    ids are namespaced by task (``{task_id}-step-{i}``) and chained via
+    ``parent_step_id``. Both the imperative orchestrator (JSONL sink) and the
+    LangGraph shell (live stream + JSONL) enrich through here, so the priced
+    records they emit are identical by construction.
+    """
+    events: list[StepEvent] = []
+    prev_step_id: str | None = None
+    for i, usage in enumerate(steps):
+        step_id = f"{task_id}-step-{i}"
+        events.append(
+            StepEvent.from_usage(
+                usage,
+                step_id=step_id,
+                parent_step_id=prev_step_id,
+                task_id=task_id,
+                task_type=task_type,
+                outcome=outcome,
+            )
+        )
+        prev_step_id = step_id
+    return events
 
 
 @dataclass

@@ -10,6 +10,10 @@ dependencies = [
     "langgraph>=1.2,<2",  # durable orchestration shell (Phase 4)
     "langgraph-checkpoint-postgres>=3.1,<4",  # PostgresSaver checkpointer (wired in L2)
     "duckdb>=1.5,<2",  # columnar query layer over the JSONL analytics spine (L4)
+    "fastapi>=0.115",  # the service seam: HTTP wrapper over the graph (Phase 5a)
+    "sse-starlette>=2",  # text/event-stream for the live run feed
+    "uvicorn>=0.30",  # ASGI server for `python -m mission_control.service`
+    "httpx>=0.27",  # the CLI drives the runtime as a client of the service API
 ]
 
 [project.optional-dependencies]
@@ -19,6 +23,7 @@ dev = [
 
 [project.scripts]
 eval-gate = "mission_control.eval_gate:main"
+mission-control = "mission_control.cli:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -20,7 +20,7 @@ from typing import Callable, Optional
 
 from . import roles, worktree
 from .tasks import Task, TaskType
-from .telemetry import RunTelemetry, StepEvent, TelemetrySink
+from .telemetry import RunTelemetry, TelemetrySink, events_from_steps
 from .worker import StubWorker, Worker, WorkerResult
 
 # Default location for per-run JSONL telemetry files.
@@ -166,20 +166,15 @@ class Orchestrator:
         one file per run, one line per step."""
         stamp = time.strftime("%Y%m%d-%H%M%S")
         path = self.telemetry_dir / f"run-{task.task_id}-{stamp}-{uuid.uuid4().hex[:6]}.jsonl"
+        events = events_from_steps(
+            worker_result.steps,
+            task_id=task.task_id,
+            task_type=task.task_type.value,  # metaphor string, from roles
+            outcome=outcome,
+        )
         with TelemetrySink(path) as sink:
-            prev_step_id: Optional[str] = None
-            for i, usage in enumerate(worker_result.steps):
-                step_id = f"{task.task_id}-step-{i}"
-                event = StepEvent.from_usage(
-                    usage,
-                    step_id=step_id,
-                    parent_step_id=prev_step_id,
-                    task_id=task.task_id,
-                    task_type=task.task_type.value,  # metaphor string, from roles
-                    outcome=outcome,
-                )
+            for event in events:
                 sink.record(event)
-                prev_step_id = step_id
             return sink.telemetry
 
     # -- teardown ----------------------------------------------------------

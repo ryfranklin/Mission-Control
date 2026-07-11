@@ -109,12 +109,32 @@ it in place (`read_json_auto`, zero ETL) for cross-run cost/quality; **Postgres*
 is the transactional system-of-record for run state. Different tools, different
 jobs — nothing crammed into one store.
 
+**The service is the seam (5a).** A thin **FastAPI** app wraps `graph.py` — it
+launches / resolves / streams / queries runs, but owns **no orchestration logic**
+(the graph still does all of it). One entry point into the runtime:
+
+| Endpoint | What it does |
+|---|---|
+| `POST /runs` | Launch a run against a target; kicks off the graph in a background task keyed by `thread_id`. |
+| `POST /runs/{id}/approve` · `/reject` | Resolve the durable go/no-go by **resuming the existing `interrupt()`** (approve → apply-burn; reject → scrub). |
+| `POST /runs/{id}/scrub` | Scrub (kill) a run with clean teardown. |
+| `GET /runs` · `GET /runs/{id}` | List runs (status/target filters) · run detail, from the Postgres registry. |
+| `GET /runs/{id}/events` | **SSE** stream of the merged live feed: node transitions + priced telemetry + gate-waiting. |
+| `GET /metrics` | Cross-run cost/quality from the DuckDB pass. |
+
+**Every UI is a client of these same endpoints.** The **CLI** (this phase) is the
+first client — it drives the runtime purely over HTTP and never imports the graph.
+The **web UI (5b)** and **Slack app (5c)** will be *additional clients of the exact
+same API* — no client re-implements orchestration; they all talk to the seam.
+
 ---
 
 ## Entrypoints
 
 | Command | What it does |
 |---|---|
+| `python -m mission_control.service` | Run the FastAPI service (the seam) on `127.0.0.1:8000`. v1 = **localhost, no auth**. `MC_SERVICE_SDK=1` for the real worker. |
+| `mission-control` · `python -m mission_control.cli` | CLI over the service API: `launch` · `watch`/`follow` · `runs` · `approve`/`reject`/`scrub`. `--base-url`/`$MC_SERVICE_URL`. |
 | `eval-gate` · `python -m mission_control.eval_gate` | The CI contract: run evals, gate vs `baseline.json`, exit 0/nonzero. `--k`/`--n`/`--demo`. |
 | `python -m mission_control.baseline [N]` | Build/refresh `golden/baseline.json` (N repeats). |
 | `python -m mission_control.analytics` | DuckDB cross-run cost/quality report over the JSONL. |
@@ -159,6 +179,10 @@ src/mission_control/
   sdk_worker.py       Claude Agent SDK worker (explicit context, AI-DLC steering)
   orchestrator.py     imperative dispatch → gate → apply/scrub → teardown
   graph.py            durable LangGraph shell + PostgresSaver + interrupt() gate
+  live.py             the merged live feed (node transitions + priced telemetry)
+  runs_store.py       the Postgres runs registry (status/cost ledger)
+  service/            FastAPI service — the seam wrapping graph.py (5a)
+  cli.py              CLI: a client of the service API (never imports the graph)
   worktree.py         git-worktree isolation
   telemetry.py        per-step JSONL events
   pricing.py          the single model→price table
