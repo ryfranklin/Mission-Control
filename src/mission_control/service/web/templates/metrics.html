@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="panel">
+  <h2>Cost / performance dashboard</h2>
+  <form class="filters" hx-get="/ui/metrics/panel" hx-target="#metrics-panel"
+        hx-swap="innerHTML" hx-trigger="change, submit">
+    <label>Target
+      <input name="target" list="known-targets" value="{{ scope_target }}" placeholder="all targets">
+      <datalist id="known-targets">
+        {% for t in targets %}<option value="{{ t }}"></option>{% endfor %}
+      </datalist>
+    </label>
+    <label>From <input name="from" type="datetime-local" value="{{ scope_from }}"></label>
+    <label>To <input name="to" type="datetime-local" value="{{ scope_to }}"></label>
+    <button type="submit">Apply</button>
+    <a href="/ui/metrics" class="reset">reset</a>
+  </form>
+</section>
+
+<div id="metrics-panel">
+  {% include "_metrics_panel.html" %}
+</div>
+
+{% endblock %}

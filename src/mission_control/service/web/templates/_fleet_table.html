@@ -1,0 +1,36 @@
+<table class="fleet">
+  <thead>
+    <tr>
+      <th>{{ labels.worker }} · target</th>
+      <th>type</th>
+      <th>status</th>
+      <th>cost</th>
+      <th>started</th>
+      <th>ended</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for run in runs %}
+    <tr>
+      <td class="target"><a href="/ui/runs/{{ run.run_id }}">{{ run.target or run.run_id }}</a></td>
+      <td><span class="badge badge-{{ run.task_type }}">{{ run.task_type }}</span></td>
+      <td><span class="status status-{{ run.status }}">{{ run.status }}</span></td>
+      <td>${{ '%.6f'|format(run.cost_usd) }}</td>
+      <td class="muted">{{ run.started_at | ts }}</td>
+      <td class="muted">{{ run.ended_at | ts }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="6" class="muted">No {{ labels.worker }}s dispatched yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div class="pager">
+  <a class="{% if page <= 0 %}disabled{% endif %}" href="/ui?page={{ page - 1 }}">&larr; prev</a>
+  <span>page {{ page + 1 }} · {{ total }} run(s)</span>
+  <a class="{% if not has_next %}disabled{% endif %}" href="/ui?page={{ page + 1 }}">next &rarr;</a>
+</div>
+
+{% if oob %}
+<span id="live-count" class="livecount" hx-swap-oob="true"><b>{{ live_count }}</b> live</span>
+{% endif %}

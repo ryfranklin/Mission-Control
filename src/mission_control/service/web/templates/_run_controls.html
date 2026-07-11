@@ -1,0 +1,23 @@
+<div id="run-controls" class="run-controls"{% if oob %} hx-swap-oob="true"{% endif %}>
+{%- if resolving %}
+  <span class="controls-note">{{ message or "decision sent — resuming; watch the timeline." }}</span>
+{%- elif status == "awaiting_gate" %}
+  <div class="gate-banner">
+    <span class="gate-title">{{ labels.go }} / {{ labels.no_go }}</span>
+    <span class="muted">holding at the gate — awaiting a decision</span>
+  </div>
+  <div class="actions">
+    <button class="act-btn" hx-post="/ui/runs/{{ run_id }}/approve"
+            hx-target="#run-controls" hx-swap="outerHTML" hx-disabled-elt=".act-btn">{{ labels.go }}</button>
+    <button class="act-btn ghost" hx-post="/ui/runs/{{ run_id }}/reject"
+            hx-target="#run-controls" hx-swap="outerHTML" hx-disabled-elt=".act-btn">{{ labels.no_go }}</button>
+    <button class="act-btn ghost" hx-post="/ui/runs/{{ run_id }}/scrub"
+            hx-target="#run-controls" hx-swap="outerHTML" hx-disabled-elt=".act-btn">{{ labels.scrub }}</button>
+  </div>
+{%- elif not ended %}
+  <div class="actions">
+    <button class="act-btn ghost" hx-post="/ui/runs/{{ run_id }}/cancel"
+            hx-target="#run-controls" hx-swap="outerHTML" hx-disabled-elt=".act-btn">cancel · stop mid-run</button>
+  </div>
+{%- endif %}
+</div>

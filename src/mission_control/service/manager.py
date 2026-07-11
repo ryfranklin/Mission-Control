@@ -2,33 +2,51 @@
 
 It wraps ``graph.py`` — it does NOT re-implement orchestration. Its jobs:
 
-* launch a run by driving the EXISTING graph (via :func:`live.stream_run`) in a
-  background task, keyed by ``thread_id``;
-* fan the merged live feed (node transitions + priced telemetry + gate-waiting)
-  out to any number of SSE subscribers, with full replay for late/reconnecting
-  clients;
-* resolve the durable go/no-go by resuming the EXISTING ``interrupt()`` with a
-  decision (approve → go, reject/scrub → no-go); and
-* answer status/detail/list straight from the S2 runs ledger.
+* launch a run by driving the EXISTING graph (via :func:`live.stream_run_sync` in a
+  worker thread) in a background task, keyed by ``thread_id``;
+* fan the merged live feed (node transitions + priced telemetry + gate-waiting +
+  an explicit terminal event) out to SSE subscribers, and DURABLY persist every
+  event so a reconnect after a restart can replay the full timeline (live tail
+  from the in-process channel; replay from the Postgres event log);
+* resolve the durable go/no-go by resuming the EXISTING ``interrupt()`` (approve →
+  go, reject → no-go);
+* cancel an in-flight run at the next node boundary, tearing its worktree down; and
+* answer status/detail/list/summary straight from the S2 runs ledger.
 
-One process, in-memory fan-out; durability + the runs ledger live in Postgres.
+The only "runtime" thing it does beyond launching/querying the graph is worktree
+teardown on the cancel/failure paths — the graph's own teardown node can't run
+when we stop the run mid-flight, so the seam reuses the existing worktree helper
+to avoid a leak. No dispatch/gate/apply logic lives here.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator, Optional
 from uuid import uuid4
 
 from langgraph.types import Command
 
-from .. import roles
-from ..graph import build_run_graph, initial_state
+from .. import roles, worktree
+from ..graph import build_run_graph, initial_state, worker_cost_usd
 from ..live import GateWaiting, NodeTransition, StepMetric, stream_run_sync
-from ..runs_store import TERMINAL_STATUSES, RunRow, RunStore
+from ..runs_store import (
+    STATUS_AWAITING_GATE,
+    STATUS_QUEUED,
+    STATUS_RUNNING,
+    STATUS_SCRUBBED,
+    TERMINAL_STATUSES,
+    RunRow,
+    RunStore,
+)
+
+# Statuses that mean a run is still in flight (for the header's live count).
+_ACTIVE_STATUSES = (STATUS_QUEUED, STATUS_RUNNING, STATUS_AWAITING_GATE)
 from ..tasks import Task, TaskType
 from ..worker import StubWorker
 
@@ -37,6 +55,9 @@ _TASK_TYPE = {t.value: t for t in TaskType}
 
 # Sentinel pushed to subscriber queues when a run's feed is complete.
 _CLOSED = object()
+
+# Feed event names (functional labels, not metaphor vocabulary).
+EVENT_TERMINAL = "terminal"
 
 
 class RunNotFound(Exception):
@@ -52,50 +73,39 @@ class RunConflict(Exception):
 
 
 class _Channel:
-    """A per-run event log with live fan-out. Retains full history so a client
-    that connects late (or reconnects) can replay from any point, then follow."""
+    """Per-run LIVE fan-out. Purely in-process and ephemeral — the durable timeline
+    lives in the ``run_events`` table; this only tails events to attached SSE
+    subscribers. ``seq`` is a global per-run counter seeded from the store so
+    numbering continues across a process restart."""
 
-    def __init__(self) -> None:
-        self.history: list[dict] = []
+    def __init__(self, start_seq: int) -> None:
         self._subscribers: set[asyncio.Queue] = set()
-        self._lock = asyncio.Lock()
         self.closed = False
+        self._next_seq = start_seq
+        self._seq_lock = threading.Lock()
 
-    async def publish(self, payload: dict) -> None:
-        async with self._lock:
-            event = {**payload, "id": len(self.history)}
-            self.history.append(event)
-            for q in self._subscribers:
-                q.put_nowait(event)
+    def next_seq(self) -> int:
+        with self._seq_lock:
+            seq = self._next_seq
+            self._next_seq += 1
+            return seq
+
+    async def push(self, event: dict) -> None:
+        for q in list(self._subscribers):
+            q.put_nowait(event)
 
     async def close(self) -> None:
-        async with self._lock:
-            self.closed = True
-            for q in self._subscribers:
-                q.put_nowait(_CLOSED)
+        self.closed = True
+        for q in list(self._subscribers):
+            q.put_nowait(_CLOSED)
 
-    async def subscribe(self, last_id: Optional[int]) -> AsyncIterator[dict]:
-        """Replay events after ``last_id`` (or from the start), then follow live
-        until the run's feed closes. Registration snapshots history under the lock
-        so no event is dropped or duplicated across the replay→follow handover."""
+    def attach(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
-        async with self._lock:
-            start = 0 if last_id is None else last_id + 1
-            backlog = self.history[start:]
-            was_closed = self.closed
-            self._subscribers.add(q)
-        try:
-            for event in backlog:
-                yield event
-            if was_closed:
-                return
-            while True:
-                item = await q.get()
-                if item is _CLOSED:
-                    return
-                yield item
-        finally:
-            self._subscribers.discard(q)
+        self._subscribers.add(q)
+        return q
+
+    def detach(self, q: asyncio.Queue) -> None:
+        self._subscribers.discard(q)
 
 
 def _serialize(event) -> dict:
@@ -110,7 +120,7 @@ def _serialize(event) -> dict:
 
 
 class RunManager:
-    """Launches / resolves / streams / queries runs over the existing graph."""
+    """Launches / resolves / cancels / streams / queries runs over the existing graph."""
 
     def __init__(
         self,
@@ -125,7 +135,9 @@ class RunManager:
         self._worker_factory = worker_factory or (lambda: StubWorker())
         self._telemetry_dir = Path(telemetry_dir) if telemetry_dir else None
         self._graphs: dict[str, object] = {}       # per-target compiled graph (shared cp/store)
-        self._channels: dict[str, _Channel] = {}    # per-run live feed
+        self._channels: dict[str, _Channel] = {}    # per-run live fan-out
+        self._cancels: dict[str, threading.Event] = {}  # per-run cooperative cancel flag
+        self._resolving: set[str] = set()           # gates mid-resolution (one-shot guard)
         self._tasks: set[asyncio.Task] = set()      # background drives (keep refs alive)
 
     # -- graph wiring ------------------------------------------------------
@@ -143,6 +155,13 @@ class RunManager:
             )
             self._graphs[key] = graph
         return graph
+
+    def _channel_for(self, run_id: str) -> _Channel:
+        channel = self._channels.get(run_id)
+        if channel is None:
+            channel = _Channel(self._store.max_event_seq(run_id) + 1)
+            self._channels[run_id] = channel
+        return channel
 
     def _spawn(self, coro) -> None:
         task = asyncio.create_task(coro)
@@ -163,7 +182,7 @@ class RunManager:
         task = Task(task_id=f"{task_type}-{uuid4().hex[:8]}", task_type=tt, prompt=prompt)
         self._store.launch(run_id, task_type=task_type, target=str(target_path.resolve()))
 
-        self._channels[run_id] = _Channel()
+        self._channel_for(run_id)
         self._spawn(self._drive(run_id, target_path, initial_state(task, run_id=run_id)))
         return run_id
 
@@ -178,81 +197,252 @@ class RunManager:
         return self._resolve(run_id, roles.NO_GO)
 
     def scrub(self, run_id: str) -> RunRow:
-        """Kill a run with clean teardown. A run paused at the gate is resumed
-        no-go (drives the graph to teardown); an already-finished run is a no-op."""
+        """Resolve a run paused at the gate with a no-go (clean teardown via the
+        graph). An already-finished run is a no-op. For an in-flight (mid-node) run,
+        use :meth:`cancel`."""
         row = self._require(run_id)
         if row.status in TERMINAL_STATUSES:
-            return row  # already torn down
+            return row
         return self._resolve(run_id, roles.NO_GO)
 
     def _resolve(self, run_id: str, decision: str) -> RunRow:
         row = self._require(run_id)
-        from ..runs_store import STATUS_AWAITING_GATE
-
         if row.status != STATUS_AWAITING_GATE:
             raise RunConflict(
                 f"run is not awaiting a gate decision (status={row.status})", status=row.status
             )
-        self._channels.setdefault(run_id, _Channel())
-        self._spawn(self._drive(run_id, Path(row.target), Command(resume=decision)))
+        # One-shot: a gate is resolved exactly once. The check-and-set is atomic on
+        # the event loop (no await between), so a double-submit's second call is
+        # rejected here — before a second resume could double-apply the burn.
+        if run_id in self._resolving:
+            raise RunConflict("gate decision already in progress", status=row.status)
+        self._resolving.add(run_id)
+        self._channel_for(run_id)
+        self._spawn(self._resume(run_id, Path(row.target), Command(resume=decision)))
         return self._require(run_id)
+
+    async def _resume(self, run_id: str, target: Path, payload) -> None:
+        try:
+            await self._drive(run_id, target, payload)
+        finally:
+            self._resolving.discard(run_id)
+
+    # -- cancel (mid-node, cooperative) ------------------------------------
+
+    def cancel(self, run_id: str) -> RunRow:
+        """Stop an in-flight run at the next node boundary (distinct from scrub,
+        which resolves the gate). Sets a cooperative flag the driver checks between
+        nodes; the driver then tears the worktree down and marks the run scrubbed.
+        Cancellation completes asynchronously — poll status or the terminal event."""
+        row = self._require(run_id)
+        if row.status in TERMINAL_STATUSES:
+            raise RunConflict(f"run already finished (status={row.status})", status=row.status)
+        if row.status == STATUS_AWAITING_GATE:
+            raise RunConflict(
+                "run is paused at the gate — use reject/scrub, not cancel", status=row.status
+            )
+        self._cancels.setdefault(run_id, threading.Event()).set()
+        return row
 
     # -- the background driver --------------------------------------------
 
     async def _drive(self, run_id: str, target: Path, payload) -> None:
-        """Drive one leg of the graph and publish its merged feed. A leg that ends
-        at the gate leaves the channel open (more comes on resume); a leg that ends
-        terminal (or errors) closes it.
+        """Drive one leg of the graph, persisting + fanning out its merged feed.
 
-        The graph runs on the sync ``PostgresSaver`` (whose async API is
-        unimplemented), so we drive the SYNC merged feed in a worker thread and
-        marshal each event back onto this loop — keeping node/telemetry ordering
-        and applying backpressure via ``.result()``."""
+        A leg that ends at the gate leaves the feed open (more comes on resume). A
+        leg that ends terminal emits an explicit terminal event and closes. A leg
+        stopped by cancel breaks at the next node boundary, then tears down + marks
+        scrubbed. A leg that errors is marked failed (best-effort teardown)."""
         graph = self._graph_for(target)
         config = {"configurable": {"thread_id": run_id}}
         channel = self._channels[run_id]
         loop = asyncio.get_running_loop()
+        cancel_event = self._cancels.setdefault(run_id, threading.Event())
 
-        def pump() -> None:
+        def pump() -> str:
             for event in stream_run_sync(graph, payload, config):
-                asyncio.run_coroutine_threadsafe(
-                    channel.publish(_serialize(event)), loop
-                ).result()
+                self._persist_and_push(run_id, channel, loop, event)
+                if cancel_event.is_set():
+                    return "cancelled"
+            return "ok"
 
         try:
-            await asyncio.to_thread(pump)
-        except Exception as exc:  # noqa: BLE001 — record, surface, and end the feed
+            result = await asyncio.to_thread(pump)
+        except Exception as exc:  # noqa: BLE001 — record, tear down, surface, end the feed
             self._store.mark_failed(run_id, f"{type(exc).__name__}: {exc}")
-            await channel.publish({"event": "error", "data": {"message": str(exc)}})
-            await channel.close()
+            await self._safe_teardown(target, config)
+            await self._finalize(run_id, channel)
             return
+
+        if result == "cancelled":
+            await self._finalize_cancel(run_id, target, config, channel)
+            return
+
         row = self._store.get_run(run_id)
         if row is not None and row.status in TERMINAL_STATUSES:
-            await channel.close()
+            await self._finalize(run_id, channel)  # explicit terminal event, then close
+        # else: paused at the gate — leave the feed open for the resume leg.
+
+    def _persist_and_push(self, run_id: str, channel: _Channel, loop, event) -> None:
+        """(pump thread) assign a global seq, persist to the durable log, tail live."""
+        payload = _serialize(event)
+        seq = channel.next_seq()
+        self._store.append_event(run_id, seq, payload["event"], payload["data"])
+        wire = {"seq": seq, "event": payload["event"], "data": payload["data"]}
+        asyncio.run_coroutine_threadsafe(channel.push(wire), loop).result()
+
+    async def _emit(self, run_id: str, channel: _Channel, event_name: str, data: dict) -> None:
+        """(loop) persist + tail one manager-synthesized event (e.g. the terminal)."""
+        seq = channel.next_seq()
+        await asyncio.to_thread(self._store.append_event, run_id, seq, event_name, data)
+        await channel.push({"seq": seq, "event": event_name, "data": data})
+
+    async def _finalize(self, run_id: str, channel: _Channel) -> None:
+        """Emit the explicit terminal event with the run's final status + cost, then
+        close the feed so clients learn the outcome from the stream itself."""
+        row = self._store.get_run(run_id)
+        if row is not None:
+            await self._emit(run_id, channel, EVENT_TERMINAL,
+                             {"status": row.status, "cost_usd": row.cost_usd})
+        await channel.close()
+
+    async def _finalize_cancel(self, run_id: str, target: Path, config: dict, channel: _Channel) -> None:
+        state = await asyncio.to_thread(self._state, target, config)
+        await asyncio.to_thread(self._remove_worktree, target, state)
+        cost = worker_cost_usd(state)
+        await asyncio.to_thread(
+            self._store.finish, run_id,
+            status=STATUS_SCRUBBED, cost_usd=cost, detail="cancelled mid-run",
+        )
+        await self._finalize(run_id, channel)
+
+    def _state(self, target: Path, config: dict) -> dict:
+        """Read the run's checkpointed state (for worktree path + cost)."""
+        try:
+            return self._graph_for(target).get_state(config).values
+        except Exception:  # noqa: BLE001
+            return {}
+
+    async def _safe_teardown(self, target: Path, config: dict) -> None:
+        """Remove the run's worktree if one was created (idempotent). Mirrors the
+        graph's teardown node for the paths where that node can't run (cancel/fail)."""
+        state = await asyncio.to_thread(self._state, target, config)
+        await asyncio.to_thread(self._remove_worktree, target, state)
+
+    def _remove_worktree(self, target: Path, state: dict) -> None:
+        path = state.get("worktree_path")
+        if not path or not Path(path).exists():
+            return
+        wt = worktree.Worktree(
+            path=Path(path),
+            branch=state.get("worktree_branch", ""),
+            target_repo=Path(target).resolve(),
+            _holder=Path(state.get("worktree_holder", path)),
+        )
+        worktree.remove_worktree(wt)
 
     # -- queries -----------------------------------------------------------
 
     def get_run(self, run_id: str) -> RunRow:
         return self._require(run_id)
 
-    def list_runs(self, *, status: Optional[str] = None, target: Optional[str] = None) -> list[RunRow]:
-        target_key = str(Path(target).expanduser().resolve()) if target else None
-        return self._store.list_runs({"status": status, "target": target_key})
+    def list_runs(
+        self,
+        *,
+        status: Optional[str] = None,
+        target: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        order: str = "desc",
+        created_from: Optional[datetime] = None,
+        created_to: Optional[datetime] = None,
+    ) -> tuple[list[RunRow], int]:
+        filt = {"status": status, "target": self._target_key(target)}
+        rows = self._store.list_runs(
+            filt, limit=limit, offset=offset, order=order,
+            created_from=created_from, created_to=created_to,
+        )
+        total = self._store.count_runs(filt, created_from=created_from, created_to=created_to)
+        return rows, total
+
+    def cost_summary(
+        self,
+        *,
+        target: Optional[str] = None,
+        created_from: Optional[datetime] = None,
+        created_to: Optional[datetime] = None,
+    ) -> dict:
+        return self._store.cost_summary(
+            {"target": self._target_key(target)},
+            created_from=created_from, created_to=created_to,
+        )
+
+    def list_targets(self) -> list[str]:
+        """Targets the registry knows about (for the UI launch selector)."""
+        return self._store.list_targets()
+
+    def active_count(self) -> int:
+        """Runs still in flight (queued/running/awaiting_gate) — the header count."""
+        return sum(self._store.count_runs({"status": s}) for s in _ACTIVE_STATUSES)
+
+    async def iter_events(self, run_id: str, last_id: Optional[int]) -> AsyncIterator[tuple]:
+        """Yield ``(phase, event)`` for a run: ``phase="history"`` for durable replay
+        (everything after ``last_id``, from the event log) seamlessly handed off to
+        ``phase="live"`` from the in-process tail. Attaching to the live channel
+        BEFORE reading the log, plus a monotonic ``seq`` watermark, guarantees no gap
+        and no duplicate across the replay→tail boundary."""
+        self._require(run_id)  # 404 if unknown
+        channel = self._channel_for(run_id)
+        q = channel.attach()
+        highest = last_id if last_id is not None else -1
+        try:
+            stored = await asyncio.to_thread(self._store.read_events, run_id, after_seq=last_id)
+            for ev in stored:
+                if ev["seq"] > highest:
+                    yield "history", ev
+                    highest = ev["seq"]
+
+            terminal = await asyncio.to_thread(self._is_terminal, run_id)
+            if channel.closed or terminal:
+                while not q.empty():  # drain the tiny replay↔live overlap window
+                    item = q.get_nowait()
+                    if item is not _CLOSED and item["seq"] > highest:
+                        yield "live", item
+                        highest = item["seq"]
+                return
+
+            while True:
+                item = await q.get()
+                if item is _CLOSED:
+                    return
+                if item["seq"] > highest:
+                    yield "live", item
+                    highest = item["seq"]
+        finally:
+            channel.detach(q)
 
     async def events(self, run_id: str, last_id: Optional[int]) -> AsyncIterator[dict]:
-        """The SSE event source for a run. Yields SSE-ready dicts; formatting +
-        keepalive pings are the endpoint's job (via EventSourceResponse)."""
-        self._require(run_id)  # 404 if unknown
-        channel = self._channels.get(run_id)
-        if channel is None:  # known to the ledger but not streamed in this process
-            channel = self._channels.setdefault(run_id, _Channel())
-            if self._store.get_run(run_id).status in TERMINAL_STATUSES:
-                await channel.close()
-        async for event in channel.subscribe(last_id):
-            yield {"event": event["event"], "id": str(event["id"]),
-                   "data": json.dumps(event["data"], default=str, sort_keys=True)}
+        """SSE-dict event source (JSON payloads) for API/CLI clients."""
+        async for _phase, ev in self.iter_events(run_id, last_id):
+            yield self._sse(ev)
 
     # -- helpers -----------------------------------------------------------
+
+    @staticmethod
+    def _sse(ev: dict) -> dict:
+        return {
+            "event": ev["event"],
+            "id": str(ev["seq"]),
+            "data": json.dumps(ev["data"], default=str, sort_keys=True),
+        }
+
+    @staticmethod
+    def _target_key(target: Optional[str]) -> Optional[str]:
+        return str(Path(target).expanduser().resolve()) if target else None
+
+    def _is_terminal(self, run_id: str) -> bool:
+        row = self._store.get_run(run_id)
+        return row is not None and row.status in TERMINAL_STATUSES
 
     def _require(self, run_id: str) -> RunRow:
         row = self._store.get_run(run_id)

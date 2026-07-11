@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import Optional
 
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 # -- lifecycle statuses (functional labels; sim/burn metaphor stays in roles) --
 STATUS_QUEUED = "queued"
@@ -58,6 +59,21 @@ _DDL = (
     """,
     "CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (status)",
     "CREATE INDEX IF NOT EXISTS runs_created_at_idx ON runs (created_at DESC)",
+    # Durable per-run event log backing the SSE feed's replay (Last-Event-ID). The
+    # in-process channel is the LIVE tail; this table is the durable timeline, so a
+    # reconnect after a restart reconstructs the full history — not just the resume
+    # leg. `seq` is a global per-run counter (NOT the in-memory index), so numbering
+    # continues across process restarts.
+    """
+    CREATE TABLE IF NOT EXISTS run_events (
+        run_id      TEXT NOT NULL,
+        seq         INTEGER NOT NULL,
+        event_type  TEXT NOT NULL,
+        data        JSONB NOT NULL,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (run_id, seq)
+    )
+    """,
 )
 
 
@@ -201,9 +217,13 @@ class RunStore:
             row = cur.fetchone()
         return RunRow(**row) if row else None
 
-    def list_runs(self, filter: Optional[dict] = None, *, limit: int = 100) -> list[RunRow]:
-        """Runs newest-first. ``filter`` narrows by any of status/task_type/target/
-        run_id (keys with None values are ignored); unknown keys are rejected."""
+    def _where(
+        self,
+        filter: Optional[dict],
+        created_from: Optional[datetime],
+        created_to: Optional[datetime],
+    ) -> tuple[str, dict]:
+        """Build a shared WHERE clause for list/count/summary (parameterized)."""
         clauses, params = [], {}
         for key, value in (filter or {}).items():
             if key not in _FILTERABLE:
@@ -211,13 +231,155 @@ class RunStore:
             if value is not None:
                 clauses.append(f"{key} = %({key})s")
                 params[key] = value
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params["_limit"] = limit
+        if created_from is not None:
+            clauses.append("created_at >= %(_from)s")
+            params["_from"] = created_from
+        if created_to is not None:
+            clauses.append("created_at < %(_to)s")
+            params["_to"] = created_to
+        return (f"WHERE {' AND '.join(clauses)}" if clauses else ""), params
+
+    def list_runs(
+        self,
+        filter: Optional[dict] = None,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        order: str = "desc",
+        created_from: Optional[datetime] = None,
+        created_to: Optional[datetime] = None,
+    ) -> list[RunRow]:
+        """A page of runs ordered by ``created_at`` (``desc`` = newest-first, default).
+        ``filter`` narrows by status/task_type/target/run_id (None values ignored);
+        ``created_from``/``created_to`` bound the window (half-open [from, to))."""
+        direction = "ASC" if str(order).lower() == "asc" else "DESC"
+        where, params = self._where(filter, created_from, created_to)
+        params["_limit"], params["_offset"] = limit, offset
         with self._pool.connection() as conn:
             cur = conn.cursor(row_factory=dict_row)
             cur.execute(
-                f"SELECT * FROM runs {where} ORDER BY created_at DESC LIMIT %(_limit)s",
+                f"SELECT * FROM runs {where} "
+                f"ORDER BY created_at {direction} LIMIT %(_limit)s OFFSET %(_offset)s",
                 params,
             )
             rows = cur.fetchall()
         return [RunRow(**r) for r in rows]
+
+    def count_runs(
+        self,
+        filter: Optional[dict] = None,
+        *,
+        created_from: Optional[datetime] = None,
+        created_to: Optional[datetime] = None,
+    ) -> int:
+        """Total matching rows (for paging), ignoring limit/offset."""
+        where, params = self._where(filter, created_from, created_to)
+        with self._pool.connection() as conn:
+            cur = conn.cursor()
+            cur.execute(f"SELECT count(*) FROM runs {where}", params)
+            return int(cur.fetchone()[0])
+
+    def cost_summary(
+        self,
+        filter: Optional[dict] = None,
+        *,
+        created_from: Optional[datetime] = None,
+        created_to: Optional[datetime] = None,
+    ) -> dict:
+        """Aggregate rollup over the runs registry for a scope (target/window): total
+        runs + reconciled cost, priced steps (from the event log), and the sim/burn
+        and per-target breakdowns. The transactional counterpart to the DuckDB pass —
+        cheap and exact. Cost is reconciled-at-teardown; in-flight runs contribute 0
+        (unreconciled, not free — see PHASE5A_FINDINGS Q1)."""
+        where, params = self._where(filter, created_from, created_to)
+        with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute(
+                f"SELECT count(*) AS runs, COALESCE(sum(cost_usd), 0) AS cost_usd FROM runs {where}",
+                params,
+            )
+            total = cur.fetchone()
+            cur.execute(
+                f"SELECT task_type, count(*) AS runs, COALESCE(sum(cost_usd), 0) AS cost_usd "
+                f"FROM runs {where} GROUP BY task_type ORDER BY task_type",
+                params,
+            )
+            by_task_type = cur.fetchall()
+            cur.execute(
+                f"SELECT target, count(*) AS runs, COALESCE(sum(cost_usd), 0) AS cost_usd "
+                f"FROM runs {where} GROUP BY target ORDER BY cost_usd DESC, target",
+                params,
+            )
+            by_target = cur.fetchall()
+            # Priced steps for the scoped runs, from the durable event log.
+            cur.execute(
+                f"SELECT count(*) FROM run_events WHERE event_type = 'step_metric' "
+                f"AND run_id IN (SELECT run_id FROM runs {where})",
+                params,
+            )
+            steps = int(cur.fetchone()["count"])
+        return {
+            "runs": int(total["runs"]),
+            "cost_usd": round(float(total["cost_usd"]), 8),
+            "steps": steps,
+            "by_task_type": [
+                {"task_type": r["task_type"], "runs": int(r["runs"]),
+                 "cost_usd": round(float(r["cost_usd"]), 8)}
+                for r in by_task_type if r["task_type"]
+            ],
+            "by_target": [
+                {"target": r["target"], "runs": int(r["runs"]),
+                 "cost_usd": round(float(r["cost_usd"]), 8)}
+                for r in by_target if r["target"]
+            ],
+        }
+
+    def list_targets(self) -> list[str]:
+        """Distinct non-null targets the registry has seen, alphabetical — the
+        set the UI's launch selector offers."""
+        with self._pool.connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT DISTINCT target FROM runs WHERE target IS NOT NULL ORDER BY target"
+            )
+            return [r[0] for r in cur.fetchall()]
+
+    # -- durable event log (backs the SSE replay) --------------------------
+
+    def append_event(self, run_id: str, seq: int, event_type: str, data: dict) -> None:
+        """Persist one feed event at a global per-run ``seq``. Idempotent: a replayed
+        node that re-emits the same (run_id, seq) is a no-op."""
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO run_events (run_id, seq, event_type, data)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (run_id, seq) DO NOTHING
+                """,
+                (run_id, seq, event_type, Jsonb(data)),
+            )
+
+    def read_events(self, run_id: str, *, after_seq: Optional[int] = None) -> list[dict]:
+        """The durable timeline for a run, in order; ``after_seq`` replays only the
+        tail past a client's Last-Event-ID."""
+        clause = "AND seq > %(after)s" if after_seq is not None else ""
+        with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute(
+                f"SELECT seq, event_type, data FROM run_events "
+                f"WHERE run_id = %(run_id)s {clause} ORDER BY seq ASC",
+                {"run_id": run_id, "after": after_seq},
+            )
+            return [
+                {"seq": r["seq"], "event": r["event_type"], "data": r["data"]}
+                for r in cur.fetchall()
+            ]
+
+    def max_event_seq(self, run_id: str) -> int:
+        """Highest persisted seq for a run, or -1 if none (seeds the live counter so
+        numbering continues across a restart)."""
+        with self._pool.connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT max(seq) FROM run_events WHERE run_id = %s", (run_id,))
+            value = cur.fetchone()[0]
+        return -1 if value is None else int(value)

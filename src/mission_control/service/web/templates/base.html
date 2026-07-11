@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mission Control — {{ labels.orchestrator }}</title>
+  <link rel="stylesheet" href="/ui/static/app.css">
+  <script src="/ui/static/vendor/htmx.min.js" defer></script>
+  <script src="/ui/static/vendor/sse.js" defer></script>
+</head>
+<body hx-ext="sse">
+  <header class="masthead">
+    <span class="title">Mission Control</span>
+    <span class="director">{{ labels.orchestrator }} · <b>on station</b></span>
+    <nav class="nav"><a href="/ui">fleet</a><a href="/ui/metrics">metrics</a></nav>
+    <span class="spacer"></span>
+    <span class="livecount" id="live-count"><b>{{ live_count }}</b> live</span>
+  </header>
+  <main class="wrap">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
