@@ -54,6 +54,12 @@ VENV_ACTIVATE="[ -f '$REPO_ROOT/.venv/bin/activate' ] && source '$REPO_ROOT/.ven
 
 # Window 0 / pane 0: claude session (left).
 tmux new-session -d -s "$SESSION" -n control -c "$REPO_ROOT"
+
+# Normalize pane numbering for this window so the .0/.1/.2 pane targets below
+# resolve regardless of the machine's global pane-base-index (some configs set
+# it to 1, which would make .0 a non-existent pane and abort under `set -e`).
+tmux set-window-option -t "$SESSION:control" pane-base-index 0
+
 tmux send-keys -t "$SESSION:control.0" \
   "command -v claude >/dev/null 2>&1 && claude || { echo 'claude CLI not found on PATH'; exec \$SHELL; }" C-m
 
