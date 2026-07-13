@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="plan-session">
+  <div class="transcript-col panel">
+    <a href="/ui/plans" class="muted">&larr; {{ labels.plan }}s</a>
+    <h2>{{ labels.plan }} · {{ plan.id }}</h2>
+
+    <!-- The interactive transcript. New turns append here; the planner's reply
+         streams in over SSE (see _plan_reply.html). -->
+    <div id="transcript" class="transcript">
+      {% for t in turns %}
+        {% with role = t.role, content = t.content %}{% include "_plan_msg.html" %}{% endwith %}
+      {% endfor %}
+    </div>
+
+    {% if plan.status in ["drafting", "ready"] %}
+    <form class="turn-form" hx-post="/ui/plans/{{ plan.id }}/turns"
+          hx-target="#transcript" hx-swap="beforeend"
+          hx-on::after-request="this.reset()">
+      <textarea name="content" required rows="2"
+                placeholder="Describe what to build, or answer the planner…"></textarea>
+      <button type="submit">send</button>
+    </form>
+    {% else %}
+    <p class="muted">This {{ labels.plan }} is {{ plan.status }} — handed to Mission Control.</p>
+    {% endif %}
+  </div>
+
+  {% include "_plan_panel.html" %}
+</section>
+
+{% endblock %}

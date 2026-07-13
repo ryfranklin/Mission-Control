@@ -31,6 +31,12 @@
     {% include "_run_controls.html" %}
   {% endwith %}
 
+  <!-- Live work-in-progress / go-no-go review: what the burn has produced in its
+       worktree. Loads on open; while the burn is running it self-refreshes so files
+       accrue on screen (a long node is no longer a black box). -->
+  <div id="run-changes" hx-get="/ui/runs/{{ run.run_id }}/changes"
+       hx-trigger="load" hx-swap="outerHTML"></div>
+
   <p class="muted timeline-legend">
     Durable history replays first (dimmed), then the live tail. Cost is
     <b>not reconciled</b> until the run finishes.

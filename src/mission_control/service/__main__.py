@@ -20,8 +20,10 @@ PORT = int(os.environ.get("MC_SERVICE_PORT", "8000"))
 
 
 def main() -> None:
-    manager, pool = build_default_manager(use_sdk=os.environ.get("MC_SERVICE_SDK") == "1")
-    app = create_app(manager)
+    manager, plan_manager, builder, pool = build_default_manager(
+        use_sdk=os.environ.get("MC_SERVICE_SDK") == "1"
+    )
+    app = create_app(manager, plan_manager, builder)
     try:
         uvicorn.run(app, host=HOST, port=PORT)
     finally:

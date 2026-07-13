@@ -1,0 +1,5 @@
+{# One transcript bubble. `role` is 'operator' or 'planner'; `content` is its text. #}
+<div class="msg msg-{{ role }}">
+  <div class="who">{% if role == "planner" %}{{ labels.planner }}{% else %}operator{% endif %}</div>
+  <div class="body pre">{{ content }}</div>
+</div>

@@ -1,0 +1,85 @@
+{# The live plan panel. Rendered inline on the session page, refreshed as a fragment
+   after each streamed reply, and swapped out-of-band from the reply stream's `done`
+   event when `oob` is set. #}
+{# While building, the panel polls itself so child-run status/cost update live. #}
+<aside id="plan-panel" class="panel plan-panel"{% if oob %} hx-swap-oob="true"{% endif %}
+  {% if plan.status == "building" %}hx-get="/ui/plans/{{ plan.id }}/panel"
+  hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
+  <h3>{{ labels.plan }}</h3>
+
+  <p class="plan-mode">
+    <span class="badge badge-{{ plan.mode }}">{{ plan.mode }}</span>
+    <span class="status status-{{ plan.status }}">{{ plan.status }}</span>
+  </p>
+
+  <h4>INCEPTION stages</h4>
+  <ul class="checklist">
+    {% for s in stages %}
+    <li class="{{ 'in-place' if s.in_place else 'pending' }}">
+      <span class="tick">{{ "☑" if s.in_place else "☐" }}</span> {{ s.title }}
+    </li>
+    {% endfor %}
+  </ul>
+
+  <h4>Requirements</h4>
+  {% if requirements %}
+  <ul class="reqs">
+    {% for r in requirements %}
+    <li><b>{{ r.key }}</b> <span class="req-state">{{ r.state }}</span>
+      <span class="muted">{{ (r.value or "") | truncate(80) }}</span></li>
+    {% endfor %}
+  </ul>
+  {% else %}<p class="muted">none yet</p>{% endif %}
+
+  <h4>Units</h4>
+  {% if units %}
+  <ol class="units">
+    {% for u in units %}
+    <li><span class="badge badge-{{ u.task_type }}">{{ u.task_type }}</span>
+      <span class="phase-tag">{{ u.phase }}</span> {{ u.title }}</li>
+    {% endfor %}
+  </ol>
+  {% else %}<p class="muted">none yet</p>{% endif %}
+
+  {% if is_brownfield %}
+  <h4>Readiness</h4>
+  <ul class="readiness">
+    {% for c in readiness %}
+    <li class="{{ 'pass' if c.met else 'fail' }}">
+      <span class="rc">{{ "✓" if c.met else "✗" }}</span> {{ c.label }}
+      {% if not c.met and c.detail %}<span class="muted">— {{ c.detail }}</span>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+
+  {% if child_runs %}
+  <h4>Build runs <span class="muted">· ${{ "%.6f"|format(build_cost) }}</span></h4>
+  <ul class="child-runs">
+    {% for r in child_runs %}
+    <li>
+      <span class="muted">#{{ r.plan_unit_seq }}</span>
+      <span class="badge badge-{{ r.task_type }}">{{ r.task_type }}</span>
+      <a href="/ui/runs/{{ r.run_id }}">station</a>
+      <span class="status status-{{ r.status }}">{{ r.status }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+
+  <!-- HAND-OFF: enabled only when finalize would succeed (readiness met) and the plan
+       is not already handed off (building / done / finalized). -->
+  {% set handed = plan.status in ["finalized", "building", "done"] %}
+  <form class="handoff-form" hx-post="/ui/plans/{{ plan.id }}/finalize"
+        hx-target="#plan-panel" hx-swap="outerHTML">
+    <button class="handoff" type="submit"
+            {% if not ready or handed %}disabled{% endif %}>
+      {% if handed %}
+        ✓ {{ labels.plan }} handed to Mission Control ({{ plan.status }})
+      {% else %}
+        {{ labels.plan }} is in place → hand to Mission Control
+      {% endif %}
+    </button>
+  </form>
+  {% if message %}<p class="muted handoff-msg">{{ message }}</p>{% endif %}
+</aside>

@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator, Optional
@@ -33,7 +33,7 @@ from uuid import uuid4
 from langgraph.types import Command
 
 from .. import roles, worktree
-from ..graph import build_run_graph, initial_state, worker_cost_usd
+from ..graph import build_run_graph, initial_state, run_tracked, worker_cost_usd
 from ..live import GateWaiting, NodeTransition, StepMetric, stream_run_sync
 from ..runs_store import (
     STATUS_AWAITING_GATE,
@@ -58,6 +58,17 @@ _CLOSED = object()
 
 # Feed event names (functional labels, not metaphor vocabulary).
 EVENT_TERMINAL = "terminal"
+
+
+@dataclass
+class SimResult:
+    """The outcome of a synchronous sim run (used by the planner's reverse-engineering
+    step): the run id (for traceability in the runs registry), the worker's summary,
+    and the terminal ledger status."""
+
+    run_id: str
+    summary: str
+    status: str
 
 
 class RunNotFound(Exception):
@@ -139,6 +150,13 @@ class RunManager:
         self._cancels: dict[str, threading.Event] = {}  # per-run cooperative cancel flag
         self._resolving: set[str] = set()           # gates mid-resolution (one-shot guard)
         self._tasks: set[asyncio.Task] = set()      # background drives (keep refs alive)
+        self._run_observer = None                   # notified (on the loop) when a run ends
+
+    def set_run_observer(self, observer) -> None:
+        """Register a callback ``observer(run_id)`` invoked ON THE LOOP each time a run
+        reaches a terminal state. The plan builder uses this to advance a plan's build
+        (dispatch newly-ready units, roll up status) without any new orchestration."""
+        self._run_observer = observer
 
     # -- graph wiring ------------------------------------------------------
 
@@ -170,21 +188,103 @@ class RunManager:
 
     # -- launch ------------------------------------------------------------
 
-    def launch(self, *, target: str, task_type: str, prompt: str) -> str:
+    def launch(
+        self,
+        *,
+        target: str,
+        task_type: str,
+        prompt: str,
+        plan_id: Optional[str] = None,
+        plan_unit_seq: Optional[int] = None,
+    ) -> str:
         """Register a queued run and kick off the graph in the background, keyed by
-        its thread_id (== run_id). Returns the run_id immediately."""
+        its thread_id (== run_id). Returns the run_id immediately. When built from a
+        plan, ``plan_id``/``plan_unit_seq`` record the link on the run row."""
         target_path = Path(target).expanduser()
         if not target_path.is_dir():
             raise RunConflict(f"target is not a directory: {target}", status="rejected")
+        # Must be its OWN git repo root — never a subdir of a parent repo (a worktree
+        # carved there would land in the PARENT). Refuse rather than pollute it.
+        if not worktree.is_git_repo(target_path):
+            raise RunConflict(
+                f"target is not a git repository root (init it, or it is nested inside "
+                f"a parent repo): {target}", status="rejected")
         tt = _TASK_TYPE[task_type]  # validated by the request model
 
         run_id = f"run-{uuid4().hex}"
         task = Task(task_id=f"{task_type}-{uuid4().hex[:8]}", task_type=tt, prompt=prompt)
-        self._store.launch(run_id, task_type=task_type, target=str(target_path.resolve()))
+        self._store.launch(run_id, task_type=task_type, target=str(target_path.resolve()),
+                           plan_id=plan_id, plan_unit_seq=plan_unit_seq)
 
         self._channel_for(run_id)
         self._spawn(self._drive(run_id, target_path, initial_state(task, run_id=run_id)))
         return run_id
+
+    # -- plan-child run queries (the plan owns its runs) -------------------
+
+    def child_runs(self, plan_id: str) -> list[RunRow]:
+        """A plan's child runs, ordered by the unit seq they were built from."""
+        return self._store.plan_runs(plan_id)
+
+    def plan_cost(self, plan_id: str) -> float:
+        """Rolled-up reconciled cost across a plan's child runs."""
+        return self._store.plan_cost(plan_id)
+
+    # -- go/no-go review: what a burn will apply --------------------------
+
+    def run_changes(self, run_id: str) -> Optional[dict]:
+        """What a burn has produced in its worktree — the material for a go/no-go
+        decision (at the gate) OR a live work-in-progress view (while ``running``, so a
+        long burn isn't a black box). ``None`` for runs with no live worktree. Reads the
+        branch/path from the durable checkpoint, so it survives a restart; the worktree
+        peek uses a throwaway index and never mutates the worker's work."""
+        row = self._require(run_id)
+        if row.status not in (STATUS_RUNNING, STATUS_AWAITING_GATE) or not row.target:
+            return None
+        config = {"configurable": {"thread_id": run_id}}
+        state = self._state(Path(row.target), config)
+        branch = state.get("worktree_branch")
+        if not branch:
+            return None
+        try:
+            changes = worktree.changes(Path(row.target), branch, state.get("worktree_path"))
+        except Exception:  # noqa: BLE001 — an observability aid must never break a run
+            return None
+        changes["status"] = row.status
+        if row.started_at:
+            started = row.started_at
+            now = datetime.now(started.tzinfo) if started.tzinfo else datetime.utcnow()
+            changes["elapsed_s"] = max(0, int((now - started).total_seconds()))
+        return changes
+
+    # -- synchronous sim (the reverse-engineering read-only investigation) ---
+
+    def run_sim(self, *, target: str, prompt: str) -> "SimResult":
+        """Launch a read-only sim against ``target`` and run it to completion, returning
+        its worker summary. Reuses the EXACT launch path (the run graph + runs ledger)
+        — no second code-reading path — so the sim is a first-class, recorded run. A sim
+        never gates, so this returns synchronously; safe to call from a worker thread
+        (the planner engine drives it off-loop)."""
+        target_path = Path(target).expanduser()
+        if not target_path.is_dir():
+            raise RunConflict(f"target is not a directory: {target}", status="rejected")
+        if not worktree.is_git_repo(target_path):
+            raise RunConflict(
+                f"target is not a git repository root: {target}", status="rejected")
+        graph = self._graph_for(target_path)
+        run_id = f"run-{uuid4().hex}"
+        task = Task(
+            task_id=f"{roles.SIM}-{uuid4().hex[:8]}",
+            task_type=TaskType.READ_ONLY,
+            prompt=prompt,
+        )
+        final = run_tracked(graph, self._store, task, thread_id=run_id)
+        row = self._store.get_run(run_id)
+        return SimResult(
+            run_id=run_id,
+            summary=str(final.get("worker_summary", "")).strip(),
+            status=row.status if row else "",
+        )
 
     # -- gate resolution (reuse the existing interrupt/resume) -------------
 
@@ -299,12 +399,16 @@ class RunManager:
 
     async def _finalize(self, run_id: str, channel: _Channel) -> None:
         """Emit the explicit terminal event with the run's final status + cost, then
-        close the feed so clients learn the outcome from the stream itself."""
+        close the feed so clients learn the outcome from the stream itself. This is the
+        single terminal choke point for every run, so it's where a plan-child run
+        notifies its builder to advance the build."""
         row = self._store.get_run(run_id)
         if row is not None:
             await self._emit(run_id, channel, EVENT_TERMINAL,
                              {"status": row.status, "cost_usd": row.cost_usd})
         await channel.close()
+        if self._run_observer is not None and row is not None and row.plan_id is not None:
+            self._run_observer(run_id, row.plan_id)  # advance the owning plan's build
 
     async def _finalize_cancel(self, run_id: str, target: Path, config: dict, channel: _Channel) -> None:
         state = await asyncio.to_thread(self._state, target, config)

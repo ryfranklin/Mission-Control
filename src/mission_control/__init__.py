@@ -4,10 +4,25 @@ Spawns workers, isolates them in git worktrees, supervises them, records
 telemetry, and gates their side effects.
 """
 
-from .aidlc import AidlcSteering, Phase, probe, task_type_for_phase
+from .aidlc import (
+    AidlcSteering,
+    Phase,
+    ReadinessCriterion,
+    is_ready,
+    probe,
+    readiness_report,
+    task_type_for_phase,
+)
 from .judge import DEFAULT_JUDGE_MODEL, JudgeResult, LlmJudge
 from .live import GateWaiting, LiveEvent, NodeTransition, StepMetric, stream_run
 from .orchestrator import Orchestrator, RunResult, TaskRun
+from .plans_store import (
+    PlanRequirement,
+    PlanRow,
+    PlanStore,
+    PlanTurn,
+    PlanUnit,
+)
 from .runs_store import RunRow, RunStore
 from .sdk_worker import SdkWorker, WorkerError
 from .tasks import Task, TaskType
@@ -35,6 +50,14 @@ __all__ = [
     "Phase",
     "probe",
     "task_type_for_phase",
+    "readiness_report",
+    "is_ready",
+    "ReadinessCriterion",
+    "PlanStore",
+    "PlanRow",
+    "PlanTurn",
+    "PlanRequirement",
+    "PlanUnit",
     "LlmJudge",
     "JudgeResult",
     "DEFAULT_JUDGE_MODEL",

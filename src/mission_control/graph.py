@@ -41,6 +41,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from . import live, pricing, roles, runs_store, worktree
+from .plans_store import PlanStore
 from .runs_store import RunStore
 from .tasks import Task, TaskType
 from .telemetry import StepUsage, TelemetrySink, events_from_steps
@@ -365,6 +366,18 @@ def build_runs_store(pool, *, setup: bool = True) -> RunStore:
     migration approach as ``PostgresSaver.setup()`` — safe to call every start.
     """
     store = RunStore(pool)
+    if setup:
+        store.setup()
+    return store
+
+
+def build_plans_store(pool, *, setup: bool = True) -> PlanStore:
+    """Build the PLAN store over the SAME pool the checkpointer / runs ledger use.
+
+    ``setup`` runs the idempotent DDL (``CREATE TABLE IF NOT EXISTS``), the same
+    migration approach as ``PostgresSaver.setup()`` — safe to call every start.
+    """
+    store = PlanStore(pool)
     if setup:
         store.setup()
     return store

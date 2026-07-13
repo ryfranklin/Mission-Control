@@ -48,6 +48,303 @@ def task_type_for_phase(phase: Phase) -> TaskType:
     )
 
 
+# -- planning: target modes, requirement states, and the finalize readiness rule --
+
+# Target modes (AI-DLC vocabulary, not our metaphor): a fresh build vs. an existing
+# codebase. Greenfield opens with "Using AI-DLC, …" (see apply_invocation); brownfield
+# reverse-engineers first.
+MODE_GREENFIELD = "greenfield"
+MODE_BROWNFIELD = "brownfield"
+MODES = (MODE_GREENFIELD, MODE_BROWNFIELD)
+
+# Requirement lifecycle states (the accreting requirements' readiness). An ``open``
+# requirement is captured but unresolved and blocks a brownfield finalize; ``ready``
+# is resolved/agreed and counts toward the gate.
+REQ_OPEN = "open"
+REQ_READY = "ready"
+
+# The always-execute INCEPTION stages a greenfield plan must lay down before it can be
+# finalized (per the AI-DLC INCEPTION phase; the conditional stages — reverse
+# engineering, user stories, application/units — are excluded here).
+REQUIRED_INCEPTION_STAGES = (
+    "Workspace Detection",
+    "Requirements Analysis",
+    "Workflow Planning",
+)
+
+# The requirement keys the brownfield readiness gate checks — the accreting, checkable
+# requirements that make a plan "clear enough for Mission Control to operate".
+REQ_KEY_SCOPE = "scope"
+REQ_KEY_COMPONENTS = "affected_components"
+REQ_KEY_ACCEPTANCE = "acceptance_criteria"
+
+# Requirement keys for the reverse-engineering artifacts folded back from the sim run.
+REQ_KEY_RE_SUMMARY = "reverse_engineering:summary"
+REQ_KEY_RE_RUN = "reverse_engineering:run"
+
+
+@dataclass(frozen=True)
+class ReadinessCriterion:
+    """One checkable finalize criterion, with whether it is currently met. The unmet
+    ones are surfaced in ``GET /plans/{id}`` so the UI can show what is still blocking."""
+
+    key: str
+    label: str
+    met: bool
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class BrownfieldCriterion:
+    """A brownfield readiness criterion: the requirement key that satisfies it (``None``
+    for the units criterion) and the clarifying question that gathers it."""
+
+    key: str
+    label: str
+    req_key: str | None
+    question: "StageQuestion"
+
+
+def _unit_wellformed(unit) -> tuple[bool, str]:
+    """A unit is well-formed when it has a title, a valid phase, a ``task_type``
+    consistent with that phase, and a list ``depends_on``."""
+    if not (getattr(unit, "title", "") and str(unit.title).strip()):
+        return False, "missing title"
+    try:
+        phase = Phase(unit.phase)
+    except (ValueError, TypeError):
+        return False, f"invalid phase {unit.phase!r}"
+    if unit.task_type != task_type_for_phase(phase).value:
+        return False, "task_type inconsistent with phase"
+    if not isinstance(unit.depends_on, list):
+        return False, "depends_on is not a list"
+    return True, ""
+
+
+def _worklist_criterion(
+    units, *, key: str = "units", label: str = "CONSTRUCTION work-list is ready"
+) -> ReadinessCriterion:
+    """A plan is only executable once it has a non-empty, well-formed CONSTRUCTION
+    work-list. Shared by both modes so neither can be finalized with nothing to build."""
+    construction = [u for u in units if u.phase == Phase.CONSTRUCTION.value]
+    malformed = [f"unit {u.seq}: {_unit_wellformed(u)[1]}"
+                 for u in units if not _unit_wellformed(u)[0]]
+    if not construction:
+        detail = "no CONSTRUCTION units yet"
+    elif malformed:
+        detail = "; ".join(malformed)
+    else:
+        detail = ""
+    return ReadinessCriterion(key, label, bool(construction) and not malformed, detail)
+
+
+def readiness_report(
+    mode: str, *, inception_stages=(), requirements=(), units=()
+) -> list[ReadinessCriterion]:
+    """The explicit, checkable finalize criteria for a plan, each flagged met/unmet.
+
+    * **greenfield** — one criterion per always-execute INCEPTION stage, PLUS a
+      non-empty, well-formed CONSTRUCTION work-list (so a plan can't be handed off with
+      nothing to build — readiness flips green at Workflow Planning otherwise).
+    * **brownfield** — the requirements-readiness gate: scope bounded, affected
+      components identified, acceptance criteria stated, and every CONSTRUCTION unit
+      well-formed. ("Clear enough for Mission Control to operate.")
+    """
+    if mode == MODE_BROWNFIELD:
+        state_by_key = {r.key: r.state for r in requirements}
+        crits: list[ReadinessCriterion] = []
+        for c in BROWNFIELD_CRITERIA:
+            if c.req_key is not None:
+                met = state_by_key.get(c.req_key) == REQ_READY
+                crits.append(ReadinessCriterion(
+                    c.key, c.label, met, "" if met else "not yet captured"))
+            else:  # the units criterion
+                crits.append(_worklist_criterion(units, key=c.key, label=c.label))
+        return crits
+    # greenfield (the default mode)
+    present = set(inception_stages)
+    crits = [
+        ReadinessCriterion(f"stage:{s}", f"{s} in place", s in present,
+                           "" if s in present else "stage not yet completed")
+        for s in REQUIRED_INCEPTION_STAGES
+    ]
+    crits.append(_worklist_criterion(units))
+    return crits
+
+
+def is_ready(criteria) -> bool:
+    """A plan is finalizable when every readiness criterion is met."""
+    return all(c.met for c in criteria)
+
+
+def unmet_summary(criteria) -> str:
+    """A short human summary of the unmet criteria (the finalize-refusal reason)."""
+    return "; ".join(c.label for c in criteria if not c.met)
+
+
+# -- the INCEPTION stage walk (drives the interactive planner) --------------
+#
+# The ordered AI-DLC INCEPTION stages the planner walks with the operator. Each is
+# an INCEPTION-phase (read-only, ``sim``) activity; completing one lays it down as a
+# ``plan_unit`` titled by its ``title`` (which is why the titles here MUST match
+# REQUIRED_INCEPTION_STAGES for the required ones — the readiness gate looks them up
+# by title). ``units_generation`` is the terminal stage that additionally emits the
+# CONSTRUCTION (``burn``) work-list.
+
+
+@dataclass(frozen=True)
+class StageQuestion:
+    """One clarifying question, with optional multiple-choice options (A, B, C…)."""
+
+    text: str
+    options: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class InceptionStage:
+    """One INCEPTION stage in the walk."""
+
+    key: str
+    title: str
+    conditional: bool  # user stories run only if warranted; the rest always run
+    questions: tuple[StageQuestion, ...]
+
+
+INCEPTION_STAGES: tuple[InceptionStage, ...] = (
+    InceptionStage(
+        "workspace_detection", "Workspace Detection", False,
+        (
+            StageQuestion(
+                "Is this a fresh build or an existing codebase?",
+                ("Greenfield — a new project", "Brownfield — an existing repository"),
+            ),
+        ),
+    ),
+    InceptionStage(
+        "requirements_analysis", "Requirements Analysis", False,
+        (
+            StageQuestion("What is the core problem this must solve?"),
+            StageQuestion(
+                "Which non-functional needs are in scope?",
+                ("Performance", "Security", "Scalability", "None material yet"),
+            ),
+        ),
+    ),
+    InceptionStage(
+        "user_stories", "User Stories", True,
+        (
+            StageQuestion("Who are the primary user personas, and what are their goals?"),
+        ),
+    ),
+    InceptionStage(
+        "workflow_planning", "Workflow Planning", False,
+        (
+            StageQuestion(
+                "How should the build be sequenced?",
+                ("Thin end-to-end slice first", "Backend then frontend", "Risk-first"),
+            ),
+        ),
+    ),
+    InceptionStage(
+        "units_generation", "Units Generation", False,
+        (
+            StageQuestion(
+                "Ready to decompose into a CONSTRUCTION work-list?",
+                ("Yes — generate the units", "Not yet — refine first"),
+            ),
+        ),
+    ),
+)
+
+INCEPTION_STAGE_BY_KEY = {s.key: s for s in INCEPTION_STAGES}
+INCEPTION_STAGE_BY_TITLE = {s.title: s for s in INCEPTION_STAGES}
+
+# The reverse-engineering stage title (a brownfield-only INCEPTION activity, run as a
+# read-only sim; laid down as a unit like the other stages).
+REVERSE_ENGINEERING_TITLE = "Reverse Engineering"
+
+# The brownfield requirements-readiness gate, in the order the planner gathers them.
+# Each criterion carries the clarifying question that captures it; the terminal
+# ``units`` criterion is satisfied by the CONSTRUCTION work-list, not a requirement.
+BROWNFIELD_CRITERIA: tuple[BrownfieldCriterion, ...] = (
+    BrownfieldCriterion(
+        "scope", "Scope is bounded", REQ_KEY_SCOPE,
+        StageQuestion("What is the bounded scope of this change, and what is explicitly "
+                      "OUT of scope?"),
+    ),
+    BrownfieldCriterion(
+        "components", "Affected components are identified", REQ_KEY_COMPONENTS,
+        StageQuestion("Which components / modules of the existing codebase will this "
+                      "change touch?"),
+    ),
+    BrownfieldCriterion(
+        "acceptance", "Acceptance criteria are stated", REQ_KEY_ACCEPTANCE,
+        StageQuestion("What are the acceptance criteria — how will we know it is done "
+                      "and correct?"),
+    ),
+    BrownfieldCriterion(
+        "units", "Every CONSTRUCTION unit is well-formed", None,
+        StageQuestion("Ready to decompose the change into a CONSTRUCTION work-list?",
+                      ("Yes — generate the units", "Not yet — refine first")),
+    ),
+)
+
+BROWNFIELD_CRITERION_BY_KEY = {c.key: c for c in BROWNFIELD_CRITERIA}
+
+
+def next_inception_stage(
+    completed_titles, *, user_stories_warranted: bool
+) -> InceptionStage | None:
+    """The next stage to work, given the stages already laid down. Skips the
+    conditional ``user_stories`` stage unless it is warranted. Returns ``None`` when
+    the walk is complete."""
+    done = set(completed_titles)
+    for stage in INCEPTION_STAGES:
+        if stage.title in done:
+            continue
+        if stage.conditional and not user_stories_warranted:
+            continue
+        return stage
+    return None
+
+
+def format_question_block(title: str, questions) -> str:
+    """Render clarifying questions in the AI-DLC question format: numbered questions,
+    lettered options, and an ``[Answer]:`` tag the operator fills in."""
+    lines = [f"## {title} — please answer:", ""]
+    for i, q in enumerate(questions, start=1):
+        lines.append(f"{i}. {q.text}")
+        for letter, option in zip("ABCDE", q.options):
+            lines.append(f"   {letter}) {option}")
+        lines.append("   [Answer]: ")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def format_questions(stage: InceptionStage) -> str:
+    """Render an INCEPTION stage's clarifying questions (AI-DLC question format)."""
+    return format_question_block(stage.title, stage.questions)
+
+
+def format_criterion(criterion: BrownfieldCriterion) -> str:
+    """Render a brownfield criterion's clarifying question (AI-DLC question format)."""
+    return format_question_block(criterion.label, (criterion.question,))
+
+
+def default_steering(flavor: str = FLAVOR_GENERIC) -> AidlcSteering:
+    """A minimal AI-DLC steering used when the target carries no detectable install —
+    so a greenfield session still plans *under* AI-DLC (the 'So default' flavor). The
+    core text names the INCEPTION phase so composed prompts stay methodology-anchored."""
+    core = (
+        "AI-DLC methodology (default steering). Work the INCEPTION phase as an "
+        "interactive, read-only planning conversation: walk the stages "
+        + ", ".join(s.title for s in INCEPTION_STAGES)
+        + ". Ask clarifying questions before advancing a stage; never modify the "
+        "target. The CONSTRUCTION phase (code generation) is gated and comes later."
+    )
+    return AidlcSteering(core_rules_text=core, detail_rules_dir=None, flavor=flavor)
+
+
 @dataclass(frozen=True)
 class AidlcSteering:
     """A normalized AI-DLC install detected in a target worktree."""

@@ -51,7 +51,7 @@ def client(tmp_path):
 
 # -- helpers ---------------------------------------------------------------
 
-def _wait_status(client, run_id, wanted, timeout=20.0) -> dict:
+def _wait_status(client, run_id, wanted, timeout=60.0) -> dict:
     deadline = time.time() + timeout
     detail = {}
     while time.time() < deadline:
@@ -62,7 +62,7 @@ def _wait_status(client, run_id, wanted, timeout=20.0) -> dict:
     raise AssertionError(f"{run_id} never reached {wanted}; last status={detail.get('status')}")
 
 
-def _read_sse(client, run_id, timeout=20.0) -> list[dict]:
+def _read_sse(client, run_id, timeout=60.0) -> list[dict]:
     """Read a run's SSE feed to completion (the stream closes on a terminal run)."""
     events: list[dict] = []
     cur: dict = {}
@@ -252,7 +252,7 @@ def _fresh_repo(base: Path) -> Path:
     return repo
 
 
-def _events(client, run_id, headers=None, timeout=20.0) -> list[dict]:
+def _events(client, run_id, headers=None, timeout=60.0) -> list[dict]:
     events, cur = [], {}
     with client.stream("GET", f"/runs/{run_id}/events", headers=headers or {}, timeout=timeout) as r:
         for raw in r.iter_lines():

@@ -4,7 +4,7 @@
 {%- elif status == "awaiting_gate" %}
   <div class="gate-banner">
     <span class="gate-title">{{ labels.go }} / {{ labels.no_go }}</span>
-    <span class="muted">holding at the gate — awaiting a decision</span>
+    <span class="muted">holding at the gate — review the changes below, then decide</span>
   </div>
   <div class="actions">
     <button class="act-btn" hx-post="/ui/runs/{{ run_id }}/approve"

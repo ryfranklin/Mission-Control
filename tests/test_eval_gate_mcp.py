@@ -38,6 +38,19 @@ def _params(baseline: str, out: str) -> dict:
     }
 
 
+def _call_over_mcp(attempts: int = 3, **params) -> dict:
+    """Invoke the gate over MCP, retrying a transient stdio subprocess spawn/handshake
+    failure. Spawning a fresh interpreter is the fragile part under a loaded suite; the
+    gate result itself is deterministic, so one clean spawn suffices."""
+    last: Exception | None = None
+    for _ in range(attempts):
+        try:
+            return call_eval_gate_over_mcp(**params)
+        except Exception as exc:  # noqa: BLE001 — retry any spawn/transport hiccup
+            last = exc
+    raise AssertionError(f"eval-gate over MCP failed after {attempts} attempts: {last}")
+
+
 def test_server_exposes_eval_gate_tool(tmp_path):
     from mcp import ClientSession
     from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -56,7 +69,7 @@ def test_server_exposes_eval_gate_tool(tmp_path):
 
 def test_mcp_pass_matches_direct(tmp_path):
     params = _params("baseline.pass.json", str(tmp_path / "mcp"))
-    over_mcp = call_eval_gate_over_mcp(**params)
+    over_mcp = _call_over_mcp(**params)
     direct = gate_result(**params).to_json()
 
     assert over_mcp["passed"] is True and over_mcp["exit_code"] == 0
@@ -67,7 +80,7 @@ def test_mcp_pass_matches_direct(tmp_path):
 
 def test_mcp_regression_matches_direct(tmp_path):
     params = _params("baseline.regressed.json", str(tmp_path / "mcp"))
-    over_mcp = call_eval_gate_over_mcp(**params)
+    over_mcp = _call_over_mcp(**params)
     direct = gate_result(**params).to_json()
 
     assert over_mcp["passed"] is False and over_mcp["exit_code"] == 1

@@ -87,14 +87,16 @@ class InMemoryRunStore:
             "run_id": run_id, "thread_id": run_id, "target": None, "task_type": None,
             "status": "queued", "cost_usd": 0.0, "created_at": self._now(),
             "started_at": None, "ended_at": None, "detail": None,
+            "plan_id": None, "plan_unit_seq": None,
         })
 
     # transitions ---------------------------------------------------------
-    def launch(self, run_id, *, task_type=None, target=None):
+    def launch(self, run_id, *, task_type=None, target=None, plan_id=None, plan_unit_seq=None):
         with self._lock:
             if run_id not in self._rows:
                 row = self._ensure(run_id)
                 row["task_type"], row["target"] = task_type, target
+                row["plan_id"], row["plan_unit_seq"] = plan_id, plan_unit_seq
 
     def mark_running(self, run_id, *, target=None):
         with self._lock:

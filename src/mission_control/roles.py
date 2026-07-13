@@ -14,3 +14,5 @@ BURN = "burn"                    # a side-effectful task
 GO = "go"                        # approval / merge gate: proceed
 NO_GO = "no-go"                  # approval / merge gate: reject
 SCRUB = "scrub"                  # kill a task (and tear it down)
+PLAN = "Flight Plan"             # a plan (the planner's durable, hand-off-able output)
+PLANNER = "Flight Planner"       # the planner persona in the interactive session

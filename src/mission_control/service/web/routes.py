@@ -17,11 +17,14 @@ from datetime import datetime
 from fastapi import APIRouter, Form, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from markupsafe import escape
 from sse_starlette.sse import EventSourceResponse
 
-from ... import roles
+from ... import aidlc, roles
 from ..manager import RunConflict, RunManager, RunNotFound
 from ..metrics import compute_metrics
+from ..planner import DoneEvent, TokenEvent
+from ..plans import PlanConflict, PlanNotFound, PlanNotReady
 
 _SSE_PING_SECONDS = 15
 
@@ -57,6 +60,8 @@ def _labels() -> dict:
         "go": roles.GO,
         "no_go": roles.NO_GO,
         "scrub": roles.SCRUB,
+        "plan": roles.PLAN,
+        "planner": roles.PLANNER,
     }
 
 
@@ -161,6 +166,20 @@ def _cost_label(run) -> str:
     if run.ended_at:
         return f"${run.cost_usd:.6f} · reconciled"
     return "not yet reconciled"
+
+
+@router.get("/ui/runs/{run_id}/changes", response_class=HTMLResponse)
+def run_changes(request: Request, run_id: str):
+    """The go/no-go review panel: the diff a burn will apply (files, rationale, patch).
+    Loaded when a run reaches the gate so the operator reviews before deciding."""
+    mgr = _mgr(request)
+    try:
+        changes = mgr.run_changes(run_id)
+    except RunNotFound:
+        raise HTTPException(status_code=404, detail=f"no such run: {run_id}")
+    return templates.TemplateResponse(
+        request=request, name="_run_changes.html",
+        context={"labels": _labels(), "changes": changes, "run_id": run_id})
 
 
 @router.get("/ui/runs/{run_id}", response_class=HTMLResponse)
@@ -284,3 +303,200 @@ async def ui_scrub(request: Request, run_id: str):
 async def ui_cancel(request: Request, run_id: str):
     # Cancel = stop an IN-FLIGHT run mid-node (clean teardown). Distinct from scrub.
     return _write_action(request, run_id, _mgr(request).cancel, "cancel requested — stopping")
+
+
+# ==========================================================================
+# The Planner surface — a client of the P1–P3 plan endpoints.
+#
+# The interactive session reads like a chat: the operator posts a turn, and the
+# planner's reply STREAMS in over SSE (the same htmx-SSE pattern as the run feed).
+# A live panel beside it shows the plan taking shape (stages, requirements, units,
+# readiness). Route names stay functional; the plan metaphor is presentation only,
+# pulled from roles.py at request time (nothing here hardcodes the vocabulary).
+# ==========================================================================
+
+def _plans(request: Request):
+    plans = getattr(request.app.state, "plans", None)
+    if plans is None:  # the PLAN seam isn't mounted on this app
+        raise HTTPException(status_code=404, detail="plans are not enabled")
+    return plans
+
+
+def _stage_checklist(mode: str, units) -> list[dict]:
+    """The INCEPTION stage checklist: each stage + whether it is laid down 'in place'.
+    Reverse Engineering is a brownfield-only stage, shown once it applies."""
+    in_place = {u.title for u in units if u.phase == aidlc.Phase.INCEPTION.value}
+    checklist = [{"title": s.title, "in_place": s.title in in_place}
+                 for s in aidlc.INCEPTION_STAGES]
+    if mode == aidlc.MODE_BROWNFIELD or aidlc.REVERSE_ENGINEERING_TITLE in in_place:
+        checklist.insert(1, {"title": aidlc.REVERSE_ENGINEERING_TITLE,
+                             "in_place": aidlc.REVERSE_ENGINEERING_TITLE in in_place})
+    return checklist
+
+
+def _panel_ctx(request: Request, plan_id: str, *, message: str | None = None) -> dict:
+    plans = _plans(request)
+    mgr = _mgr(request)
+    plan, _turns, requirements, units, readiness = plans.aggregate(plan_id)
+    return {
+        "labels": _labels(),
+        "plan": plan,
+        "is_brownfield": plan.mode == aidlc.MODE_BROWNFIELD,
+        "stages": _stage_checklist(plan.mode, units),
+        "requirements": requirements,
+        "units": units,
+        "readiness": readiness,
+        "ready": aidlc.is_ready(readiness),
+        "child_runs": mgr.child_runs(plan_id),   # units dispatched as runs (build)
+        "build_cost": mgr.plan_cost(plan_id),     # rolled-up cost across child runs
+        "message": message,
+    }
+
+
+@router.get("/ui/plans", response_class=HTMLResponse)
+def plans_page(request: Request, page: int = 0):
+    """The plan list + the NEW-PLAN control (target / methodology / cloud)."""
+    plans = _plans(request)
+    page = max(0, page)
+    rows, total = plans.list_plans(limit=PAGE_SIZE, offset=page * PAGE_SIZE, order="desc")
+    ctx = {
+        "labels": _labels(),
+        "plans": rows,
+        "total": total,
+        "page": page,
+        "page_size": PAGE_SIZE,
+        "has_next": (page + 1) * PAGE_SIZE < total,
+        "live_count": _mgr(request).active_count(),
+        "default_methodology": plans.methodology_default,
+        "default_cloud": plans.cloud_default,
+    }
+    return templates.TemplateResponse(request=request, name="plans.html", context=ctx)
+
+
+@router.post("/ui/plans")
+def create_plan(
+    request: Request,
+    target: str = Form(""),
+    methodology: str = Form(""),
+    cloud: str = Form(""),
+):
+    """Open a session from the new-plan control. A blank / 'new' / 'greenfield' target
+    means a fresh build; a path means an existing repo (workspace detection decides
+    greenfield vs brownfield on the first turn)."""
+    plans = _plans(request)
+    t = target.strip()
+    tgt = None if (not t or t.lower() in {"new", "greenfield", "new/greenfield"}) else t
+    try:
+        row = plans.open_plan(
+            target=tgt, mode=aidlc.MODE_GREENFIELD,
+            methodology=methodology.strip() or None, cloud_target=cloud.strip() or None,
+        )
+    except PlanConflict as exc:
+        raise HTTPException(status_code=400, detail=f"cannot open plan: {exc}")
+    return RedirectResponse(url=f"/ui/plans/{row.id}", status_code=303)
+
+
+@router.get("/ui/plans/{plan_id}", response_class=HTMLResponse)
+def plan_session(request: Request, plan_id: str):
+    """The session: the interactive transcript beside the live plan panel."""
+    try:
+        plan, turns, *_ = _plans(request).aggregate(plan_id)
+    except PlanNotFound:
+        raise HTTPException(status_code=404, detail=f"no such plan: {plan_id}")
+    ctx = _panel_ctx(request, plan_id)
+    ctx["turns"] = turns
+    ctx["live_count"] = _mgr(request).active_count()
+    return templates.TemplateResponse(request=request, name="plan_detail.html", context=ctx)
+
+
+@router.get("/ui/plans/{plan_id}/panel", response_class=HTMLResponse)
+def plan_panel(request: Request, plan_id: str):
+    """The live plan panel fragment (htmx refreshes it after each streamed reply)."""
+    try:
+        return templates.TemplateResponse(
+            request=request, name="_plan_panel.html", context=_panel_ctx(request, plan_id))
+    except PlanNotFound:
+        raise HTTPException(status_code=404, detail=f"no such plan: {plan_id}")
+
+
+@router.post("/ui/plans/{plan_id}/turns", response_class=HTMLResponse)
+def plan_turn(request: Request, plan_id: str, content: str = Form(...)):
+    """Post an operator turn: record it, then hand back the operator bubble + an empty
+    planner bubble that opens the SSE reply stream (htmx appends the tokens)."""
+    plans = _plans(request)
+    try:
+        plans.record_operator_turn(plan_id, content)
+    except PlanNotFound:
+        raise HTTPException(status_code=404, detail=f"no such plan: {plan_id}")
+    except PlanConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return templates.TemplateResponse(
+        request=request, name="_plan_reply.html",
+        context={"labels": _labels(), "plan_id": plan_id, "content": content})
+
+
+@router.get("/ui/plans/{plan_id}/reply")
+async def plan_reply(request: Request, plan_id: str):
+    """SSE: stream the planner's reply to the pending operator turn as ``token``
+    fragments (htmx appends them into the bubble), then a ``done`` event carrying the
+    refreshed plan panel out-of-band. Same htmx-SSE shape as the run feed."""
+    plans = _plans(request)
+    try:
+        gen = plans.stream_reply(plan_id)
+    except PlanNotFound:
+        raise HTTPException(status_code=404, detail=f"no such plan: {plan_id}")
+
+    async def stream():
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        end = object()
+
+        def pump() -> None:
+            try:
+                for event in gen:
+                    asyncio.run_coroutine_threadsafe(queue.put(event), loop).result()
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(end), loop).result()
+
+        fut = loop.run_in_executor(None, pump)
+        try:
+            while True:
+                event = await queue.get()
+                if event is end:
+                    break
+                if isinstance(event, TokenEvent):
+                    yield {"event": "token", "data": str(escape(event.text))}
+                elif isinstance(event, DoneEvent):
+                    panel = templates.get_template("_plan_panel.html").render(
+                        **_panel_ctx(request, plan_id), oob=True)
+                    yield {"event": "done", "data": panel}
+            # Always close the stream (htmx `sse-close="done"` stops reconnection).
+            yield {"event": "done", "data": ""}
+        finally:
+            await fut
+
+    return EventSourceResponse(stream(), ping=_SSE_PING_SECONDS)
+
+
+@router.post("/ui/plans/{plan_id}/finalize", response_class=HTMLResponse)
+async def plan_finalize(request: Request, plan_id: str):
+    """The hand-off: lock the plan and hand it to Mission Control — the builder
+    translates its units into runs on the launch path. Only succeeds when readiness is
+    met; a refusal re-renders the panel with what's blocking. Returns the re-rendered
+    panel either way (htmx swaps #plan-panel)."""
+    plans = _plans(request)
+    message = None
+    try:
+        plans.finalize(plan_id)
+    except PlanNotFound:
+        raise HTTPException(status_code=404, detail=f"no such plan: {plan_id}")
+    except PlanNotReady as exc:
+        message = f"not ready — {exc.reason}"
+    builder = getattr(request.app.state, "builder", None)
+    if message is None and builder is not None:
+        await builder.start_build(plan_id)  # dispatch the units as sim/burn runs
+    return templates.TemplateResponse(
+        request=request, name="_plan_panel.html",
+        context=_panel_ctx(request, plan_id, message=message))

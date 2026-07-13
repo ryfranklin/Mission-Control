@@ -194,3 +194,79 @@ li.ev-divider {
 .final-banner.status-failed { border-color: var(--s-failed); }
 .final-banner.status-applied, .final-banner.status-done { border-color: var(--s-applied); }
 .final-banner.status-scrubbed { border-color: var(--s-scrubbed); }
+
+/* -- planner surface (Flight Plan) ------------------------------------- */
+/* mode badges (greenfield/brownfield) reuse the .badge base */
+.badge-greenfield { background: #16324a; color: #7cee9c; }
+.badge-brownfield { background: #3a2a16; color: #f2c14e; }
+
+/* new-plan control */
+.new-plan { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+.new-plan label { display: flex; flex-direction: column; gap: 4px; font-size: 11px;
+  color: var(--ink-dim); text-transform: uppercase; letter-spacing: 0.06em; }
+.new-plan input { background: var(--panel-2); border: 1px solid var(--edge); color: var(--ink);
+  padding: 6px 8px; border-radius: 4px; font: 13px var(--mono); min-width: 220px; }
+.new-plan button, .turn-form button, .handoff {
+  background: var(--panel-2); border: 1px solid var(--edge); color: var(--ink);
+  padding: 7px 14px; border-radius: 4px; font: 13px var(--mono); cursor: pointer; }
+.new-plan button:hover, .turn-form button:hover { border-color: var(--accent); color: #fff; }
+
+/* session: transcript beside the live panel */
+.plan-session { display: grid; grid-template-columns: 1fr 340px; gap: 16px; align-items: start; }
+.transcript { display: flex; flex-direction: column; gap: 10px; margin: 12px 0;
+  max-height: 62vh; overflow-y: auto; }
+.msg { border: 1px solid var(--edge); border-radius: 6px; padding: 8px 10px; background: var(--panel-2); }
+.msg .who { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-dim); margin-bottom: 3px; }
+.msg-operator { border-left: 3px solid var(--accent); }
+.msg-planner { border-left: 3px solid var(--s-applied); }
+.body.pre { white-space: pre-wrap; word-break: break-word; }
+.sse-sink { display: none; }
+
+.turn-form { display: flex; gap: 8px; align-items: flex-end; }
+.turn-form textarea { flex: 1; background: var(--panel-2); border: 1px solid var(--edge);
+  color: var(--ink); padding: 8px; border-radius: 4px; font: 13px var(--mono); resize: vertical; }
+
+/* live plan panel */
+.plan-panel h4 { margin: 14px 0 6px; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--ink-dim); }
+.plan-panel .plan-mode { display: flex; gap: 8px; }
+.checklist, .reqs, .units, .readiness { list-style: none; padding: 0; margin: 0;
+  display: flex; flex-direction: column; gap: 4px; }
+.checklist .tick { color: var(--s-applied); }
+.checklist .pending { color: var(--ink-dim); }
+.checklist .pending .tick { color: var(--ink-dim); }
+.reqs .req-state { color: var(--s-applied); font-size: 10px; text-transform: uppercase; }
+.units .phase-tag { color: var(--ink-dim); font-size: 10px; }
+.readiness .pass .rc { color: var(--s-applied); }
+.readiness .fail .rc { color: var(--s-failed); }
+.readiness .fail { color: var(--ink); }
+
+.handoff-form { margin-top: 16px; }
+.handoff { width: 100%; font-weight: 700; }
+.handoff:not([disabled]) { border-color: var(--s-applied); color: #7cee9c; }
+.handoff[disabled] { opacity: 0.45; cursor: not-allowed; }
+.handoff-msg { margin-top: 6px; color: var(--s-awaiting_gate); }
+
+/* plan build: child runs */
+.child-runs { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; }
+.child-runs li { display: flex; gap: 8px; align-items: baseline; }
+
+/* -- go/no-go review panel (the diff a burn will apply) ----------------- */
+.review { border: 1px solid var(--edge); border-radius: 8px; padding: 12px 14px;
+  margin: 10px 0; background: var(--panel-2); }
+.review h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--ink-dim); }
+.review-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--ink-dim); margin: 8px 0 3px; }
+.review-msg .pre { white-space: pre-wrap; margin: 0; color: var(--ink); }
+.review-files { list-style: none; padding: 0; margin: 0; display: flex;
+  flex-direction: column; gap: 2px; }
+.review-files li { display: flex; gap: 8px; align-items: baseline; }
+.review-files .add { color: var(--s-applied); }
+.review-files .del { color: var(--s-failed); }
+.review-diff { margin-top: 8px; }
+.review-diff summary { cursor: pointer; color: var(--ink-dim); font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.06em; }
+.review-diff .diff { max-height: 46vh; overflow: auto; background: var(--bg);
+  border: 1px solid var(--edge); border-radius: 6px; padding: 10px; margin-top: 6px;
+  white-space: pre; font-size: 12px; line-height: 1.4; }

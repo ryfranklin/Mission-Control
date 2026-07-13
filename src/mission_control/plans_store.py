@@ -1,0 +1,390 @@
+"""The PLAN store: a running instance's own operational memory.
+
+A plan is the interactive, durable record of *what MC is about to build* for a
+target — the planning-side counterpart to the runs ledger. It lives in the SAME
+Postgres as the LangGraph checkpointer, the runs ledger, and ``run_events`` (one
+substrate for all of the instance's durable state), and follows the same idempotent
+discipline: schema via ``CREATE TABLE IF NOT EXISTS``, stage-boundary writes as
+upserts keyed by natural identity, so a replay re-applies without duplicating.
+
+Four tables, one aggregate:
+
+* ``plans`` — the header: target, mode, methodology/cloud target, stage, status.
+* ``plan_turns`` — the interactive transcript (operator ↔ planner), ordered by seq.
+* ``plan_requirements`` — the accreting requirements (key → value/state), upserted.
+* ``plan_units`` — the CONSTRUCTION work-list MC will execute; each unit's
+  ``task_type`` is DERIVED from its phase via :func:`aidlc.task_type_for_phase`,
+  never stored by hand (the sim/burn metaphor stays sourced from ``roles``).
+
+This is a store + seam only — it adds NO orchestration to ``graph.py``. It is a
+client of the existing runtime that happens to share its connection pool.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
+
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+from .aidlc import Phase, task_type_for_phase
+
+# -- plan lifecycle statuses (functional labels) ---------------------------
+STATUS_DRAFTING = "drafting"
+STATUS_READY = "ready"
+STATUS_FINALIZED = "finalized"
+STATUS_BUILDING = "building"
+STATUS_DONE = "done"
+
+# -- transcript roles (planner domain, not the MC metaphor) ----------------
+ROLE_OPERATOR = "operator"
+ROLE_PLANNER = "planner"
+
+# -- unit statuses (the work-list's per-unit execution state) --------------
+UNIT_PENDING = "pending"
+
+# One statement per entry: the autocommit pool prepares statements, which forbids
+# multiple commands in a single execute() (same constraint as the runs ledger).
+_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS plans (
+        id           TEXT PRIMARY KEY,
+        target       TEXT,
+        mode         TEXT NOT NULL,
+        methodology  TEXT NOT NULL DEFAULT 'aidlc',
+        cloud_target TEXT NOT NULL DEFAULT 'aws',
+        stage        TEXT,
+        status       TEXT NOT NULL DEFAULT 'drafting',
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS plans_status_idx ON plans (status)",
+    "CREATE INDEX IF NOT EXISTS plans_created_at_idx ON plans (created_at DESC)",
+    # The interactive transcript: operator turns and the planner's replies, in order.
+    # seq is a per-plan counter (continues across process restarts).
+    """
+    CREATE TABLE IF NOT EXISTS plan_turns (
+        plan_id    TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        role       TEXT NOT NULL,
+        content    TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (plan_id, seq)
+    )
+    """,
+    # The accreting requirements — upserted by (plan_id, key) so a re-run of the
+    # capturing stage updates in place rather than duplicating.
+    """
+    CREATE TABLE IF NOT EXISTS plan_requirements (
+        plan_id    TEXT NOT NULL,
+        key        TEXT NOT NULL,
+        value      TEXT,
+        state      TEXT NOT NULL DEFAULT 'open',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (plan_id, key)
+    )
+    """,
+    # The CONSTRUCTION work-list — upserted by (plan_id, seq). task_type is derived
+    # from phase at write time; depends_on is a JSONB list of prerequisite unit seqs.
+    """
+    CREATE TABLE IF NOT EXISTS plan_units (
+        plan_id    TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        title      TEXT NOT NULL,
+        phase      TEXT NOT NULL,
+        task_type  TEXT NOT NULL,
+        depends_on JSONB NOT NULL DEFAULT '[]'::jsonb,
+        status     TEXT NOT NULL DEFAULT 'pending',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (plan_id, seq)
+    )
+    """,
+)
+
+
+@dataclass
+class PlanRow:
+    """One row of the ``plans`` header table."""
+
+    id: str
+    target: Optional[str]
+    mode: str
+    methodology: str
+    cloud_target: str
+    stage: Optional[str]
+    status: str
+    created_at: Optional[datetime]
+    updated_at: Optional[datetime]
+
+
+@dataclass
+class PlanTurn:
+    """One entry of the interactive transcript."""
+
+    plan_id: str
+    seq: int
+    role: str
+    content: str
+    created_at: Optional[datetime]
+
+
+@dataclass
+class PlanRequirement:
+    """One accreting requirement (key → value, with a readiness state)."""
+
+    plan_id: str
+    key: str
+    value: Optional[str]
+    state: str
+    created_at: Optional[datetime]
+    updated_at: Optional[datetime]
+
+
+@dataclass
+class PlanUnit:
+    """One unit of the CONSTRUCTION work-list."""
+
+    plan_id: str
+    seq: int
+    title: str
+    phase: str
+    task_type: str
+    depends_on: list
+    status: str
+    created_at: Optional[datetime]
+
+
+# Columns whose non-None values narrow a list_plans() query.
+_FILTERABLE = ("status", "mode", "target", "id")
+
+
+class PlanStore:
+    """Reads/writes the PLAN tables over a shared psycopg connection pool.
+
+    The pool is the one the checkpointer and runs ledger use (autocommit); this
+    store never opens its own — see :func:`mission_control.graph.postgres_checkpointer`.
+    """
+
+    def __init__(self, pool) -> None:
+        self._pool = pool
+
+    # -- schema ------------------------------------------------------------
+
+    def setup(self) -> None:
+        """Create the tables if absent. Idempotent (mirrors the runs ledger)."""
+        with self._pool.connection() as conn:
+            for statement in _DDL:
+                conn.execute(statement)
+
+    # -- plans header (idempotent open + stage/status transitions) ---------
+
+    def open_plan(
+        self,
+        plan_id: str,
+        *,
+        target: Optional[str],
+        mode: str,
+        methodology: str,
+        cloud_target: str,
+        stage: Optional[str] = None,
+        status: str = STATUS_DRAFTING,
+    ) -> None:
+        """Register a new plan session. A no-op if the row already exists, so a
+        re-open never resets an in-progress plan."""
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO plans (id, target, mode, methodology, cloud_target, stage, status)
+                VALUES (%(id)s, %(target)s, %(mode)s, %(methodology)s, %(cloud)s, %(stage)s, %(status)s)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                {
+                    "id": plan_id, "target": target, "mode": mode,
+                    "methodology": methodology, "cloud": cloud_target,
+                    "stage": stage, "status": status,
+                },
+            )
+
+    def set_stage(self, plan_id: str, stage: str) -> None:
+        """Move the plan to a new stage (idempotent; bumps updated_at)."""
+        self._update(plan_id, "stage", stage)
+
+    def set_mode(self, plan_id: str, mode: str) -> None:
+        """Set the plan's mode (workspace detection may derive it; bumps updated_at)."""
+        self._update(plan_id, "mode", mode)
+
+    def set_target(self, plan_id: str, target: str) -> None:
+        """Record the build target (e.g. a scaffolded workspace for a greenfield plan)."""
+        self._update(plan_id, "target", target)
+
+    def set_status(self, plan_id: str, status: str) -> None:
+        """Move the plan to a new status (idempotent; bumps updated_at)."""
+        self._update(plan_id, "status", status)
+
+    def _update(self, plan_id: str, column: str, value) -> None:
+        # column is a fixed internal literal, never user input (no injection surface).
+        with self._pool.connection() as conn:
+            conn.execute(
+                f"UPDATE plans SET {column} = %(value)s, updated_at = now() WHERE id = %(id)s",
+                {"value": value, "id": plan_id},
+            )
+
+    def get_plan(self, plan_id: str) -> Optional[PlanRow]:
+        with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute("SELECT * FROM plans WHERE id = %s", (plan_id,))
+            row = cur.fetchone()
+        return PlanRow(**row) if row else None
+
+    def _where(self, filter: Optional[dict]) -> tuple[str, dict]:
+        clauses, params = [], {}
+        for key, value in (filter or {}).items():
+            if key not in _FILTERABLE:
+                raise ValueError(f"unfilterable column: {key!r} (allowed: {_FILTERABLE})")
+            if value is not None:
+                clauses.append(f"{key} = %({key})s")
+                params[key] = value
+        return (f"WHERE {' AND '.join(clauses)}" if clauses else ""), params
+
+    def list_plans(
+        self,
+        filter: Optional[dict] = None,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        order: str = "desc",
+    ) -> list[PlanRow]:
+        """A page of plans ordered by ``created_at`` (``desc`` = newest-first)."""
+        direction = "ASC" if str(order).lower() == "asc" else "DESC"
+        where, params = self._where(filter)
+        params["_limit"], params["_offset"] = limit, offset
+        with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute(
+                f"SELECT * FROM plans {where} "
+                f"ORDER BY created_at {direction} LIMIT %(_limit)s OFFSET %(_offset)s",
+                params,
+            )
+            rows = cur.fetchall()
+        return [PlanRow(**r) for r in rows]
+
+    def count_plans(self, filter: Optional[dict] = None) -> int:
+        """Total matching plans (for paging), ignoring limit/offset."""
+        where, params = self._where(filter)
+        with self._pool.connection() as conn:
+            cur = conn.cursor()
+            cur.execute(f"SELECT count(*) FROM plans {where}", params)
+            return int(cur.fetchone()[0])
+
+    # -- transcript (append-in-order) --------------------------------------
+
+    def append_turn(self, plan_id: str, role: str, content: str) -> PlanTurn:
+        """Append one transcript turn at the next per-plan seq. The seq is computed
+        and inserted in a single statement, so concurrent appends stay ordered and
+        gap-free without an explicit lock."""
+        with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute(
+                """
+                INSERT INTO plan_turns (plan_id, seq, role, content)
+                VALUES (
+                    %(pid)s,
+                    COALESCE((SELECT max(seq) FROM plan_turns WHERE plan_id = %(pid)s), -1) + 1,
+                    %(role)s, %(content)s
+                )
+                RETURNING plan_id, seq, role, content, created_at
+                """,
+                {"pid": plan_id, "role": role, "content": content},
+            )
+            row = cur.fetchone()
+        return PlanTurn(**row)
+
+    def list_turns(self, plan_id: str) -> list[PlanTurn]:
+        with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute(
+                "SELECT * FROM plan_turns WHERE plan_id = %s ORDER BY seq ASC", (plan_id,)
+            )
+            return [PlanTurn(**r) for r in cur.fetchall()]
+
+    # -- requirements (accreting; upsert by key) ---------------------------
+
+    def upsert_requirement(
+        self, plan_id: str, key: str, *, value: Optional[str], state: str
+    ) -> None:
+        """Record or update one requirement, keyed by (plan_id, key). Re-capturing a
+        key updates its value/state in place (bumps updated_at) — no duplicate."""
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO plan_requirements (plan_id, key, value, state)
+                VALUES (%(pid)s, %(key)s, %(value)s, %(state)s)
+                ON CONFLICT (plan_id, key) DO UPDATE SET
+                    value      = EXCLUDED.value,
+                    state      = EXCLUDED.state,
+                    updated_at = now()
+                """,
+                {"pid": plan_id, "key": key, "value": value, "state": state},
+            )
+
+    def list_requirements(self, plan_id: str) -> list[PlanRequirement]:
+        with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute(
+                "SELECT * FROM plan_requirements WHERE plan_id = %s ORDER BY key ASC",
+                (plan_id,),
+            )
+            return [PlanRequirement(**r) for r in cur.fetchall()]
+
+    # -- units (the CONSTRUCTION work-list; upsert by seq) -----------------
+
+    def upsert_unit(
+        self,
+        plan_id: str,
+        seq: int,
+        *,
+        title: str,
+        phase: Phase | str,
+        depends_on: Optional[list] = None,
+        status: str = UNIT_PENDING,
+    ) -> PlanUnit:
+        """Record or update one work-list unit, keyed by (plan_id, seq). ``task_type``
+        is DERIVED from ``phase`` here (never passed in), so the sim/burn mapping stays
+        sourced from :func:`aidlc.task_type_for_phase`. Idempotent at the stage
+        boundary that lays the work-list down."""
+        phase_enum = phase if isinstance(phase, Phase) else Phase(phase)
+        task_type = task_type_for_phase(phase_enum).value
+        deps = list(depends_on or [])
+        with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute(
+                """
+                INSERT INTO plan_units (plan_id, seq, title, phase, task_type, depends_on, status)
+                VALUES (%(pid)s, %(seq)s, %(title)s, %(phase)s, %(tt)s, %(deps)s, %(status)s)
+                ON CONFLICT (plan_id, seq) DO UPDATE SET
+                    title      = EXCLUDED.title,
+                    phase      = EXCLUDED.phase,
+                    task_type  = EXCLUDED.task_type,
+                    depends_on = EXCLUDED.depends_on,
+                    status     = EXCLUDED.status
+                RETURNING plan_id, seq, title, phase, task_type, depends_on, status, created_at
+                """,
+                {
+                    "pid": plan_id, "seq": seq, "title": title, "phase": phase_enum.value,
+                    "tt": task_type, "deps": Jsonb(deps), "status": status,
+                },
+            )
+            row = cur.fetchone()
+        return PlanUnit(**row)
+
+    def list_units(self, plan_id: str) -> list[PlanUnit]:
+        with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute(
+                "SELECT * FROM plan_units WHERE plan_id = %s ORDER BY seq ASC", (plan_id,)
+            )
+            return [PlanUnit(**r) for r in cur.fetchall()]

@@ -45,20 +45,27 @@ TERMINAL_STATUSES = frozenset(
 _DDL = (
     """
     CREATE TABLE IF NOT EXISTS runs (
-        run_id      TEXT PRIMARY KEY,
-        thread_id   TEXT NOT NULL,
-        target      TEXT,
-        task_type   TEXT,
-        status      TEXT NOT NULL,
-        cost_usd    DOUBLE PRECISION NOT NULL DEFAULT 0,
-        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-        started_at  TIMESTAMPTZ,
-        ended_at    TIMESTAMPTZ,
-        detail      TEXT
+        run_id        TEXT PRIMARY KEY,
+        thread_id     TEXT NOT NULL,
+        target        TEXT,
+        task_type     TEXT,
+        status        TEXT NOT NULL,
+        cost_usd      DOUBLE PRECISION NOT NULL DEFAULT 0,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        started_at    TIMESTAMPTZ,
+        ended_at      TIMESTAMPTZ,
+        detail        TEXT,
+        plan_id       TEXT,
+        plan_unit_seq INTEGER
     )
     """,
+    # Plan<->run link (a plan owns its child runs; each run carries its plan_id + the
+    # unit seq it was built from). Added via ALTER for ledgers created before the link.
+    "ALTER TABLE runs ADD COLUMN IF NOT EXISTS plan_id TEXT",
+    "ALTER TABLE runs ADD COLUMN IF NOT EXISTS plan_unit_seq INTEGER",
     "CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (status)",
     "CREATE INDEX IF NOT EXISTS runs_created_at_idx ON runs (created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS runs_plan_idx ON runs (plan_id)",
     # Durable per-run event log backing the SSE feed's replay (Last-Event-ID). The
     # in-process channel is the LIVE tail; this table is the durable timeline, so a
     # reconnect after a restart reconstructs the full history — not just the resume
@@ -91,10 +98,14 @@ class RunRow:
     started_at: Optional[datetime]
     ended_at: Optional[datetime]
     detail: Optional[str]
+    # Plan link (None for standalone runs): the owning plan + the unit seq this run
+    # was built from. Defaulted so RunRow(**row) works for pre-link rows / mock stores.
+    plan_id: Optional[str] = None
+    plan_unit_seq: Optional[int] = None
 
 
 # Columns whose non-None values narrow a list_runs() query.
-_FILTERABLE = ("status", "task_type", "target", "run_id")
+_FILTERABLE = ("status", "task_type", "target", "run_id", "plan_id")
 
 
 class RunStore:
@@ -123,18 +134,45 @@ class RunStore:
         *,
         task_type: Optional[str] = None,
         target: Optional[str] = None,
+        plan_id: Optional[str] = None,
+        plan_unit_seq: Optional[int] = None,
     ) -> None:
         """Record a newly submitted run as ``queued``. A no-op if the row already
-        exists (so re-submitting or resuming never resets an in-flight run)."""
+        exists (so re-submitting or resuming never resets an in-flight run). A run
+        built from a plan carries its ``plan_id`` + ``plan_unit_seq`` (the link)."""
         with self._pool.connection() as conn:
             conn.execute(
                 """
-                INSERT INTO runs (run_id, thread_id, task_type, target, status, cost_usd, created_at)
-                VALUES (%(run_id)s, %(run_id)s, %(task_type)s, %(target)s, %(status)s, 0, now())
+                INSERT INTO runs (run_id, thread_id, task_type, target, status, cost_usd,
+                                  created_at, plan_id, plan_unit_seq)
+                VALUES (%(run_id)s, %(run_id)s, %(task_type)s, %(target)s, %(status)s, 0, now(),
+                        %(plan_id)s, %(unit_seq)s)
                 ON CONFLICT (run_id) DO NOTHING
                 """,
-                {"run_id": run_id, "task_type": task_type, "target": target, "status": STATUS_QUEUED},
+                {"run_id": run_id, "task_type": task_type, "target": target,
+                 "status": STATUS_QUEUED, "plan_id": plan_id, "unit_seq": plan_unit_seq},
             )
+
+    def plan_runs(self, plan_id: str) -> list[RunRow]:
+        """A plan's child runs, ordered by the unit seq they were built from — the
+        build work-list as it executes."""
+        with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute(
+                "SELECT * FROM runs WHERE plan_id = %s "
+                "ORDER BY plan_unit_seq ASC NULLS LAST, created_at ASC",
+                (plan_id,),
+            )
+            return [RunRow(**r) for r in cur.fetchall()]
+
+    def plan_cost(self, plan_id: str) -> float:
+        """Rolled-up reconciled cost across a plan's child runs (in-flight runs
+        contribute 0 until teardown reconciles them — see cost_summary)."""
+        with self._pool.connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COALESCE(sum(cost_usd), 0) FROM runs WHERE plan_id = %s",
+                        (plan_id,))
+            return round(float(cur.fetchone()[0]), 8)
 
     def mark_running(self, run_id: str, *, target: Optional[str] = None) -> None:
         """Move to ``running`` and stamp ``started_at`` once. Upserts the row if a

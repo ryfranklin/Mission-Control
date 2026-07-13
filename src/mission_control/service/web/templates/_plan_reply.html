@@ -1,0 +1,11 @@
+{# POST /ui/plans/{id}/turns response: the operator's bubble, then an empty planner
+   bubble that opens the SSE reply stream. htmx appends `token` fragments into .body
+   as they arrive; the `done` event carries the refreshed panel (out-of-band) and
+   closes the stream (sse-close). Same htmx-SSE shape as the run feed. #}
+{% with role = "operator", content = content %}{% include "_plan_msg.html" %}{% endwith %}
+
+<div class="msg msg-planner" sse-connect="/ui/plans/{{ plan_id }}/reply" sse-close="done">
+  <div class="who">{{ labels.planner }}</div>
+  <div class="body pre" sse-swap="token" hx-swap="beforeend"></div>
+  <div class="sse-sink" sse-swap="done" hx-swap="beforeend"></div>
+</div>

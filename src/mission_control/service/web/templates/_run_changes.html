@@ -1,0 +1,46 @@
+{# The changes a burn has produced in its worktree. Two modes:
+   - running       → LIVE work-in-progress (self-refreshes every few seconds)
+   - awaiting_gate → the final review for the go/no-go decision.
+   Rendered into #run-changes; while running it re-arms its own poll so files accrue
+   on screen — a long burn is no longer a black box. #}
+{% if changes %}
+<div id="run-changes" class="review review-{{ changes.status }}"
+     {% if changes.status == "running" %}
+     hx-get="/ui/runs/{{ run_id }}/changes" hx-trigger="every 4s" hx-swap="outerHTML"
+     {% endif %}>
+  <h3>
+    {% if changes.status == "running" %}⏳ working — {{ changes.file_count }} file(s) so far
+      {% if changes.elapsed_s %}· {{ changes.elapsed_s }}s{% endif %}
+      <span class="muted">(live · refreshes every 4s)</span>
+    {% else %}changes to review · {{ changes.file_count }} file(s)
+      <span class="muted">→ {{ changes.branch }}</span>{% endif %}
+  </h3>
+
+  {% if changes.message %}
+  <div class="review-msg">
+    <div class="review-label">latest commit</div>
+    <pre class="pre">{{ changes.message }}</pre>
+  </div>
+  {% endif %}
+
+  <div class="review-label">files</div>
+  <ul class="review-files">
+    {% for f in changes.files %}
+    <li>
+      <span class="add">+{{ f.added }}</span><span class="del">-{{ f.removed }}</span>
+      <code>{{ f.path }}</code>
+    </li>
+    {% endfor %}
+    {% if not changes.files %}<li class="muted">no file changes yet…</li>{% endif %}
+  </ul>
+
+  <details class="review-diff"{% if changes.status == "awaiting_gate" %} open{% endif %}>
+    <summary>unified diff{% if changes.truncated %} · <span class="muted">truncated
+      (full patch via the API)</span>{% endif %}</summary>
+    <pre class="diff">{{ changes.stat }}
+{{ changes.patch }}</pre>
+  </details>
+</div>
+{% else %}
+<div id="run-changes"></div>
+{% endif %}

@@ -22,6 +22,7 @@ Two load-bearing rules from the build spec:
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from time import perf_counter
@@ -41,10 +42,13 @@ from .telemetry import StepUsage
 from .worker import WorkerResult
 
 # Cheapest current tier — verified against the Claude model catalog
-# (Haiku 4.5: $1/$5 per 1M tokens, 200K context). Configurable per worker.
+# (Haiku 4.5: $1/$5 per 1M tokens, 200K context). Configurable per worker, or via
+# MC_WORKER_MODEL for a whole service (a stronger model finishes a task in fewer turns).
 DEFAULT_MODEL = "claude-haiku-4-5"
 
-# Bound a single task so a runaway worker can't loop forever.
+# Bound a single task so a runaway worker can't loop forever. 20 is fine for small
+# changes but too low for a feature-sized CONSTRUCTION unit; raise it per service with
+# MC_WORKER_MAX_TURNS when the plan's units are coarse-grained.
 DEFAULT_MAX_TURNS = 20
 
 # Tools that mutate the filesystem. A read-only task hard-blocks these so a
@@ -61,12 +65,16 @@ class SdkWorker:
 
     def __init__(
         self,
-        model: str = DEFAULT_MODEL,
-        max_turns: int = DEFAULT_MAX_TURNS,
+        model: str | None = None,
+        max_turns: int | None = None,
         eval_gate_mcp: bool = False,
     ) -> None:
-        self.model = model
-        self.max_turns = max_turns
+        # Explicit arg wins; else the service-wide env override; else the default.
+        self.model = model or os.environ.get("MC_WORKER_MODEL") or DEFAULT_MODEL
+        self.max_turns = (
+            max_turns if max_turns is not None
+            else int(os.environ.get("MC_WORKER_MAX_TURNS") or DEFAULT_MAX_TURNS)
+        )
         # Opt-in: expose the eval-gate to the Controller as a portable MCP tool
         # (consumed over MCP, not hardcoded). Off by default → behavior unchanged.
         self.eval_gate_mcp = eval_gate_mcp
