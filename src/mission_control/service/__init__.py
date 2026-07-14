@@ -71,11 +71,17 @@ def build_default_manager(
     # reverse-engineering step reuses the RunManager's launch path (run a real sim
     # against the target) — no second code-reading path.
     brain = SdkPlannerBrain() if use_sdk else StubPlannerBrain()
-    engine = PlannerEngine(plan_store, brain=brain, sim_runner=manager)
-    plan_manager = PlanManager(plan_store, engine=engine)
+    # Persist the plan (INCEPTION output) into the target repo as committed git docs at
+    # each checkpoint + finalize, so it travels with the project and Postgres is just a
+    # rebuildable cache (git authoritative). See plan_docs.
+    from .. import plan_docs
+    docs_sync = lambda pid: plan_docs.sync_to_repo(plan_store, pid)  # noqa: E731
+    engine = PlannerEngine(plan_store, brain=brain, sim_runner=manager, docs_sync=docs_sync)
+    plan_manager = PlanManager(plan_store, engine=engine, docs_sync=docs_sync)
 
     # The builder hands a finalized plan to Mission Control: it translates units into
-    # runs on the launch path and advances the build as each run terminates.
-    builder = PlanBuilder(plan_store, manager)
+    # runs on the launch path and advances the build as each run terminates. It marks a
+    # unit ``done`` in git (docs_sync) on each success, so build progress is portable.
+    builder = PlanBuilder(plan_store, manager, docs_sync=docs_sync)
     manager.set_run_observer(builder.on_run_terminal)
     return manager, plan_manager, builder, pool

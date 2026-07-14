@@ -13,6 +13,8 @@
   --s-running: #4aa8ff;
   --s-awaiting_gate: #f2c14e;
   --s-applied: #3fb950;
+  --s-push_rejected: #d98b3a;
+  --s-merge_conflict: #e5534b;
   --s-scrubbed: #d98b3a;
   --s-failed: #f04d4d;
   --s-done: #3fb950;
@@ -123,6 +125,8 @@ table.fleet td.target { white-space: normal; word-break: break-all; color: var(-
 .status-running { color: var(--s-running); }
 .status-awaiting_gate { color: var(--s-awaiting_gate); }
 .status-applied { color: var(--s-applied); }
+.status-push_rejected { color: var(--s-push_rejected); }
+.status-merge_conflict { color: var(--s-merge_conflict); }
 .status-scrubbed { color: var(--s-scrubbed); }
 .status-failed { color: var(--s-failed); }
 .status-done { color: var(--s-done); }
@@ -193,6 +197,8 @@ li.ev-divider {
 .final-banner .final-cost { color: var(--ink); font-weight: 700; }
 .final-banner.status-failed { border-color: var(--s-failed); }
 .final-banner.status-applied, .final-banner.status-done { border-color: var(--s-applied); }
+.final-banner.status-push_rejected { border-color: var(--s-push_rejected); }
+.final-banner.status-merge_conflict { border-color: var(--s-merge_conflict); }
 .final-banner.status-scrubbed { border-color: var(--s-scrubbed); }
 
 /* -- planner surface (Flight Plan) ------------------------------------- */

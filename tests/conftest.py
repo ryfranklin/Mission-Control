@@ -84,26 +84,29 @@ class InMemoryRunStore:
 
     def _ensure(self, run_id: str) -> dict:
         return self._rows.setdefault(run_id, {
-            "run_id": run_id, "thread_id": run_id, "target": None, "task_type": None,
-            "status": "queued", "cost_usd": 0.0, "created_at": self._now(),
-            "started_at": None, "ended_at": None, "detail": None,
-            "plan_id": None, "plan_unit_seq": None,
+            "run_id": run_id, "thread_id": run_id, "target": None, "local_path": None,
+            "task_type": None, "status": "queued", "cost_usd": 0.0,
+            "created_at": self._now(), "started_at": None, "ended_at": None,
+            "detail": None, "plan_id": None, "plan_unit_seq": None,
         })
 
     # transitions ---------------------------------------------------------
-    def launch(self, run_id, *, task_type=None, target=None, plan_id=None, plan_unit_seq=None):
+    def launch(self, run_id, *, task_type=None, target=None, local_path=None,
+               plan_id=None, plan_unit_seq=None):
         with self._lock:
             if run_id not in self._rows:
                 row = self._ensure(run_id)
                 row["task_type"], row["target"] = task_type, target
+                row["local_path"] = local_path
                 row["plan_id"], row["plan_unit_seq"] = plan_id, plan_unit_seq
 
-    def mark_running(self, run_id, *, target=None):
+    def mark_running(self, run_id, *, target=None, local_path=None):
         with self._lock:
             row = self._ensure(run_id)
             row["status"] = "running"
             row["started_at"] = row["started_at"] or self._now()
             row["target"] = target or row["target"]
+            row["local_path"] = local_path or row["local_path"]
 
     def mark_awaiting_gate(self, run_id):
         with self._lock:

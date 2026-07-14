@@ -30,14 +30,17 @@ from psycopg.types.json import Jsonb
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
 STATUS_AWAITING_GATE = "awaiting_gate"
-STATUS_APPLIED = "applied"
+STATUS_APPLIED = "applied"  # burn approved, merged, and pushed (trunk or workstream)
+STATUS_PUSH_REJECTED = "push_rejected"  # approved, but the push was non-fast-forward
+STATUS_MERGE_CONFLICT = "merge_conflict"  # approved, but integrating the remote conflicted
 STATUS_SCRUBBED = "scrubbed"
 STATUS_FAILED = "failed"
 STATUS_DONE = "done"
 
 # States after which no more work happens; each stamps ended_at exactly once.
 TERMINAL_STATUSES = frozenset(
-    {STATUS_APPLIED, STATUS_SCRUBBED, STATUS_FAILED, STATUS_DONE}
+    {STATUS_APPLIED, STATUS_PUSH_REJECTED, STATUS_MERGE_CONFLICT,
+     STATUS_SCRUBBED, STATUS_FAILED, STATUS_DONE}
 )
 
 # One statement per entry: the autocommit pool prepares statements, which forbids
@@ -48,6 +51,7 @@ _DDL = (
         run_id        TEXT PRIMARY KEY,
         thread_id     TEXT NOT NULL,
         target        TEXT,
+        local_path    TEXT,
         task_type     TEXT,
         status        TEXT NOT NULL,
         cost_usd      DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -63,6 +67,9 @@ _DDL = (
     # unit seq it was built from). Added via ALTER for ledgers created before the link.
     "ALTER TABLE runs ADD COLUMN IF NOT EXISTS plan_id TEXT",
     "ALTER TABLE runs ADD COLUMN IF NOT EXISTS plan_unit_seq INTEGER",
+    # target now carries the PORTABLE ref (normalized remote); local_path is the
+    # derived machine-local working dir — a separate field, never the identity.
+    "ALTER TABLE runs ADD COLUMN IF NOT EXISTS local_path TEXT",
     "CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (status)",
     "CREATE INDEX IF NOT EXISTS runs_created_at_idx ON runs (created_at DESC)",
     "CREATE INDEX IF NOT EXISTS runs_plan_idx ON runs (plan_id)",
@@ -90,7 +97,7 @@ class RunRow:
 
     run_id: str
     thread_id: str
-    target: Optional[str]
+    target: Optional[str]  # the PORTABLE identity (normalized remote ref), not a path
     task_type: Optional[str]
     status: str
     cost_usd: float
@@ -102,6 +109,10 @@ class RunRow:
     # was built from. Defaulted so RunRow(**row) works for pre-link rows / mock stores.
     plan_id: Optional[str] = None
     plan_unit_seq: Optional[int] = None
+    # The derived machine-local working dir the run executed in (worktrees carved
+    # here). Separate from ``target`` — a portable ref must not be a local path.
+    # Defaulted so RunRow(**row) works for rows created before this column.
+    local_path: Optional[str] = None
 
 
 # Columns whose non-None values narrow a list_runs() query.
@@ -134,23 +145,26 @@ class RunStore:
         *,
         task_type: Optional[str] = None,
         target: Optional[str] = None,
+        local_path: Optional[str] = None,
         plan_id: Optional[str] = None,
         plan_unit_seq: Optional[int] = None,
     ) -> None:
         """Record a newly submitted run as ``queued``. A no-op if the row already
         exists (so re-submitting or resuming never resets an in-flight run). A run
-        built from a plan carries its ``plan_id`` + ``plan_unit_seq`` (the link)."""
+        built from a plan carries its ``plan_id`` + ``plan_unit_seq`` (the link).
+        ``target`` is the portable ref; ``local_path`` the derived working dir."""
         with self._pool.connection() as conn:
             conn.execute(
                 """
-                INSERT INTO runs (run_id, thread_id, task_type, target, status, cost_usd,
-                                  created_at, plan_id, plan_unit_seq)
-                VALUES (%(run_id)s, %(run_id)s, %(task_type)s, %(target)s, %(status)s, 0, now(),
-                        %(plan_id)s, %(unit_seq)s)
+                INSERT INTO runs (run_id, thread_id, task_type, target, local_path, status,
+                                  cost_usd, created_at, plan_id, plan_unit_seq)
+                VALUES (%(run_id)s, %(run_id)s, %(task_type)s, %(target)s, %(local_path)s,
+                        %(status)s, 0, now(), %(plan_id)s, %(unit_seq)s)
                 ON CONFLICT (run_id) DO NOTHING
                 """,
                 {"run_id": run_id, "task_type": task_type, "target": target,
-                 "status": STATUS_QUEUED, "plan_id": plan_id, "unit_seq": plan_unit_seq},
+                 "local_path": local_path, "status": STATUS_QUEUED,
+                 "plan_id": plan_id, "unit_seq": plan_unit_seq},
             )
 
     def plan_runs(self, plan_id: str) -> list[RunRow]:
@@ -174,20 +188,27 @@ class RunStore:
                         (plan_id,))
             return round(float(cur.fetchone()[0]), 8)
 
-    def mark_running(self, run_id: str, *, target: Optional[str] = None) -> None:
+    def mark_running(
+        self, run_id: str, *, target: Optional[str] = None, local_path: Optional[str] = None
+    ) -> None:
         """Move to ``running`` and stamp ``started_at`` once. Upserts the row if a
-        launch insert never happened, so the ledger is robust to a missed launch."""
+        launch insert never happened, so the ledger is robust to a missed launch.
+        ``target`` is the portable ref; ``local_path`` the derived working dir."""
         with self._pool.connection() as conn:
             conn.execute(
                 """
-                INSERT INTO runs (run_id, thread_id, target, status, cost_usd, created_at, started_at)
-                VALUES (%(run_id)s, %(run_id)s, %(target)s, %(status)s, 0, now(), now())
+                INSERT INTO runs (run_id, thread_id, target, local_path, status, cost_usd,
+                                  created_at, started_at)
+                VALUES (%(run_id)s, %(run_id)s, %(target)s, %(local_path)s, %(status)s, 0,
+                        now(), now())
                 ON CONFLICT (run_id) DO UPDATE SET
                     status     = EXCLUDED.status,
                     target     = COALESCE(EXCLUDED.target, runs.target),
+                    local_path = COALESCE(EXCLUDED.local_path, runs.local_path),
                     started_at = COALESCE(runs.started_at, EXCLUDED.started_at)
                 """,
-                {"run_id": run_id, "target": target, "status": STATUS_RUNNING},
+                {"run_id": run_id, "target": target, "local_path": local_path,
+                 "status": STATUS_RUNNING},
             )
 
     def mark_awaiting_gate(self, run_id: str) -> None:

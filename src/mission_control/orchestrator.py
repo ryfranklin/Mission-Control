@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import roles, worktree
+from . import repo_source, roles, worktree
 from .tasks import Task, TaskType
 from .telemetry import RunTelemetry, TelemetrySink, events_from_steps
 from .worker import StubWorker, Worker, WorkerResult
@@ -34,6 +34,13 @@ Approval = Callable[["TaskRun"], bool]
 OUTCOME_COMPLETED = "completed"  # sim finished, or burn approved + applied
 OUTCOME_BLOCKED = "blocked"  # burn produced changes but approval was no-go
 OUTCOME_TERMINATED = "terminated"  # task killed early (scrub)
+
+# Push outcome for an applied burn (mirrors graph.py; the write hop to the remote).
+PUSH_PUSHED = "pushed"       # merged locally AND pushed to origin
+PUSH_REJECTED = "rejected"   # push refused as non-fast-forward
+PUSH_CONFLICT = "conflict"   # integrating the remote advance produced a merge conflict
+PUSH_ERROR = "error"         # push failed on creds / network (surfaced loudly)
+PUSH_SKIPPED = "skipped"     # no remote to push to (a remote-less local target)
 
 
 @dataclass
@@ -55,6 +62,10 @@ class RunResult:
     decision: Optional[str]  # roles.GO / roles.NO_GO, or None for read-only
     outcome: str  # one of the OUTCOME_* labels
     telemetry: Optional[RunTelemetry] = None  # None only for terminate (no run)
+    # Push outcome for an applied burn (one of the PUSH_* labels); None when no merge
+    # happened (sim / no-go / burn no-op), so "applied + pushed" vs "applied locally,
+    # push rejected" is legible to callers.
+    push_status: Optional[str] = None
 
 
 class Orchestrator:
@@ -97,7 +108,7 @@ class Orchestrator:
         run = self.dispatch(task)
         try:
             worker_result = self.worker.investigate(task, run.worktree.path)
-            applied, decision, outcome = self._gate(run, worker_result, approval)
+            applied, decision, outcome, push_status = self._gate(run, worker_result, approval)
             telemetry = self._write_telemetry(task, worker_result, outcome)
             return RunResult(
                 task=task,
@@ -106,6 +117,7 @@ class Orchestrator:
                 decision=decision,
                 outcome=outcome,
                 telemetry=telemetry,
+                push_status=push_status,
             )
         finally:
             self._teardown(run)
@@ -131,12 +143,12 @@ class Orchestrator:
         run: TaskRun,
         worker_result: WorkerResult,
         approval: Optional[Approval],
-    ) -> tuple[bool, Optional[str], str]:
+    ) -> tuple[bool, Optional[str], str, Optional[str]]:
         """Decide whether the worker's changes are applied. Returns
-        (applied, decision, outcome)."""
+        (applied, decision, outcome, push_status)."""
         if run.task.task_type is not TaskType.SIDE_EFFECTFUL:
-            # Read-only work never applies changes; nothing to gate.
-            return False, None, OUTCOME_COMPLETED
+            # Read-only work never applies changes; nothing to gate, nothing to push.
+            return False, None, OUTCOME_COMPLETED, None
 
         # Side-effectful: commit the worker's changes onto the task branch so the
         # decision has a concrete diff to accept or reject.
@@ -144,18 +156,37 @@ class Orchestrator:
             run.worktree, f"task {run.task.task_id}: {run.task.prompt}"
         )
         if not committed:
-            # A burn that produced no changes is a completed no-op.
-            return False, None, OUTCOME_COMPLETED
+            # A burn that produced no changes is a completed no-op — nothing to push.
+            return False, None, OUTCOME_COMPLETED, None
 
         approved = approval is not None and approval(run)
         if approved:
             worktree.merge_into_target(
                 run.worktree, f"apply task {run.task.task_id}"
             )
-            return True, roles.GO, OUTCOME_COMPLETED
+            # The write hop: push the merged result to the remote so it leaves the host.
+            # Fires ONLY on an affirmative gate, after the merge — never on sim/no-go/no-op.
+            return True, roles.GO, OUTCOME_COMPLETED, self._push()
         # No approver, or explicit no-go → changes stay quarantined on the branch
         # and are discarded at teardown.
-        return False, roles.NO_GO, OUTCOME_BLOCKED
+        return False, roles.NO_GO, OUTCOME_BLOCKED, None
+
+    def _push(self) -> str:
+        """Push the just-merged branch to origin. Returns a PUSH_* label; a rejection or
+        creds/network failure is recorded (not raised) so it's legible in the result and
+        never force-pushed. A remote-less target has nothing to push."""
+        if not repo_source.has_origin(self.target_repo):
+            return PUSH_SKIPPED
+        branch = repo_source.current_branch(self.target_repo)
+        try:
+            repo_source.push_to_remote(self.target_repo, branch)
+            return PUSH_PUSHED
+        except repo_source.MergeConflict:
+            return PUSH_CONFLICT
+        except repo_source.PushRejected:
+            return PUSH_REJECTED
+        except repo_source.PushError:
+            return PUSH_ERROR
 
     # -- telemetry ---------------------------------------------------------
 

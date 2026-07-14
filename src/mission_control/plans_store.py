@@ -43,7 +43,10 @@ ROLE_OPERATOR = "operator"
 ROLE_PLANNER = "planner"
 
 # -- unit statuses (the work-list's per-unit execution state) --------------
+# These travel in flight-plan.yaml, so they are the PORTABLE per-unit progress record:
+# a ``done`` unit is not re-run on another machine. Not-``done`` units are (re-)runnable.
 UNIT_PENDING = "pending"
+UNIT_DONE = "done"
 
 # One statement per entry: the autocommit pool prepares statements, which forbids
 # multiple commands in a single execute() (same constraint as the runs ledger).
@@ -52,6 +55,8 @@ _DDL = (
     CREATE TABLE IF NOT EXISTS plans (
         id           TEXT PRIMARY KEY,
         target       TEXT,
+        local_path   TEXT,
+        workstream   TEXT,
         mode         TEXT NOT NULL,
         methodology  TEXT NOT NULL DEFAULT 'aidlc',
         cloud_target TEXT NOT NULL DEFAULT 'aws',
@@ -63,6 +68,11 @@ _DDL = (
     """,
     "CREATE INDEX IF NOT EXISTS plans_status_idx ON plans (status)",
     "CREATE INDEX IF NOT EXISTS plans_created_at_idx ON plans (created_at DESC)",
+    # target now carries the PORTABLE ref (normalized remote); local_path is the
+    # derived machine-local working dir — a separate field, never the identity.
+    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS local_path TEXT",
+    # Optional workstream: the plan's build reconciles through the mc/ws/<name> branch.
+    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS workstream TEXT",
     # The interactive transcript: operator turns and the planner's replies, in order.
     # seq is a per-plan counter (continues across process restarts).
     """
@@ -111,7 +121,7 @@ class PlanRow:
     """One row of the ``plans`` header table."""
 
     id: str
-    target: Optional[str]
+    target: Optional[str]  # the PORTABLE identity (normalized remote ref), not a path
     mode: str
     methodology: str
     cloud_target: str
@@ -119,6 +129,20 @@ class PlanRow:
     status: str
     created_at: Optional[datetime]
     updated_at: Optional[datetime]
+    # The derived machine-local working dir (worktrees / probes run here). Separate
+    # from ``target`` — a portable ref must not be a local path. Defaulted so
+    # PlanRow(**row) works for rows created before this column.
+    local_path: Optional[str] = None
+    # Optional workstream: the plan's build reconciles through the mc/ws/<name> branch
+    # rather than directly onto trunk. Defaulted for rows created before this column.
+    workstream: Optional[str] = None
+
+    @property
+    def working_path(self) -> Optional[str]:
+        """The machine-local working dir to operate in. Prefers ``local_path`` (the
+        derived field); falls back to ``target`` for rows written before the split,
+        where ``target`` still held the resolved path."""
+        return self.local_path or self.target
 
 
 @dataclass
@@ -190,21 +214,25 @@ class PlanStore:
         mode: str,
         methodology: str,
         cloud_target: str,
+        local_path: Optional[str] = None,
+        workstream: Optional[str] = None,
         stage: Optional[str] = None,
         status: str = STATUS_DRAFTING,
     ) -> None:
         """Register a new plan session. A no-op if the row already exists, so a
-        re-open never resets an in-progress plan."""
+        re-open never resets an in-progress plan. ``target`` is the portable ref;
+        ``local_path`` the derived working dir; ``workstream`` the optional mc/ws line."""
         with self._pool.connection() as conn:
             conn.execute(
                 """
-                INSERT INTO plans (id, target, mode, methodology, cloud_target, stage, status)
-                VALUES (%(id)s, %(target)s, %(mode)s, %(methodology)s, %(cloud)s, %(stage)s, %(status)s)
+                INSERT INTO plans (id, target, local_path, workstream, mode, methodology, cloud_target, stage, status)
+                VALUES (%(id)s, %(target)s, %(local_path)s, %(workstream)s, %(mode)s, %(methodology)s, %(cloud)s, %(stage)s, %(status)s)
                 ON CONFLICT (id) DO NOTHING
                 """,
                 {
-                    "id": plan_id, "target": target, "mode": mode,
-                    "methodology": methodology, "cloud": cloud_target,
+                    "id": plan_id, "target": target, "local_path": local_path,
+                    "workstream": workstream,
+                    "mode": mode, "methodology": methodology, "cloud": cloud_target,
                     "stage": stage, "status": status,
                 },
             )
@@ -218,8 +246,13 @@ class PlanStore:
         self._update(plan_id, "mode", mode)
 
     def set_target(self, plan_id: str, target: str) -> None:
-        """Record the build target (e.g. a scaffolded workspace for a greenfield plan)."""
+        """Record the build target's portable identity (a normalized remote ref)."""
         self._update(plan_id, "target", target)
+
+    def set_local_path(self, plan_id: str, local_path: str) -> None:
+        """Record the derived machine-local working dir (e.g. a scaffolded workspace
+        for a greenfield plan). Separate from the identity in ``target``."""
+        self._update(plan_id, "local_path", local_path)
 
     def set_status(self, plan_id: str, status: str) -> None:
         """Move the plan to a new status (idempotent; bumps updated_at)."""
@@ -388,3 +421,28 @@ class PlanStore:
                 "SELECT * FROM plan_units WHERE plan_id = %s ORDER BY seq ASC", (plan_id,)
             )
             return [PlanUnit(**r) for r in cur.fetchall()]
+
+    def set_unit_status(self, plan_id: str, seq: int, status: str) -> None:
+        """Update one unit's execution status (idempotent). Setting it to
+        :data:`UNIT_DONE` is the durable, portable progress mark — it is then written to
+        flight-plan.yaml and pushed, so another machine won't re-run that unit."""
+        with self._pool.connection() as conn:
+            conn.execute(
+                "UPDATE plan_units SET status = %s WHERE plan_id = %s AND seq = %s",
+                (status, plan_id, seq),
+            )
+
+    # -- cache reconciliation (git is authoritative; Postgres is a rebuildable cache) --
+
+    def clear_units(self, plan_id: str) -> None:
+        """Drop a plan's cached units. Used when reconciling the Postgres cache to the
+        git source of truth: units are cleared then re-inserted from the on-disk plan,
+        so any local divergence (extra/changed units) resolves to the git version."""
+        with self._pool.connection() as conn:
+            conn.execute("DELETE FROM plan_units WHERE plan_id = %s", (plan_id,))
+
+    def clear_requirements(self, plan_id: str) -> None:
+        """Drop a plan's cached requirements — the requirements counterpart to
+        :meth:`clear_units` for git-authoritative reconciliation."""
+        with self._pool.connection() as conn:
+            conn.execute("DELETE FROM plan_requirements WHERE plan_id = %s", (plan_id,))

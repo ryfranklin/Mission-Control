@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Optional
 
 from . import roles
 
@@ -38,3 +39,6 @@ class Task:
     # Greenfield targets get the "Using AI-DLC, …" prompt opener when steering
     # is detected; brownfield targets skip it.
     greenfield: bool = False
+    # Optional workstream name → the long-lived mc/ws/<name> branch this task builds on
+    # and reconciles into (None → work directly on trunk, the single-line default).
+    workstream: Optional[str] = None

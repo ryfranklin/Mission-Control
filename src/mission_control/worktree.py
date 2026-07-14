@@ -11,12 +11,48 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 # Functional prefixes for the branch/worktree namespace (not metaphor terms).
 _BRANCH_PREFIX = "mc/task"
 _WORKTREE_TMP_PREFIX = "mc-worktree-"
+
+# Per-repo locks, keyed by resolved repo path. See _repo_lock for the rationale.
+_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _repo_lock(repo_path) -> threading.Lock:
+    """The lock serializing mutations of ONE shared repo, keyed by its resolved path.
+
+    With portable identity, many runs against the same ref now share ONE cache clone
+    (``repo_source.ensure_local``), so their git mutations — the acquisition
+    clone/fetch, ``worktree add``, ``merge``, ``worktree remove`` — all contend on the
+    same ``.git`` admin (refs, HEAD, the worktree list). ONE per-repo lock is the
+    natural granularity: a fetch-only lock would still let a fetch race a
+    worktree-add's ref reads.
+
+    Every caller acquires this lock for a single operation and releases it before the
+    next one runs (dispatch does ``ensure_local`` then ``create_worktree``
+    sequentially), so the lock is NEVER held across another lock acquisition — no
+    self-deadlock (the flock risk the architecture review flagged). It is in-process
+    only; cross-process locking is deliberately out of scope for this slice.
+
+    IMPORTANT (workstreams): this serializes ONLY within a single host — it is not
+    cross-host mutual exclusion. Two hosts (or processes) building the same project
+    can race. That is safe because cross-host correctness comes from GIT, not this
+    lock: a lost race surfaces as a non-fast-forward push or a recoverable merge
+    conflict at the gate/promote (see repo_source.push_to_remote / promote), never
+    silent corruption or a forced overwrite."""
+    key = str(Path(repo_path).resolve())
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _LOCKS[key] = lock
+        return lock
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -63,8 +99,15 @@ class Worktree:
     _holder: Path  # temp dir that contains ``path`` (cleaned up on teardown)
 
 
-def create_worktree(target_repo: Path, name: str) -> Worktree:
-    """Carve an isolated worktree + branch off ``target_repo`` at its current HEAD."""
+def create_worktree(target_repo: Path, name: str, *, base: str = "HEAD") -> Worktree:
+    """Carve an isolated worktree + branch off ``target_repo`` at ``base``.
+
+    ``base`` is any commit-ish the new branch starts from. It defaults to ``HEAD``
+    (the repo's current checkout). The run graph passes ``origin/<trunk>`` (via
+    :func:`repo_source.default_base`) so a fetched cache clone builds on the remote's
+    default branch rather than whatever the shared clone's HEAD happens to point at;
+    callers can pass any explicit base (the seam for later workstream branches). The
+    branch namespace and teardown are unchanged."""
     target_repo = Path(target_repo).resolve()
     branch = f"{_BRANCH_PREFIX}/{name}"
 
@@ -73,7 +116,9 @@ def create_worktree(target_repo: Path, name: str) -> Worktree:
     holder = Path(tempfile.mkdtemp(prefix=_WORKTREE_TMP_PREFIX))
     path = holder / name
 
-    _git(target_repo, "worktree", "add", "-b", branch, str(path), "HEAD")
+    # Serialize branch/worktree creation on the shared repo (see _repo_lock).
+    with _repo_lock(target_repo):
+        _git(target_repo, "worktree", "add", "-b", branch, str(path), base)
     return Worktree(path=path, branch=branch, target_repo=target_repo, _holder=holder)
 
 
@@ -83,27 +128,29 @@ def remove_worktree(worktree: Worktree) -> None:
     teardown must never mask the original outcome."""
     target = worktree.target_repo
 
-    # Remove the linked worktree (force: it may hold uncommitted/committed work).
-    subprocess.run(
-        ["git", "-C", str(target), "worktree", "remove", "--force", str(worktree.path)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    # Delete the dedicated branch (force: it may be unmerged on a no-go).
-    subprocess.run(
-        ["git", "-C", str(target), "branch", "-D", worktree.branch],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    # Prune any stale administrative entries, then drop the temp holder.
-    subprocess.run(
-        ["git", "-C", str(target), "worktree", "prune"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    # Serialize teardown of the shared repo against concurrent add/merge (see _repo_lock).
+    with _repo_lock(target):
+        # Remove the linked worktree (force: it may hold uncommitted/committed work).
+        subprocess.run(
+            ["git", "-C", str(target), "worktree", "remove", "--force", str(worktree.path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        # Delete the dedicated branch (force: it may be unmerged on a no-go).
+        subprocess.run(
+            ["git", "-C", str(target), "branch", "-D", worktree.branch],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        # Prune any stale administrative entries, then drop the temp holder.
+        subprocess.run(
+            ["git", "-C", str(target), "worktree", "prune"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     shutil.rmtree(worktree._holder, ignore_errors=True)
 
 
@@ -133,16 +180,21 @@ def commit_changes(worktree: Worktree, message: str) -> bool:
 
 
 def merge_into_target(worktree: Worktree, message: str) -> None:
-    """Apply the worktree's committed work back onto the target repo's HEAD branch."""
-    _git(
-        worktree.target_repo,
-        "merge",
-        "--no-ff",
-        "--no-edit",
-        "-m",
-        message,
-        worktree.branch,
-    )
+    """Apply the worktree's committed work back onto the target repo's HEAD branch.
+
+    Still the READ-side of a run in this slice: the merge lands on the LOCAL clone's
+    HEAD branch only — nothing is pushed to the remote (push lands gated later)."""
+    # Serialize the merge on the shared repo against concurrent add/remove (see _repo_lock).
+    with _repo_lock(worktree.target_repo):
+        _git(
+            worktree.target_repo,
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            "-m",
+            message,
+            worktree.branch,
+        )
 
 
 # Cap the patch we surface to a reviewer (a huge burn shouldn't blow up the page).

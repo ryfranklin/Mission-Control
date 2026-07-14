@@ -253,6 +253,7 @@ def create_app(
             row = plans.open_plan(
                 target=body.target, mode=body.mode,
                 methodology=body.methodology, cloud_target=body.cloud_target,
+                workstream=body.workstream,
             )
         except PlanConflict as exc:
             raise HTTPException(status_code=400, detail=str(exc))

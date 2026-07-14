@@ -32,7 +32,7 @@ from uuid import uuid4
 
 from langgraph.types import Command
 
-from .. import roles, worktree
+from .. import project_ref, roles, worktree
 from ..graph import build_run_graph, initial_state, run_tracked, worker_cost_usd
 from ..live import GateWaiting, NodeTransition, StepMetric, stream_run_sync
 from ..runs_store import (
@@ -58,6 +58,11 @@ _CLOSED = object()
 
 # Feed event names (functional labels, not metaphor vocabulary).
 EVENT_TERMINAL = "terminal"
+
+# Upper bound a reader waits for an in-flight terminal event (status already terminal,
+# event about to be emitted+closed by _finalize). Generous vs. an in-process finalize;
+# only a bound so a run that died mid-finalize elsewhere can't block a reader forever.
+_TERMINAL_EVENT_WAIT_S = 30.0
 
 
 @dataclass
@@ -130,6 +135,13 @@ def _serialize(event) -> dict:
     return {"event": "message", "data": {"value": str(event)}}
 
 
+def _work_path(row) -> Optional[str]:
+    """The machine-local working dir a run executes in. Prefers ``local_path`` (the
+    derived field); falls back to ``target`` for rows written before the split, where
+    ``target`` still held the resolved path."""
+    return row.local_path or row.target
+
+
 class RunManager:
     """Launches / resolves / cancels / streams / queries runs over the existing graph."""
 
@@ -196,11 +208,19 @@ class RunManager:
         prompt: str,
         plan_id: Optional[str] = None,
         plan_unit_seq: Optional[int] = None,
+        workstream: Optional[str] = None,
     ) -> str:
         """Register a queued run and kick off the graph in the background, keyed by
         its thread_id (== run_id). Returns the run_id immediately. When built from a
-        plan, ``plan_id``/``plan_unit_seq`` record the link on the run row."""
-        target_path = Path(target).expanduser()
+        plan, ``plan_id``/``plan_unit_seq`` record the link on the run row.
+
+        ``target`` may be a local path OR a remote URL. Its PORTABLE identity (a
+        normalized remote ref) is stored as the run's ``target``; the derived
+        machine-local working dir is stored separately as ``local_path`` and is what
+        the run executes in. No clone is done in this slice, so a URL with no local
+        checkout is rejected below."""
+        ref, local_path = project_ref.resolve_target(target)
+        target_path = local_path if local_path is not None else Path(target).expanduser()
         if not target_path.is_dir():
             raise RunConflict(f"target is not a directory: {target}", status="rejected")
         # Must be its OWN git repo root — never a subdir of a parent repo (a worktree
@@ -212,8 +232,10 @@ class RunManager:
         tt = _TASK_TYPE[task_type]  # validated by the request model
 
         run_id = f"run-{uuid4().hex}"
-        task = Task(task_id=f"{task_type}-{uuid4().hex[:8]}", task_type=tt, prompt=prompt)
-        self._store.launch(run_id, task_type=task_type, target=str(target_path.resolve()),
+        task = Task(task_id=f"{task_type}-{uuid4().hex[:8]}", task_type=tt, prompt=prompt,
+                    workstream=workstream)
+        self._store.launch(run_id, task_type=task_type, target=ref,
+                           local_path=str(target_path.resolve()),
                            plan_id=plan_id, plan_unit_seq=plan_unit_seq)
 
         self._channel_for(run_id)
@@ -239,15 +261,16 @@ class RunManager:
         branch/path from the durable checkpoint, so it survives a restart; the worktree
         peek uses a throwaway index and never mutates the worker's work."""
         row = self._require(run_id)
-        if row.status not in (STATUS_RUNNING, STATUS_AWAITING_GATE) or not row.target:
+        work_path = _work_path(row)  # the LOCAL working dir, not the portable ref
+        if row.status not in (STATUS_RUNNING, STATUS_AWAITING_GATE) or not work_path:
             return None
         config = {"configurable": {"thread_id": run_id}}
-        state = self._state(Path(row.target), config)
+        state = self._state(Path(work_path), config)
         branch = state.get("worktree_branch")
         if not branch:
             return None
         try:
-            changes = worktree.changes(Path(row.target), branch, state.get("worktree_path"))
+            changes = worktree.changes(Path(work_path), branch, state.get("worktree_path"))
         except Exception:  # noqa: BLE001 — an observability aid must never break a run
             return None
         changes["status"] = row.status
@@ -318,7 +341,7 @@ class RunManager:
             raise RunConflict("gate decision already in progress", status=row.status)
         self._resolving.add(run_id)
         self._channel_for(run_id)
-        self._spawn(self._resume(run_id, Path(row.target), Command(resume=decision)))
+        self._spawn(self._resume(run_id, Path(_work_path(row)), Command(resume=decision)))
         return self._require(run_id)
 
     async def _resume(self, run_id: str, target: Path, payload) -> None:
@@ -501,13 +524,19 @@ class RunManager:
         highest = last_id if last_id is not None else -1
         try:
             stored = await asyncio.to_thread(self._store.read_events, run_id, after_seq=last_id)
+            saw_terminal = False
             for ev in stored:
                 if ev["seq"] > highest:
                     yield "history", ev
                     highest = ev["seq"]
+                    saw_terminal = saw_terminal or ev["event"] == EVENT_TERMINAL
 
-            terminal = await asyncio.to_thread(self._is_terminal, run_id)
-            if channel.closed or terminal:
+            # The durable log already holds the terminal event (a run finished in a
+            # prior process, replayed here) → nothing more will ever come; stop.
+            if saw_terminal:
+                return
+
+            if channel.closed:
                 while not q.empty():  # drain the tiny replay↔live overlap window
                     item = q.get_nowait()
                     if item is not _CLOSED and item["seq"] > highest:
@@ -515,8 +544,21 @@ class RunManager:
                         highest = item["seq"]
                 return
 
+            # The run may already be terminal by STATUS while its terminal EVENT is
+            # still in flight — _finalize sets the status (in teardown) before emitting
+            # the terminal event and closing the channel. So we must NOT return on
+            # status alone (that truncates the stream just before the terminal event,
+            # ending on the teardown node_transition). Read the live tail until the
+            # channel closes; the terminal event arrives immediately before _CLOSED.
+            # Bounded so a run that died mid-finalize in a prior process (terminal
+            # status, no terminal event, no live producer) can't block a reader forever.
+            terminal = await asyncio.to_thread(self._is_terminal, run_id)
             while True:
-                item = await q.get()
+                try:
+                    item = await (asyncio.wait_for(q.get(), _TERMINAL_EVENT_WAIT_S)
+                                  if terminal else q.get())
+                except asyncio.TimeoutError:
+                    return  # producerless terminal run — degrade gracefully, don't hang
                 if item is _CLOSED:
                     return
                 if item["seq"] > highest:
@@ -542,7 +584,18 @@ class RunManager:
 
     @staticmethod
     def _target_key(target: Optional[str]) -> Optional[str]:
-        return str(Path(target).expanduser().resolve()) if target else None
+        """Normalize a target filter to the ledger's stored identity (a portable
+        ref). A remote URL → its normalized ref; an existing local path → that repo's
+        derived ref (== the resolved path when it has no remote, unchanged from before);
+        anything else (already a ref, or a non-existent path) → verbatim."""
+        if not target:
+            return None
+        if project_ref.is_remote_url(target):
+            return project_ref.normalize_remote(target)
+        path = Path(target).expanduser()
+        if path.exists():
+            return project_ref.resolve_target(str(path))[0]
+        return target
 
     def _is_terminal(self, run_id: str) -> bool:
         row = self._store.get_run(run_id)

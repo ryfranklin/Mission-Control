@@ -42,6 +42,8 @@ from .runs_store import (
     STATUS_APPLIED,
     STATUS_DONE,
     STATUS_FAILED,
+    STATUS_MERGE_CONFLICT,
+    STATUS_PUSH_REJECTED,
     STATUS_SCRUBBED,
     TERMINAL_STATUSES,
 )
@@ -51,6 +53,8 @@ DEFAULT_BASE_URL = os.environ.get("MC_SERVICE_URL", "http://127.0.0.1:8000")
 EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_SCRUBBED = 2
+EXIT_PUSH_REJECTED = 3  # applied locally, but the push didn't land
+EXIT_MERGE_CONFLICT = 4  # approved, but integrating the remote conflicted (operator must resolve)
 
 # Terminal run status → CLI exit code (the watch/launch--watch contract).
 _EXIT_FOR_STATUS = {
@@ -58,6 +62,8 @@ _EXIT_FOR_STATUS = {
     STATUS_DONE: EXIT_OK,
     STATUS_FAILED: EXIT_FAILURE,
     STATUS_SCRUBBED: EXIT_SCRUBBED,
+    STATUS_PUSH_REJECTED: EXIT_PUSH_REJECTED,
+    STATUS_MERGE_CONFLICT: EXIT_MERGE_CONFLICT,
 }
 
 

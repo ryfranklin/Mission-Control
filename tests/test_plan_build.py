@@ -182,7 +182,9 @@ def test_greenfield_plan_scaffolds_a_target_and_builds(build_env):
 
     fin = client.post(f"/plans/{pid}/finalize")
     assert fin.status_code == 200 and fin.json()["status"] == ps.STATUS_BUILDING
-    assert fin.json()["target"]                                  # a workspace was scaffolded
+    # A workspace was scaffolded as the DERIVED working dir (scratch) — NOT recorded as
+    # the portable target (an anonymous local scaffold is not a portable identity).
+    assert fin.json()["local_path"] and not fin.json()["target"]
 
     # The INCEPTION stages run as sims; the change waits at the gate as a burn.
     d = _wait(client, pid, lambda x: _by_seq(x).get(3, {}).get("status") == "awaiting_gate")

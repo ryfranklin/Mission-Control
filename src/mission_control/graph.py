@@ -40,7 +40,7 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
-from . import live, pricing, roles, runs_store, worktree
+from . import live, pricing, project_ref, repo_source, roles, runs_store, worktree
 from .plans_store import PlanStore
 from .runs_store import RunStore
 from .tasks import Task, TaskType
@@ -59,6 +59,13 @@ _TASK_TYPE_BY_VALUE = {t.value: t for t in TaskType}
 OUTCOME_COMPLETED = "completed"
 OUTCOME_BLOCKED = "blocked"
 
+# Push outcome for an applied burn (the write hop back to the remote).
+PUSH_PUSHED = "pushed"       # merged AND pushed to origin (trunk or workstream branch)
+PUSH_REJECTED = "rejected"   # push refused as non-fast-forward
+PUSH_CONFLICT = "conflict"   # integrating the remote advance produced a merge conflict
+PUSH_ERROR = "error"         # push failed on creds / network (surfaced loudly)
+PUSH_SKIPPED = "skipped"     # no remote to push to (a remote-less local target)
+
 class RunState(TypedDict, total=False):
     """Serializable run state (primitives only, for checkpointing in L2)."""
 
@@ -67,6 +74,8 @@ class RunState(TypedDict, total=False):
     task_type: str  # roles.SIM / roles.BURN
     prompt: str
     greenfield: bool
+    workstream: str  # optional workstream name → the mc/ws/<name> branch this run builds on
+    local_repo: str  # the resolved local working path (acquired at dispatch from the ref)
     worktree_path: str
     worktree_branch: str
     worktree_holder: str
@@ -75,6 +84,8 @@ class RunState(TypedDict, total=False):
     steps: list  # list[dict] — StepUsage as dicts (cost data preserved for L2)
     decision: Optional[str]  # roles.GO / roles.NO_GO / None (sim)
     applied: bool
+    push_status: str  # one of the PUSH_* labels (only set for an applied burn)
+    push_detail: str  # human-legible reason when a push was rejected / errored
     outcome: str
 
 
@@ -82,8 +93,17 @@ class RunState(TypedDict, total=False):
 class _Deps:
     """Non-serializable dependencies, held out of the graph state."""
 
-    target_repo: Path
+    # A pre-resolved local working path hint (legacy / direct-node tests). The
+    # authoritative local path is resolved from ``target_ref`` at dispatch time and
+    # stored in the run state — this is only a fallback. Kept FIRST + positional so
+    # ``_Deps(target_repo, worker)`` still works.
+    target_repo: Optional[Path]
     worker: Worker
+    # The PORTABLE identity (a normalized remote ref) — the run's true identity, and
+    # what ``ensure_local`` acquires from. The local working path is DERIVED from it.
+    target_ref: Optional[str] = None
+    # Cache-root override for acquisition (``ensure_local``). None → project_ref default.
+    cache_root: Optional[Path] = None
     # Where per-run JSONL is written. None → skip the durable spine (live view
     # only); the priced events are still emitted into the custom stream.
     telemetry_dir: Optional[Path] = None
@@ -102,11 +122,24 @@ def _task(state: RunState) -> Task:
     )
 
 
+def _local_repo(deps: _Deps, state: RunState) -> Path:
+    """The resolved local working path for this run. Prefers what ``_dispatch`` stored
+    in the state (durable across restart); falls back to the ``_Deps`` hint, then to
+    locating it from the ref. Post-dispatch nodes read the stored value and so never
+    re-acquire (no surprise fetch during apply/teardown)."""
+    stored = state.get("local_repo")
+    if stored:
+        return Path(stored)
+    if deps.target_repo is not None:
+        return Path(deps.target_repo)
+    return repo_source.ensure_local(deps.target_ref, root=deps.cache_root)
+
+
 def _worktree(deps: _Deps, state: RunState) -> worktree.Worktree:
     return worktree.Worktree(
         path=Path(state["worktree_path"]),
         branch=state["worktree_branch"],
-        target_repo=deps.target_repo,
+        target_repo=_local_repo(deps, state),
         _holder=Path(state["worktree_holder"]),
     )
 
@@ -117,12 +150,21 @@ def _outcome(task_type: str, decision: Optional[str], applied: bool) -> str:
     return OUTCOME_COMPLETED
 
 
-def _terminal_status(task_type: str, decision: Optional[str], applied: bool) -> str:
-    """Map a finished run to its terminal ledger status. A burn applied on a go is
-    ``applied``; a no-go burn is ``scrubbed``; a sim is ``done``."""
+def _terminal_status(
+    task_type: str, decision: Optional[str], applied: bool, push_status: Optional[str] = None
+) -> str:
+    """Map a finished run to its terminal ledger status. A burn on a go that merged AND
+    pushed (or had nothing to push) is ``applied``; if integrating the remote conflicted
+    it is the distinct ``merge_conflict``; a non-fast-forward / creds failure is
+    ``push_rejected``; a no-go burn is ``scrubbed``; a sim is ``done``."""
     if task_type == roles.BURN:
-        if decision == roles.GO and applied:
-            return runs_store.STATUS_APPLIED
+        if decision == roles.GO:
+            if push_status == PUSH_CONFLICT:
+                return runs_store.STATUS_MERGE_CONFLICT
+            if push_status in (PUSH_REJECTED, PUSH_ERROR):
+                return runs_store.STATUS_PUSH_REJECTED
+            if applied:
+                return runs_store.STATUS_APPLIED
         return runs_store.STATUS_SCRUBBED
     return runs_store.STATUS_DONE
 
@@ -139,15 +181,37 @@ def _ledger(deps: _Deps, state: RunState) -> tuple[Optional[RunStore], Optional[
 # -- nodes (idempotent; module-level so they're directly testable) --------
 
 def _dispatch(deps: _Deps, state: RunState) -> dict:
-    """Create the isolated worktree. Idempotent: reuse if this run already made one."""
+    """Acquire the target locally, then carve the isolated worktree off the fetched
+    remote trunk. Idempotent: reuse if this run already made one.
+
+    The local working path is resolved from the ref HERE (at dispatch), not stored as
+    identity: ``ensure_local`` clones the target on a fresh machine or fetches an
+    existing cache clone, so the worktree is built on the current remote state rather
+    than whatever a stale local HEAD points at. A clone/fetch failure raises loudly —
+    the run fails rather than proceeding on an empty or stale copy."""
+    ref = deps.target_ref or (str(deps.target_repo) if deps.target_repo else None)
+    if not ref:
+        raise RuntimeError("dispatch has no target ref/repo to acquire")
+    local = repo_source.ensure_local(ref, root=deps.cache_root)
+
     store, run_id = _ledger(deps, state)
     if store is not None:  # first node → the run is now running; stamp started_at
-        store.mark_running(run_id, target=str(deps.target_repo))
+        store.mark_running(run_id, target=ref, local_path=str(local))
+
     existing = state.get("worktree_path")
     if existing and Path(existing).exists():
         return {}  # already dispatched — re-run is a no-op
-    wt = worktree.create_worktree(deps.target_repo, state["task_id"])
+
+    # A workstream run branches off its long-lived mc/ws/<name> line (ensured on the
+    # remote first); otherwise off origin/<trunk> (or HEAD for a remote-less target).
+    ws = state.get("workstream")
+    if ws and repo_source.has_origin(local):
+        base = f"origin/{repo_source.ensure_workstream_branch(local, ws)}"
+    else:
+        base = repo_source.default_base(local)
+    wt = worktree.create_worktree(local, state["task_id"], base=base)
     return {
+        "local_repo": str(local),
         "worktree_path": str(wt.path),
         "worktree_branch": wt.branch,
         "worktree_holder": str(wt._holder),
@@ -185,9 +249,16 @@ def _gate(deps: _Deps, state: RunState) -> dict:
 
 
 def _apply_burn(deps: _Deps, state: RunState) -> dict:
-    """Apply the burn's changes to the target repo. OWN NODE, idempotent:
-    commit no-ops when clean; merge no-ops when already merged — so a crash that
-    re-runs this whole node never double-applies.
+    """Apply the burn's changes to the target repo AND push them to the remote. OWN
+    NODE, idempotent: commit no-ops when clean; merge no-ops when already merged; the
+    push is a no-op once landed — so a crash that re-runs this whole node never
+    double-applies and always completes the push on resume.
+
+    The push is the write hop that lets an approved burn leave the host, and it fires
+    ONLY here — reached only via the go edge, so never on a sim, a no-go, or a burn
+    no-op. A rejected push (non-fast-forward / conflict) or a creds/network failure is
+    recorded as a distinct outcome (not raised) so teardown still runs and the run ends
+    on a legible terminal state rather than leaking a worktree. We never force-push.
 
     Guard: never apply without a recorded go decision (defense in depth beyond the
     routing edge)."""
@@ -195,8 +266,46 @@ def _apply_burn(deps: _Deps, state: RunState) -> dict:
         raise RuntimeError("apply_burn reached without a recorded go decision")
     wt = _worktree(deps, state)
     worktree.commit_changes(wt, f"apply task {state['task_id']}")
+    local = _local_repo(deps, state)
+    ws = state.get("workstream")
+
+    if ws and repo_source.has_origin(local):
+        # Workstream run: reconcile onto the mc/ws/<name> branch (NOT trunk — trunk only
+        # advances via an explicit promote). The change is committed in the isolated task
+        # worktree; push it (integrating any remote advance on the workstream branch)
+        # from there, so the shared clone's HEAD is never touched. "applied" means it
+        # landed on the workstream branch — false on a conflict/rejection (nothing did).
+        return _push_result({}, local, repo_source.workstream_branch(ws), work_dir=wt.path)
+
+    # Trunk run (or remote-less target): merge into the local trunk, then push it.
     worktree.merge_into_target(wt, f"apply task {state['task_id']}")
-    return {"applied": True}
+    result: dict = {"applied": True}
+    if not repo_source.has_origin(local):
+        result["push_status"] = PUSH_SKIPPED  # nothing to push (remote-less target)
+        return result
+    return _push_result(result, local, repo_source.current_branch(local), work_dir=local)
+
+
+def _push_result(result: dict, local: Path, branch: str, *, work_dir) -> dict:
+    """Push ``work_dir``'s HEAD to ``origin/<branch>`` and fold the outcome into
+    ``result`` (push_status / push_detail / applied). A rejected push or merge conflict
+    is recorded (not raised) so teardown still runs and the run ends on a legible
+    terminal state; we never force-push. ``result`` already reflects any local merge."""
+    try:
+        repo_source.push_to_remote(work_dir, branch, lock_repo=local)
+        result["push_status"] = PUSH_PUSHED
+        result["applied"] = True
+    except repo_source.MergeConflict as exc:
+        result["push_status"] = PUSH_CONFLICT
+        result["push_detail"] = "conflicting files: " + (", ".join(exc.files) or "(unknown)")
+    except repo_source.PushRejected as exc:
+        result["push_status"] = PUSH_REJECTED
+        result["push_detail"] = str(exc)
+    except repo_source.PushError as exc:
+        result["push_status"] = PUSH_ERROR
+        result["push_detail"] = str(exc)
+    result.setdefault("applied", False)
+    return result
 
 
 def _teardown(deps: _Deps, state: RunState) -> dict:
@@ -220,11 +329,22 @@ def _teardown(deps: _Deps, state: RunState) -> dict:
     # this node never duplicates the row or double-counts the cost.
     store, run_id = _ledger(deps, state)
     if store is not None:
+        push_status = state.get("push_status")
+        # A push that didn't land (rejected, errored, or a merge conflict) is the run's
+        # headline fact — put its reason / conflicting files in the detail so the control
+        # room / CLI / Slack can show why; otherwise use the worker summary.
+        if push_status in (PUSH_REJECTED, PUSH_ERROR, PUSH_CONFLICT):
+            detail = (state.get("push_detail") or "push did not land")[:500]
+        else:
+            detail = (state.get("worker_summary") or "")[:500] or None
         store.finish(
             run_id,
-            status=_terminal_status(state["task_type"], state.get("decision"), state.get("applied", False)),
+            status=_terminal_status(
+                state["task_type"], state.get("decision"), state.get("applied", False),
+                push_status,
+            ),
             cost_usd=cost_usd,
-            detail=(state.get("worker_summary") or "")[:500] or None,
+            detail=detail,
         )
     return {"outcome": outcome}
 
@@ -278,8 +398,10 @@ def _route_after_gate(state: RunState) -> str:
 # -- graph assembly --------------------------------------------------------
 
 def build_run_graph(
-    target_repo: Path,
+    target_repo: Optional[Path] = None,
     *,
+    target_ref: Optional[str] = None,
+    cache_root: Optional[Path] = None,
     worker: Optional[Worker] = None,
     checkpointer=None,
     interrupt_before=None,
@@ -301,9 +423,27 @@ def build_run_graph(
     ``runs_store`` opts the run into the Postgres runs ledger: nodes write status
     transitions and the terminal cost/summary as the run progresses. When ``None``
     the run isn't tracked (offline / MemorySaver runs behave exactly as before).
+
+    ``target_ref`` is the PORTABLE identity (a normalized remote ref) and the run's
+    true target: ``dispatch`` acquires it locally (clone/fetch) and carves the
+    worktree off ``origin/<trunk>``. Supply ``target_ref`` alone to run a remote the
+    machine has no local checkout of. When it's ``None`` it's derived from
+    ``target_repo``'s ``origin`` remote, falling back to the resolved path for a
+    remote-less repo. At least one of ``target_repo`` / ``target_ref`` is required.
+    ``cache_root`` overrides where remotes are cached (else the project_ref default).
     """
+    if target_repo is None and target_ref is None:
+        raise ValueError("build_run_graph requires target_repo or target_ref")
+    resolved = Path(target_repo).resolve() if target_repo is not None else None
+    if target_ref is None:
+        try:
+            target_ref = project_ref.remote_of(resolved)
+        except project_ref.NoRemoteError:
+            target_ref = str(resolved)
     deps = _Deps(
-        target_repo=Path(target_repo).resolve(),
+        target_repo=resolved,
+        target_ref=target_ref,
+        cache_root=Path(cache_root) if cache_root is not None else None,
         worker=worker if worker is not None else StubWorker(),
         telemetry_dir=Path(telemetry_dir) if telemetry_dir is not None else None,
         runs_store=runs_store,
@@ -426,6 +566,8 @@ def initial_state(task: Task, *, run_id: Optional[str] = None) -> RunState:
         "decision": None,
         "applied": False,
     }
+    if task.workstream:
+        state["workstream"] = task.workstream
     if run_id is not None:
         state["run_id"] = run_id
     return state

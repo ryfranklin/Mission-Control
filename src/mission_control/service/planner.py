@@ -138,6 +138,14 @@ class SimRunner(Protocol):
         ...
 
 
+class DocsSync(Protocol):
+    """Persists a plan's INCEPTION docs to git (write + commit + push) for ``plan_id``.
+    Wired to :func:`mission_control.plan_docs.sync_to_repo`; called at each checkpoint."""
+
+    def __call__(self, plan_id: str) -> object:
+        ...
+
+
 # -- helpers ---------------------------------------------------------------
 
 def tokenize(text: str) -> Iterator[str]:
@@ -427,10 +435,14 @@ class PlannerEngine:
         *,
         brain: Optional[PlannerBrain] = None,
         sim_runner: Optional[SimRunner] = None,
+        docs_sync: Optional["DocsSync"] = None,
     ) -> None:
         self._store = store
         self._brain: PlannerBrain = brain or StubPlannerBrain()
         self._sim = sim_runner
+        # Called at each INCEPTION checkpoint to persist the plan docs to git (write +
+        # commit + push). None → no git sync (offline / unit tests). See plan_docs.
+        self._docs_sync = docs_sync
 
     def run_turn(self, plan_id: str, operator_content: str) -> Iterator[EngineEvent]:
         """A sync generator of :class:`TokenEvent` / :class:`StageEvent` /
@@ -471,7 +483,7 @@ class PlannerEngine:
 
     def _workspace_detection(self, plan, plan_id, operator_content, completed):
         stage = aidlc.INCEPTION_STAGE_BY_KEY["workspace_detection"]
-        detected = aidlc.MODE_BROWNFIELD if detect_existing_code(plan.target) else None
+        detected = aidlc.MODE_BROWNFIELD if detect_existing_code(plan.working_path) else None
         ctx = self._ctx(plan, operator_content, stage=stage, detected_mode=detected)
         parts: list[str] = []
         outcome = yield from self._stream_brain(ctx, parts)
@@ -509,12 +521,13 @@ class PlannerEngine:
         path), folding the summary back into requirements and laying down the
         Reverse Engineering stage. Returns a one-line note for the reply."""
         self._lay_down(plan_id, aidlc.REVERSE_ENGINEERING_TITLE, Phase.INCEPTION)
-        if not (self._sim and plan.target and Path(plan.target).is_dir()):
+        work_path = plan.working_path
+        if not (self._sim and work_path and Path(work_path).is_dir()):
             self._store.upsert_requirement(
                 plan_id, aidlc.REQ_KEY_RE_SUMMARY,
                 value="(no target available to reverse-engineer)", state=aidlc.REQ_READY)
             return "No target repository was available to reverse-engineer. "
-        result = self._sim.run_sim(target=plan.target, prompt=_RE_PROMPT)
+        result = self._sim.run_sim(target=work_path, prompt=_RE_PROMPT)
         self._store.upsert_requirement(
             plan_id, aidlc.REQ_KEY_RE_SUMMARY, value=result.summary, state=aidlc.REQ_READY)
         self._store.upsert_requirement(
@@ -629,6 +642,10 @@ class PlannerEngine:
     def _finish(self, plan_id, parts, stage_event=None):
         turn = self._store.append_turn(plan_id, ROLE_PLANNER, "".join(parts))
         if stage_event is not None:
+            # A checkpoint: the plan state just changed (a stage laid down / ready) —
+            # persist the plan docs to git so the source of truth travels with the repo.
+            if self._docs_sync is not None:
+                self._docs_sync(plan_id)
             yield stage_event
         yield DoneEvent(turn=turn, plan=self._store.get_plan(plan_id))
 
@@ -674,8 +691,8 @@ class PlannerEngine:
         """Compose the planner's system prompt from the target's AI-DLC install (if
         any), else the default steering — always under AI-DLC (the 'So default')."""
         steering = None
-        if plan.target:
-            root = Path(plan.target)
+        if plan.working_path:
+            root = Path(plan.working_path)
             if root.is_dir():
                 steering = aidlc.probe(root)  # read-only probe
         if steering is None:

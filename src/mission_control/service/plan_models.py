@@ -28,6 +28,9 @@ class OpenPlanRequest(BaseModel):
     cloud_target: Optional[str] = Field(
         None, description="Overrides the instance default (MC_PLANNER_CLOUD)."
     )
+    workstream: Optional[str] = Field(
+        None, description="Optional workstream: build reconciles through mc/ws/<name>."
+    )
 
     @field_validator("mode")
     @classmethod
@@ -90,7 +93,9 @@ class PlanSummary(BaseModel):
     """A single plan header (the ``GET /plans`` list row)."""
 
     id: str
-    target: Optional[str]
+    target: Optional[str]  # the PORTABLE identity (a normalized remote ref)
+    local_path: Optional[str] = None  # the DERIVED machine-local working dir
+    workstream: Optional[str] = None  # the optional mc/ws/<name> line the build reconciles through
     mode: str
     methodology: str
     cloud_target: str

@@ -17,7 +17,7 @@ import os
 from typing import Optional
 from uuid import uuid4
 
-from .. import aidlc
+from .. import aidlc, plan_docs, project_ref
 from ..plans_store import (
     ROLE_OPERATOR,
     STATUS_FINALIZED,
@@ -25,7 +25,7 @@ from ..plans_store import (
     PlanStore,
     PlanTurn,
 )
-from .planner import DoneEvent, PlannerEngine
+from .planner import DocsSync, DoneEvent, PlannerEngine
 
 # Instance defaults: env, themselves defaulting to the methodology's own defaults.
 # Read lazily (at manager construction) so tests can set the env per case.
@@ -59,6 +59,8 @@ class PlanManager:
         engine: Optional[PlannerEngine] = None,
         methodology: Optional[str] = None,
         cloud_target: Optional[str] = None,
+        docs_sync: Optional[DocsSync] = None,
+        cache_root: Optional[str] = None,
     ) -> None:
         self._store = store
         self._engine = engine or PlannerEngine(store)
@@ -66,6 +68,10 @@ class PlanManager:
             "MC_PLANNER_METHODOLOGY"
         ) or DEFAULT_METHODOLOGY
         self._cloud = cloud_target or os.environ.get("MC_PLANNER_CLOUD") or DEFAULT_CLOUD
+        # Persists plan docs to git at finalize (and load_from_git rebuilds the cache
+        # from git). None → no git sync (offline / unit tests).
+        self._docs_sync = docs_sync
+        self._cache_root = cache_root
 
     @property
     def methodology_default(self) -> str:
@@ -86,15 +92,26 @@ class PlanManager:
         mode: str,
         methodology: Optional[str] = None,
         cloud_target: Optional[str] = None,
+        workstream: Optional[str] = None,
     ) -> PlanRow:
         """Open a planning session. methodology/cloud fall back to the instance
-        defaults (env → 'aidlc'/'aws') unless overridden per request."""
+        defaults (env → 'aidlc'/'aws') unless overridden per request. An optional
+        ``workstream`` makes the build reconcile through the mc/ws/<name> branch."""
         if mode not in aidlc.MODES:
             raise PlanConflict(f"mode must be one of {aidlc.MODES}")
         plan_id = f"plan-{uuid4().hex}"
+        # Store the PORTABLE identity (a normalized remote ref) as target; keep the
+        # derived local working dir separately. A blank target (greenfield "new")
+        # stays None until the build scaffolds a workspace.
+        ref, local_path = (None, None)
+        if target:
+            r, lp = project_ref.resolve_target(target)
+            ref, local_path = r, (str(lp) if lp is not None else None)
         self._store.open_plan(
             plan_id,
-            target=target,
+            target=ref,
+            local_path=local_path,
+            workstream=(workstream or None),
             mode=mode,
             methodology=methodology or self._methodology,
             cloud_target=cloud_target or self._cloud,
@@ -152,6 +169,28 @@ class PlanManager:
         if not aidlc.is_ready(report):
             raise PlanNotReady(aidlc.unmet_summary(report))
         self._store.set_status(plan_id, STATUS_FINALIZED)
+        # Land the finalized plan on the remote — the authoritative INCEPTION artifact
+        # the build (and any other host) reads. Must reach the remote (raises on push
+        # failure); a no-op when there's no git sync wired or no portable target.
+        if self._docs_sync is not None:
+            self._docs_sync(plan_id)
+        return self._require(plan_id)
+
+    # -- rebuild the cache from git (a fresh host doesn't start from scratch) ---
+
+    def load_from_git(self, target: str) -> PlanRow:
+        """Reconstruct a plan for ``target`` from its committed git plan docs, GIT
+        AUTHORITATIVE: acquire (clone/fetch), read ``aidlc-docs/inception/``, and
+        reconcile the Postgres cache to it. On a fresh host (empty Postgres) this fully
+        rebuilds the plan from the repo — no re-running of INCEPTION. Raises
+        :class:`PlanNotFound` when the repo carries no plan docs."""
+        plan_id = plan_docs.load_from_repo(
+            self._store, target, cache_root=self._cache_root,
+            methodology=self._methodology, cloud_target=self._cloud,
+            plan_id_factory=lambda: f"plan-{uuid4().hex}",
+        )
+        if plan_id is None:
+            raise PlanNotFound(f"no plan documents found in the repo for target {target!r}")
         return self._require(plan_id)
 
     def readiness(self, plan_id: str):
