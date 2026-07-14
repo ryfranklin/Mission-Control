@@ -37,6 +37,7 @@ from .plan_models import (
 )
 from .planner import DoneEvent, StageEvent, TokenEvent
 from .plans import PlanConflict, PlanManager, PlanNotFound, PlanNotReady
+from .spa import configure_cors, mount_spa
 from .web import mount_web
 
 # How often to emit an SSE keepalive comment (seconds) — keeps proxies/clients
@@ -123,6 +124,11 @@ def create_app(
     app.state.manager = manager
     app.state.plans = plan_manager
     app.state.builder = builder
+
+    # Additive browser access for a separately-built SPA: permit an env-configured
+    # dev-origin allow-list (default none → unchanged). Does not relax the loopback
+    # bind or the v1 no-auth posture — only same-origin browser fetch/EventSource.
+    configure_cors(app)
 
     # -- launch ------------------------------------------------------------
 
@@ -336,5 +342,10 @@ def create_app(
 
     # Server-rendered control-room UI (htmx, no JS build) over the same seam.
     mount_web(app)
+
+    # Optionally serve the separately-built SPA bundle in production — only when
+    # MC_SPA_DIST points at an existing directory. Mounted under a prefix that
+    # does not shadow any API route; a no-op (unchanged seam) when unset/missing.
+    mount_spa(app)
 
     return app
