@@ -27,6 +27,10 @@ FLAVOR_AMAZON_Q = "amazon-q"
 FLAVOR_CURSOR = "cursor"
 FLAVOR_CLINE = "cline"
 FLAVOR_COPILOT = "copilot"
+# The vendored AWS AI-DLC v2 methodology, installed by mission_control.aidlc_v2.
+# Distinct from the legacy single-file/detail-dir flavors above: v2 is a directory
+# tree MC reads as a catalog (see aidlc_v2.catalog), and it wins over any legacy hit.
+FLAVOR_AIDLC_V2 = "aidlc-v2"
 
 # The greenfield task-prompt opener.
 AIDLC_OPENER = "Using AI-DLC, "
@@ -352,6 +356,9 @@ class AidlcSteering:
     core_rules_text: str
     detail_rules_dir: Path | None  # None for bundled single-file installs
     flavor: str
+    # For the v2 flavor: the installed methodology root MC reads as a catalog (the dir
+    # holding ``aidlc-common/stages/<phase>/*.md``). ``None`` for every legacy flavor.
+    catalog_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -396,10 +403,43 @@ def has_aidlc_signature(text: str) -> bool:
     return bool(_SIGNATURE.search(text))
 
 
+# The v2 methodology is installed under this dir (see mission_control.aidlc_v2.install);
+# it is the catalog root holding ``aidlc-common/stages/<phase>/*.md``. Kept as a literal
+# here so aidlc.py has no import-time dependency on the aidlc_v2 package.
+_V2_INSTALL_DIRNAME = ".aidlc"
+_V2_STAGES_GLOB = "aidlc-common/stages/*/*.md"
+
+
+def _probe_v2(root: Path) -> AidlcSteering | None:
+    """Detect a v2 install: the ``.aidlc/`` catalog root with at least one
+    ``aidlc-common/stages/<phase>/*.md``. Self-identifying (dir-named), so no content
+    signature is needed. Returns steering carrying the resolvable ``catalog_root``."""
+    catalog_root = root / _V2_INSTALL_DIRNAME
+    if not any(catalog_root.glob(_V2_STAGES_GLOB)):
+        return None
+    core = (
+        "AI-DLC v2 methodology is installed in this target. Mission Control drives its "
+        "stages (initialization → ideation → inception → construction → operation) via "
+        "its own orchestration and go/no-go gate; v2's hooks and tools are not run."
+    )
+    return AidlcSteering(
+        core_rules_text=core,
+        detail_rules_dir=None,
+        flavor=FLAVOR_AIDLC_V2,
+        catalog_root=catalog_root,
+    )
+
+
 def probe(worktree_root: Path) -> AidlcSteering | None:
-    """Probe known AI-DLC install paths in priority order; return the first hit
-    normalized, or ``None`` to run plain (AI-DLC is opt-in per target)."""
+    """Probe known AI-DLC install paths; return the first hit normalized, or ``None`` to
+    run plain (AI-DLC is opt-in per target).
+
+    The v2 catalog layout is checked FIRST and wins over any legacy install; the legacy
+    single-file/detail-dir probe order (unchanged) runs only when there is no v2 tree."""
     root = Path(worktree_root)
+    v2 = _probe_v2(root)
+    if v2 is not None:
+        return v2
     for c in _PROBE_ORDER:
         core = root / c.core_rel
         if not core.is_file():

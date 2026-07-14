@@ -47,6 +47,10 @@ ROLE_PLANNER = "planner"
 # a ``done`` unit is not re-run on another machine. Not-``done`` units are (re-)runnable.
 UNIT_PENDING = "pending"
 UNIT_DONE = "done"
+# A unit recorded in the work-list but deliberately NOT dispatched (an AI-DLC v2
+# ``operation`` stage — deferred in v1, needs cloud creds). It travels in the plan and
+# counts as resolved for plan completion, but the builder never launches it.
+UNIT_DEFERRED = "deferred"
 
 # One statement per entry: the autocommit pool prepares statements, which forbids
 # multiple commands in a single execute() (same constraint as the runs ledger).
@@ -121,6 +125,9 @@ _DDL = (
         PRIMARY KEY (plan_id, seq)
     )
     """,
+    # The v2 stage this unit was derived from (its catalog slug), so a worker can find
+    # the right stage file. NULL for built-in (v1) plans — backward-compatible.
+    "ALTER TABLE plan_units ADD COLUMN IF NOT EXISTS stage_slug TEXT",
 )
 
 
@@ -193,6 +200,9 @@ class PlanUnit:
     depends_on: list
     status: str
     created_at: Optional[datetime]
+    # The v2 catalog stage this unit derives from (None for built-in/v1 plans).
+    # Defaulted so PlanUnit(**row) works for rows created before this column.
+    stage_slug: Optional[str] = None
 
 
 # Columns whose non-None values narrow a list_plans() query.
@@ -402,31 +412,42 @@ class PlanStore:
         phase: Phase | str,
         depends_on: Optional[list] = None,
         status: str = UNIT_PENDING,
+        task_type: Optional[str] = None,
+        stage_slug: Optional[str] = None,
     ) -> PlanUnit:
-        """Record or update one work-list unit, keyed by (plan_id, seq). ``task_type``
-        is DERIVED from ``phase`` here (never passed in), so the sim/burn mapping stays
-        sourced from :func:`aidlc.task_type_for_phase`. Idempotent at the stage
-        boundary that lays the work-list down."""
-        phase_enum = phase if isinstance(phase, Phase) else Phase(phase)
-        task_type = task_type_for_phase(phase_enum).value
+        """Record or update one work-list unit, keyed by (plan_id, seq). Idempotent at
+        the stage boundary that lays the work-list down.
+
+        For built-in (v1) plans ``task_type`` is left None and DERIVED from ``phase`` via
+        :func:`aidlc.task_type_for_phase`, so the sim/burn mapping stays sourced from the
+        methodology. AI-DLC v2 units pass ``task_type`` explicitly (from the stage
+        ``kind``) — because a v2 phase (e.g. a design stage in ``construction``) does not
+        determine sim vs. burn — plus the ``stage_slug`` that identifies the stage."""
+        phase_str = phase.value if isinstance(phase, Phase) else str(phase)
+        # Only coerce through the v1 Phase enum when we must derive task_type from it;
+        # v2 phases ("construction"/"operation") are stored verbatim.
+        if task_type is None:
+            task_type = task_type_for_phase(Phase(phase_str)).value
         deps = list(depends_on or [])
         with self._pool.connection() as conn:
             cur = conn.cursor(row_factory=dict_row)
             cur.execute(
                 """
-                INSERT INTO plan_units (plan_id, seq, title, phase, task_type, depends_on, status)
-                VALUES (%(pid)s, %(seq)s, %(title)s, %(phase)s, %(tt)s, %(deps)s, %(status)s)
+                INSERT INTO plan_units (plan_id, seq, title, phase, task_type, depends_on, status, stage_slug)
+                VALUES (%(pid)s, %(seq)s, %(title)s, %(phase)s, %(tt)s, %(deps)s, %(status)s, %(slug)s)
                 ON CONFLICT (plan_id, seq) DO UPDATE SET
                     title      = EXCLUDED.title,
                     phase      = EXCLUDED.phase,
                     task_type  = EXCLUDED.task_type,
                     depends_on = EXCLUDED.depends_on,
-                    status     = EXCLUDED.status
-                RETURNING plan_id, seq, title, phase, task_type, depends_on, status, created_at
+                    status     = EXCLUDED.status,
+                    stage_slug = EXCLUDED.stage_slug
+                RETURNING plan_id, seq, title, phase, task_type, depends_on, status, created_at, stage_slug
                 """,
                 {
-                    "pid": plan_id, "seq": seq, "title": title, "phase": phase_enum.value,
+                    "pid": plan_id, "seq": seq, "title": title, "phase": phase_str,
                     "tt": task_type, "deps": Jsonb(deps), "status": status,
+                    "slug": stage_slug,
                 },
             )
             row = cur.fetchone()

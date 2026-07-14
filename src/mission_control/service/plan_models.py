@@ -88,12 +88,14 @@ class UnitModel(BaseModel):
     task_type: str
     depends_on: list
     status: str
+    stage_slug: Optional[str] = None  # the v2 catalog stage (None for built-in plans)
 
     @classmethod
     def from_row(cls, row: PlanUnit) -> "UnitModel":
         return cls(
             seq=row.seq, title=row.title, phase=row.phase, task_type=row.task_type,
             depends_on=list(row.depends_on or []), status=row.status,
+            stage_slug=row.stage_slug,
         )
 
 

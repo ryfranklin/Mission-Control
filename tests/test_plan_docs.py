@@ -11,10 +11,12 @@ from uuid import uuid4
 
 import pytest
 
-from mission_control import plan_docs, project_ref, repo_source
+from mission_control import plan_docs, project_ref, repo_source, roles
 from mission_control.aidlc import Phase
+from mission_control.aidlc_v2 import install as install_v2
 from mission_control.graph import build_plans_store, postgres_checkpointer
 from mission_control.plan_docs import PlanDoc, RequirementDoc, UnitDoc
+from mission_control.plans_store import UNIT_DONE
 
 
 # -- pure round-trip (no services) -----------------------------------------
@@ -67,6 +69,34 @@ def test_flight_plan_and_requirements_files_exist(tmp_path):
 def test_load_missing_plan_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         plan_docs.load_plan(tmp_path)
+
+
+def test_v2_units_roundtrip_with_stage_slug_and_task_type(tmp_path):
+    """A v2 unit lives in a v2 phase (e.g. a design stage in ``construction``) where the
+    phase alone can't determine sim vs. burn — so stage_slug + task_type must survive the
+    round-trip, and task_type is trusted (not derived) for the non-v1 phase."""
+    plan = PlanDoc(
+        mode="greenfield",
+        status="ready",
+        units=[
+            # a design stage: v2 phase 'construction' but kind sim → task_type 'sim'
+            UnitDoc(0, "Functional Design", "construction", [], "pending",
+                    stage_slug="functional-design", stored_task_type="sim"),
+            # a code stage: 'construction' + burn
+            UnitDoc(1, "Code Generation", "construction", [0], "pending",
+                    stage_slug="code-generation", stored_task_type="burn"),
+            # an operation stage: recorded but deferred
+            UnitDoc(2, "Deployment Execution", "operation", [1], "deferred",
+                    stage_slug="deployment-execution", stored_task_type="burn"),
+        ],
+    )
+    plan_docs.dump_plan(plan, tmp_path)
+    loaded = plan_docs.load_plan(tmp_path)
+    assert loaded.units == plan.units
+    assert [u.task_type for u in loaded.units] == ["sim", "burn", "burn"]
+    assert [u.stage_slug for u in loaded.units] == [
+        "functional-design", "code-generation", "deployment-execution"]
+    assert loaded.units[2].status == "deferred"
 
 
 # -- Postgres + git reconciliation -----------------------------------------
@@ -185,6 +215,92 @@ def test_fresh_host_reconstructs_plan_from_git(store, remote, tmp_path):
     assert store.get_plan(pid_b).status == "ready"
     reqs = {r.key: (r.value, r.state) for r in store.list_requirements(pid_b)}
     assert reqs["scope"] == ("bounded to ingestion", "ready")
+
+
+# -- v2: MC keeps aidlc-state.md coherent + commits artifacts (one path) ----
+
+@pytest.fixture
+def v2_remote(tmp_path):
+    """A bare remote whose trunk already carries an AI-DLC v2 install (.aidlc/)."""
+    work = tmp_path / "v2seed"
+    work.mkdir()
+    _git(work, "init", "-b", "main")
+    _git(work, "config", "user.email", "t@example.com")
+    _git(work, "config", "user.name", "T")
+    (work / "README.md").write_text("# seed\n")
+    install_v2(work)                      # writes .aidlc/ (the vendored methodology)
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "seed + aidlc v2")
+    bare = tmp_path / "v2remote.git"
+    subprocess.run(["git", "clone", "--bare", str(work), str(bare)],
+                   check=True, capture_output=True)
+    _git(bare, "remote", "remove", "origin")
+    _git(bare, "symbolic-ref", "HEAD", "refs/heads/main")
+    return bare
+
+
+def test_v2_stage_go_marks_state_and_commits_artifacts(store, v2_remote, tmp_path):
+    """A stage GO flips that stage to [x] in aidlc-state.md and commits the produced
+    artifacts through the SAME plan_docs sync path, behind the content guard."""
+    ref, _ = project_ref.resolve_target(str(v2_remote))
+    cache = tmp_path / "cache"
+
+    pid = f"plan-{uuid4().hex}"
+    store.open_plan(pid, target=ref, local_path=None, mode="greenfield",
+                    methodology="aidlc", cloud_target="aws")
+    # a laid-down plan (INCEPTION) stage, a DONE build unit (a GO), and a pending one
+    store.upsert_unit(pid, 0, title="Requirements Analysis", phase=Phase.INCEPTION,
+                      stage_slug="requirements-analysis")
+    store.upsert_unit(pid, 1, title="Functional Design", phase="construction",
+                      task_type=roles.SIM, stage_slug="functional-design", status=UNIT_DONE)
+    store.upsert_unit(pid, 2, title="Code Generation", phase="construction",
+                      task_type=roles.BURN, stage_slug="code-generation")
+    store.set_status(pid, "ready")
+
+    # the worker's produced artifact sits (uncommitted) under aidlc-docs/, as after an apply
+    local = repo_source.ensure_local(ref, root=cache)
+    art = local / "aidlc-docs" / "construction" / "functional-design" / "business-logic-model.md"
+    art.parent.mkdir(parents=True, exist_ok=True)
+    art.write_text("# Business Logic Model\n\nSpec-only artifact.\n")
+
+    # the ONE sync path: writes flight-plan.yaml + aidlc-state.md, stages artifacts,
+    # runs the content guard, commits, pushes. (No exception → guard passed.)
+    assert plan_docs.sync_to_repo(store, pid, cache_root=cache) is True
+
+    state = (local / "aidlc-docs" / "aidlc-state.md").read_text()
+    assert "- [x] functional-design" in state          # the GO'd stage
+    assert "- [x] requirements-analysis" in state       # laid-down plan stage
+    assert "- [ ] code-generation" in state             # not done → incomplete
+
+    # everything moved in one commit through plan_docs → landed on the remote trunk
+    tree = _git(v2_remote, "ls-tree", "-r", "--name-only", "refs/heads/main").split()
+    assert "aidlc-docs/aidlc-state.md" in tree
+    assert "aidlc-docs/inception/flight-plan.yaml" in tree
+    assert "aidlc-docs/construction/functional-design/business-logic-model.md" in tree
+
+
+def test_content_guard_covers_committed_v2_artifacts(store, v2_remote, tmp_path):
+    """The egress guard scans the WHOLE aidlc-docs/ tree — so a secret in a produced v2
+    artifact blocks the commit, not just secrets in flight-plan.yaml."""
+    from mission_control.content_guard import GuardViolation
+
+    ref, _ = project_ref.resolve_target(str(v2_remote))
+    cache = tmp_path / "cache"
+    pid = f"plan-{uuid4().hex}"
+    store.open_plan(pid, target=ref, local_path=None, mode="greenfield",
+                    methodology="aidlc", cloud_target="aws")
+    store.upsert_unit(pid, 0, title="Code Generation", phase="construction",
+                      task_type=roles.BURN, stage_slug="code-generation")
+    store.set_status(pid, "ready")
+
+    # a produced artifact under aidlc-docs/ carrying an obvious secret
+    local = repo_source.ensure_local(ref, root=cache)
+    art = local / "aidlc-docs" / "construction" / "code-generation" / "code-summary.md"
+    art.parent.mkdir(parents=True, exist_ok=True)
+    art.write_text("aws_secret_access_key = AKIAIOSFODNN7EXAMPLEabcdefghijklmnopqrstuvwx\n")
+
+    with pytest.raises(GuardViolation):
+        plan_docs.sync_to_repo(store, pid, cache_root=cache)
 
 
 def test_postgres_git_divergence_resolves_to_git(store, remote, tmp_path):

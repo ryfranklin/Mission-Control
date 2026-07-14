@@ -33,11 +33,13 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
+from typing import Optional
 
 from .. import aidlc, plan_docs, repo_source, roles, worktree
 from ..plans_store import (
     STATUS_BUILDING,
     STATUS_DONE,
+    UNIT_DEFERRED,
     UNIT_DONE,
     PlanStore,
 )
@@ -142,14 +144,37 @@ class PlanBuilder:
     # -- edge trigger: a child run terminated ------------------------------
 
     def on_run_terminal(self, run_id: str, plan_id: str) -> None:
-        """A plan-child run reached a terminal state. On SUCCESS, mark its unit ``done``
-        and push that to git (the portable progress record) BEFORE dispatching more, so
-        the durable record is updated before anything builds on it. Then dispatch
-        newly-unblocked units and roll the plan up. Registered as the run observer."""
+        """A plan-child run reached a terminal state. On SUCCESS (a sim done / a burn
+        applied on a GO), mark its unit ``done`` and push that to git (the portable
+        progress record) BEFORE dispatching more. On a NO-GO scrub, record the stage's
+        'request changes' — the unit stays not-done (its stage stays incomplete) and
+        only that unit is scrubbed; the plan is not failed. Then dispatch newly-unblocked
+        units and roll the plan up. Registered as the run observer."""
         run = self._runs.get_run(run_id)
-        if run is not None and run.plan_unit_seq is not None and run.status in _SUCCESS:
-            self._mark_unit_done(plan_id, run.plan_unit_seq)
+        if run is not None and run.plan_unit_seq is not None:
+            if run.status in _SUCCESS:
+                self._mark_unit_done(plan_id, run.plan_unit_seq)
+            elif run.status == STATUS_SCRUBBED:  # a NO-GO at the gate
+                self._request_changes(plan_id, run.plan_unit_seq,
+                                      getattr(run, "detail", None))
         self._advance(plan_id)
+
+    def _request_changes(self, plan_id: str, seq: int, feedback: Optional[str]) -> None:
+        """Record a NO-GO'd stage's gate feedback as a 'request changes' — the v2
+        ``[?]``→revising signal, collapsed into MC's gate. The unit is NOT marked done
+        (its stage stays ``[ ]`` in aidlc-state.md); the recorded requirement travels in
+        the plan docs so the next attempt (or a reviewer) can read the feedback. This is
+        MC's stand-in for ``aidlc-state.ts reject`` — MC never shells out to that tool."""
+        unit = next((u for u in self._plans.list_units(plan_id) if u.seq == seq), None)
+        if unit is None or not getattr(unit, "stage_slug", None):
+            return  # not a v2 stage unit → nothing v2-specific to record
+        note = feedback or f"changes requested at the go/no-go gate for {unit.stage_slug}"
+        self._plans.upsert_requirement(
+            plan_id, f"{unit.stage_slug}:changes-requested", value=note,
+            state=aidlc.REQ_OPEN)
+        # Re-sync so the incomplete stage + the request-changes note land in git.
+        if self._docs_sync is not None:
+            self._docs_sync(plan_id)
 
     def _mark_unit_done(self, plan_id: str, seq: int) -> None:
         """Mark a unit ``done`` and persist that to git (write flight-plan.yaml + commit
@@ -167,6 +192,9 @@ class PlanBuilder:
     # -- the scheduler -----------------------------------------------------
 
     def _advance(self, plan_id: str) -> None:
+        # This is MC's own advance: it dispatches the next dependency-satisfied unit(s)
+        # itself. For a v2 plan it REPLACES v2's `aidlc-orchestrate.ts report` auto-
+        # advance — MC owns sequencing and never shells out to v2's .ts tools.
         plan = self._plans.get_plan(plan_id)
         if plan is None or plan.status == STATUS_DONE:
             return
@@ -196,16 +224,21 @@ class PlanBuilder:
                 self._mark_unit_done(plan_id, unit.seq)
                 done.add(unit.seq)
         dead = self._dead_seqs(units, by_seq)  # own run failed, or a dep is dead
+        # Deferred units (AI-DLC v2 ``operation`` stages) are RECORDED in the plan but
+        # never dispatched in v1 (they need cloud creds). They count as resolved so the
+        # plan can still complete; they are never launched and never block a dependent.
+        deferred = {u.seq for u in units if u.status == UNIT_DEFERRED}
 
         for unit in units:  # units come back in seq order
-            if unit.seq in done or unit.seq in by_seq or unit.seq in dead:
-                continue  # already done (git) / dispatched this session / will never run
+            if unit.seq in done or unit.seq in by_seq or unit.seq in dead \
+                    or unit.seq in deferred:
+                continue  # done / dispatched / dead / deferred-never-dispatched
             if not all(dep in done for dep in (unit.depends_on or [])):
                 continue  # a dependency isn't done yet → not (yet) dispatchable
             self._dispatch(plan_id, target, unit)
             by_seq = {r.plan_unit_seq: r for r in self._runs.child_runs(plan_id)}
 
-        if self._all_resolved(units, done, dead):
+        if self._all_resolved(units, done | deferred, dead):
             self._plans.set_status(plan_id, STATUS_DONE)
 
     def _dispatch(self, plan_id: str, target: str, unit) -> None:
@@ -215,6 +248,9 @@ class PlanBuilder:
             plan_id=plan_id, plan_unit_seq=unit.seq,
             workstream=plan.workstream if plan else None,
             allow_secrets=bool(plan.allow_secrets) if plan else False,
+            # A v2 unit carries its stage slug → the worker steers from that stage's
+            # definition + lead-agent knowledge (see aidlc_v2.steering). None for v1.
+            stage_slug=getattr(unit, "stage_slug", None),
         )
 
     # -- dependency logic --------------------------------------------------

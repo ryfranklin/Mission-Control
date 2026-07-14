@@ -97,6 +97,28 @@ workdir)`). `SdkWorker` wraps the Claude Agent SDK with **fully explicit context
 an **AI-DLC** install and composes its rules into the system prompt, and reports
 per-step usage. `StubWorker` is a deterministic, offline stand-in.
 
+**AI-DLC v2 (methodology-in-target).** Mission Control can run the [AWS **AI-DLC
+v2**](https://github.com/awslabs/aidlc-workflows) methodology as *content installed in
+the target repo* — **MC drives, v2 supplies the stage content, and MC never runs v2's
+hooks or tools.** The methodology is vendored into `src/mission_control/aidlc_v2/`
+pinned to an exact upstream commit (stage definitions, protocols, agent definitions,
+knowledge — `hooks/` and `tools/` are excluded). When a target has v2 installed
+(`.aidlc/`), the planner **derives the INCEPTION walk and the work-list from the
+catalog** instead of MC's built-in stages, and each stage-unit worker is steered by that
+one stage's protocol + its `lead_agent`'s knowledge. MC substitutes its **own**
+orchestration, go/no-go gate, and state:
+
+- each catalog stage becomes an MC unit — a design stage runs as a read-only `sim`, a
+  code stage as a gated `burn`;
+- v2's approval gate maps onto MC's **go/no-go** (a `reviewer` in a stage's frontmatter
+  collapses into the gate — a GO approves, a NO-GO with feedback is "request changes");
+- MC keeps v2's own `aidlc-state.md` coherent (marking stages `[x]` on a GO) and commits
+  it with the produced artifacts through the same content-guarded git-sync path;
+- `operation`-phase stages are parsed and shown but **deferred** in v1 (they need cloud
+  credentials) — recorded in the plan with a clear reason, never dispatched.
+
+See `scripts/e2e_phase8.py` for the end-to-end run and `docs/PHASE8_FINDINGS.md`.
+
 **Orchestration.** Two interchangeable shells over the *same* worker:
 - **Imperative** (`Orchestrator`) — dispatch → run → gate → apply/scrub → teardown.
 - **Durable** (`graph.py`, LangGraph `StateGraph`) — the same lifecycle as nodes,

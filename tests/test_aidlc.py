@@ -6,7 +6,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from mission_control import Phase, Task, TaskType, aidlc, probe, task_type_for_phase
-from mission_control.aidlc import FLAVOR_CLAUDE, FLAVOR_GENERIC, FLAVOR_KIRO
+from mission_control.aidlc import (
+    FLAVOR_AIDLC_V2,
+    FLAVOR_CLAUDE,
+    FLAVOR_GENERIC,
+    FLAVOR_KIRO,
+)
 from mission_control.sdk_worker import SdkWorker, _system_prompt
 
 # A realistic assembled steering file with the AI-DLC content signature.
@@ -120,3 +125,55 @@ def test_greenfield_opener_only_when_greenfield():
         "Using AI-DLC, build a service"
     )
     assert aidlc.apply_invocation("fix a bug", greenfield=False) == "fix a bug"
+
+
+# -- v2 detection (the directory-tree flavor) --------------------------------
+#
+# The v2 layout is a ``.aidlc/`` catalog root holding ``aidlc-common/stages/<phase>/
+# *.md``. A single minimal stage file is enough to exercise the detection rule
+# (independent of the real vendored tree — that path is covered in test_aidlc_v2_install).
+
+
+def _write_v2_layout(root: Path) -> Path:
+    """Lay down the minimal v2 catalog layout probe() keys on; return the catalog root."""
+    catalog_root = root / ".aidlc"
+    _write(
+        catalog_root,
+        "aidlc-common/stages/inception/requirements-analysis.md",
+        "---\nslug: requirements-analysis\nphase: inception\n---\n# Requirements\n",
+    )
+    return catalog_root
+
+
+def test_v2_layout_detected(tmp_path):
+    catalog_root = _write_v2_layout(tmp_path)
+    steering = probe(tmp_path)
+    assert steering is not None
+    assert steering.flavor == FLAVOR_AIDLC_V2
+    # steering carries a resolvable catalog root M3 hands to load_catalog()
+    assert steering.catalog_root == catalog_root
+    assert steering.catalog_root.is_dir()
+
+
+def test_v2_wins_over_legacy(tmp_path):
+    """When both a legacy install AND a v2 tree are present, v2 wins."""
+    _write(tmp_path, "AGENTS.md", SIGNED)        # a valid legacy (generic) hit
+    _write(tmp_path, ".claude/CLAUDE.md", SIGNED)  # another legacy hit
+    _write_v2_layout(tmp_path)
+    steering = probe(tmp_path)
+    assert steering.flavor == FLAVOR_AIDLC_V2
+
+
+def test_legacy_flavor_unchanged_without_v2(tmp_path):
+    """No v2 tree → the legacy probe order is untouched and carries no catalog_root."""
+    _write(tmp_path, "AGENTS.md", SIGNED)
+    steering = probe(tmp_path)
+    assert steering.flavor == FLAVOR_GENERIC
+    assert steering.catalog_root is None
+
+
+def test_empty_v2_dir_does_not_match(tmp_path):
+    """A ``.aidlc/`` with no ``aidlc-common/stages/<phase>/*.md`` is not a v2 hit —
+    and with no legacy install either, probe() still returns None."""
+    (tmp_path / ".aidlc" / "aidlc-common" / "stages").mkdir(parents=True)
+    assert probe(tmp_path) is None

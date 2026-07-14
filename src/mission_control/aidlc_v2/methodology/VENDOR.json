@@ -1,0 +1,18 @@
+{
+  "repo": "https://github.com/awslabs/aidlc-workflows",
+  "ref": "v2",
+  "commit": "d4fc34dd2e548b43fb781ff6177662d6bf54e6f8",
+  "vendored_at": "2026-07-14T20:20:00+00:00",
+  "source_base": "dist/claude/.claude",
+  "source_paths": [
+    "aidlc-common/stages",
+    "aidlc-common/protocols",
+    "agents",
+    "knowledge"
+  ],
+  "excluded": [
+    "hooks",
+    "tools"
+  ],
+  "file_count": 109
+}

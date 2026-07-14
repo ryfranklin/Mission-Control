@@ -8,6 +8,7 @@ Skipped unless the Dockerized Postgres is reachable."""
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -21,7 +22,7 @@ from mission_control.graph import (
     postgres_checkpointer,
 )
 from mission_control import plans_store as ps
-from mission_control.runs_store import STATUS_DONE
+from mission_control.runs_store import STATUS_DONE, STATUS_SCRUBBED
 from mission_control.service import PlanBuilder, PlanManager, RunManager, create_app
 
 STUB_BURN_FILE = "STUB_BURN.txt"
@@ -174,6 +175,110 @@ def test_rejected_gate_scrubs_the_unit_not_the_plan(build_env, target_repo):
     assert 2 not in runs and 1 not in runs                      # dependent stayed blocked
     assert done["status"] == ps.STATUS_DONE                     # the plan is NOT scrubbed
     assert not (target_repo / STUB_BURN_FILE).exists()          # nothing applied
+
+
+# -- deferred (v2 operation) units are recorded but never dispatched -------
+
+@pytest.fixture
+def plan_store_pg():
+    try:
+        _checkpointer, pool = postgres_checkpointer(setup=True)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"Postgres unavailable (run `docker compose up -d`): {e}")
+    yield build_plans_store(pool, setup=True)
+    pool.close()
+
+
+class _FakeRuns:
+    """Records launches; never actually runs anything (enough to drive the scheduler)."""
+
+    def __init__(self):
+        self.launched = []
+
+    def child_runs(self, plan_id):
+        return []
+
+    def launch(self, *, plan_unit_seq, **kwargs):
+        self.launched.append(plan_unit_seq)
+
+
+def _open_building(store, target, units):
+    """Open a BUILDING plan on ``target`` with ``units`` = list of
+    (seq, phase, task_type, status, stage_slug, depends_on)."""
+    pid = f"plan-{uuid4().hex}"
+    store.open_plan(pid, target=str(target), local_path=str(target), mode="greenfield",
+                    methodology="aidlc", cloud_target="aws", status=ps.STATUS_BUILDING)
+    for seq, phase, task_type, status, slug, deps in units:
+        store.upsert_unit(pid, seq, title=f"unit {seq}", phase=phase, task_type=task_type,
+                          status=status, stage_slug=slug, depends_on=deps)
+    return pid
+
+
+def test_deferred_unit_is_never_dispatched(plan_store_pg, target_repo, tmp_path):
+    store = plan_store_pg
+    runs = _FakeRuns()
+    builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
+                          cache_root=tmp_path / "cache")
+    # seq0 a dispatchable construction burn; seq1 a DEFERRED operation burn.
+    pid = _open_building(store, target_repo, [
+        (0, "construction", roles.BURN, ps.UNIT_PENDING, "code-generation", []),
+        (1, "operation", roles.BURN, ps.UNIT_DEFERRED, "deployment-execution", []),
+    ])
+    builder._advance(pid)
+    assert runs.launched == [0]            # only the non-deferred unit dispatched
+    assert 1 not in runs.launched          # the deferred operation unit never launched
+
+
+def test_plan_of_only_deferred_units_completes(plan_store_pg, target_repo, tmp_path):
+    store = plan_store_pg
+    runs = _FakeRuns()
+    builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
+                          cache_root=tmp_path / "cache")
+    pid = _open_building(store, target_repo, [
+        (0, "operation", roles.BURN, ps.UNIT_DEFERRED, "incident-response", []),
+    ])
+    builder._advance(pid)
+    assert runs.launched == []                              # nothing dispatched
+    assert store.get_plan(pid).status == ps.STATUS_DONE     # deferred counts as resolved
+
+
+def test_no_go_records_request_changes_and_leaves_stage_incomplete(plan_store_pg,
+                                                                    target_repo, tmp_path):
+    """A NO-GO at a stage's gate records the gate feedback as 'request changes', leaves
+    the stage not-done (incomplete), and scrubs only that unit — the plan is not failed."""
+    store = plan_store_pg
+
+    class _Runs:
+        def __init__(self):
+            self.launched = []
+            self.run = None
+
+        def child_runs(self, plan_id):
+            return [self.run] if self.run else []
+
+        def get_run(self, run_id):
+            return self.run
+
+        def launch(self, **kwargs):
+            self.launched.append(kwargs.get("plan_unit_seq"))
+
+    runs = _Runs()
+    # docs_sync None → record the requirement without touching git (unit-level check)
+    builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
+                          cache_root=tmp_path / "cache", docs_sync=None)
+    pid = _open_building(store, target_repo, [
+        (0, "construction", roles.BURN, ps.UNIT_PENDING, "code-generation", []),
+    ])
+    # the burn was rejected at the gate → scrubbed, with the operator's feedback on detail
+    runs.run = SimpleNamespace(run_id="run-0", plan_unit_seq=0,
+                               status=STATUS_SCRUBBED, detail="fix the API contract")
+    builder.on_run_terminal("run-0", pid)
+
+    reqs = {r.key: r for r in store.list_requirements(pid)}
+    assert "code-generation:changes-requested" in reqs         # feedback recorded
+    assert reqs["code-generation:changes-requested"].value == "fix the API contract"
+    assert store.list_units(pid)[0].status != ps.UNIT_DONE      # stage stays incomplete
+    assert store.get_plan(pid).status in (ps.STATUS_BUILDING, ps.STATUS_DONE)  # not failed
 
 
 # -- greenfield bootstraps a real remote (portable identity from unit 1) ----
