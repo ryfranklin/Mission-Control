@@ -256,12 +256,33 @@ class RunManager:
     # -- go/no-go review: what a burn will apply --------------------------
 
     def run_changes(self, run_id: str) -> Optional[dict]:
-        """What a burn has produced in its worktree — the material for a go/no-go
-        decision (at the gate) OR a live work-in-progress view (while ``running``, so a
-        long burn isn't a black box). ``None`` for runs with no live worktree. Reads the
-        branch/path from the durable checkpoint, so it survives a restart; the worktree
-        peek uses a throwaway index and never mutates the worker's work."""
+        """What a burn changed — the material for a go/no-go decision (at the gate) OR
+        a live work-in-progress view (while ``running``), and, once the run has left the
+        gate, the FINAL applied diff read from durable storage (the live worktree is
+        gone). ``None`` only when there is nothing to show (a sim, a no-change burn, or a
+        run that never produced a diff), so the endpoint 404s cleanly for those.
+
+        The response carries ``phase``: ``"pending"`` for the still-editable live diff
+        (at the gate / running) vs ``"applied"`` for the durable post-apply diff, so the
+        UI can label it. The rest of the shape (files/stat/patch/branch/status) is
+        unchanged, so existing callers keep working."""
         row = self._require(run_id)
+        live = self._live_changes(run_id, row)
+        if live is not None:
+            live["phase"] = "pending"
+            return live
+        # No live worktree (run left the gate) → fall back to the persisted applied diff.
+        if row.changes_json:
+            changes = dict(row.changes_json)
+            changes["status"] = row.status
+            changes["phase"] = "applied"
+            return changes
+        return None
+
+    def _live_changes(self, run_id: str, row: RunRow) -> Optional[dict]:
+        """The LIVE worktree diff while a run is running / at the gate, or ``None`` once
+        the worktree is gone. Reads the branch/path from the durable checkpoint, so it
+        survives a restart; the peek uses a throwaway index and never mutates the work."""
         work_path = _work_path(row)  # the LOCAL working dir, not the portable ref
         if row.status not in (STATUS_RUNNING, STATUS_AWAITING_GATE) or not work_path:
             return None

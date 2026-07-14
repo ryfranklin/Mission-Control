@@ -253,6 +253,26 @@ def _gate(deps: _Deps, state: RunState) -> dict:
     return {"decision": roles.GO if approved else roles.NO_GO}
 
 
+def _persist_changes(deps: _Deps, state: RunState, local: Path, wt: worktree.Worktree) -> None:
+    """Capture the pending changed-files diff and store it on the run row, so it stays
+    viewable after the worktree is torn down. Best-effort (an observability aid must
+    never break apply) and additive (only ``changes_json`` is written). Persists only
+    when the burn actually changed files — a no-op burn leaves the column NULL."""
+    store, run_id = _ledger(deps, state)
+    if store is None:
+        return
+    try:
+        diff = worktree.changes(local, wt.branch, wt.path)
+    except Exception:  # noqa: BLE001 — diffing must never break the apply
+        return
+    if not diff.get("files"):
+        return
+    try:
+        store.set_changes(run_id, diff)
+    except Exception:  # noqa: BLE001
+        return
+
+
 def _apply_burn(deps: _Deps, state: RunState) -> dict:
     """Apply the burn's changes to the target repo AND push them to the remote. OWN
     NODE, idempotent: commit no-ops when clean; merge no-ops when already merged; the
@@ -273,6 +293,13 @@ def _apply_burn(deps: _Deps, state: RunState) -> dict:
     wt = _worktree(deps, state)
     local = _local_repo(deps, state)
     ws = state.get("workstream")
+
+    # Persist the changed-files diff BEFORE it is applied — this is the last point the
+    # worktree still exists (teardown removes it), so it's where worktree.changes() is
+    # computable. Durable storage then keeps the diff viewable after the run leaves the
+    # gate. Additive + best-effort: never break apply; only a burn that changed files
+    # gets a stored payload (a no-op burn persists nothing).
+    _persist_changes(deps, state, local, wt)
 
     # EGRESS GUARD: scan the staged unit output before it is committed + pushed. A
     # secret/PII blocks the burn as a distinct terminal state (not raised — teardown must
