@@ -278,13 +278,21 @@ def sync_to_repo(store, plan_id: str, *, cache_root: Optional[Path] = None) -> b
         store.set_local_path(plan_id, str(local))
 
     dump_plan(plan_doc_from_store(store, plan_id), docs_dir(local))
+    # For an AI-DLC v2 target, MC keeps v2's own state file coherent too: aidlc-state.md
+    # is (re)derived from the plan and written alongside flight-plan.yaml — so both, plus
+    # any produced stage artifacts already under aidlc-docs/, move in ONE commit through
+    # the same guard. (git wins; the Postgres plan store is a rebuildable cache.)
+    _sync_v2_state(store, plan_id, local)
 
     # Commit the docs directly on the working copy's branch (no task worktree — these
     # are read-only-to-code artifacts). Serialized with other shared-repo mutations.
     # EGRESS GUARD: scan the staged docs before committing/pushing — a secret/PII blocks
     # it unless the plan carries an explicit operator override (recorded on the plan).
+    # The pathspec is the whole aidlc-docs/ tree (flight-plan.yaml + aidlc-state.md +
+    # stage artifacts) — a superset of inception/ only when v2 artifacts exist, so v1
+    # commits are byte-identical.
     from . import content_guard
-    rel = str(DOCS_SUBDIR)
+    rel = str(DOCS_SUBDIR.parent)  # "aidlc-docs"
     with worktree._repo_lock(local):
         worktree._git(local, "add", rel)
         status = worktree._git(local, "status", "--porcelain", rel).stdout
@@ -295,6 +303,33 @@ def sync_to_repo(store, plan_id: str, *, cache_root: Optional[Path] = None) -> b
     if repo_source.has_origin(local):
         repo_source.push_to_remote(local, repo_source.current_branch(local))
     return True
+
+
+def _sync_v2_state(store, plan_id: str, local: Path) -> None:
+    """Write ``aidlc-docs/aidlc-state.md`` when the target carries AI-DLC v2 — derived
+    from the plan's completed stages (git is authoritative). No-op for a non-v2 target.
+    Completed = every laid-down plan (INCEPTION) stage plus every ``done`` build unit."""
+    steering = aidlc.probe(local)
+    if steering is None or steering.flavor != aidlc.FLAVOR_AIDLC_V2 \
+            or steering.catalog_root is None:
+        return
+    from .aidlc_v2 import catalog as v2catalog
+    from .aidlc_v2 import state as v2state
+    from .plans_store import UNIT_DONE
+
+    plan = store.get_plan(plan_id)
+    completed = set()
+    for u in store.list_units(plan_id):
+        if not u.stage_slug:
+            continue
+        if u.phase == Phase.INCEPTION.value or u.status == UNIT_DONE:
+            completed.add(u.stage_slug)
+    text = v2state.render_state_file(
+        v2catalog.load_catalog(steering.catalog_root),
+        catalog_root=steering.catalog_root, mode=plan.mode, completed_slugs=completed)
+    record_root = docs_dir(local).parent  # <local>/aidlc-docs
+    record_root.mkdir(parents=True, exist_ok=True)
+    v2state.state_file_path(record_root).write_text(text, encoding="utf-8")
 
 
 def load_from_repo(store, target: str, *, cache_root: Optional[Path] = None,
