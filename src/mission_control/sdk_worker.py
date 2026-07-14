@@ -124,15 +124,18 @@ class SdkWorker:
         self,
         task: Task,
         workdir: Path,
-        steering: AidlcSteering | None = None,
+        system_prompt: str | None = None,
     ) -> ClaudeAgentOptions:
         read_only = task.task_type is not TaskType.SIDE_EFFECTFUL
+        if system_prompt is None:  # default: the generic (non-stage) worker prompt
+            system_prompt = _system_prompt(task)
         return ClaudeAgentOptions(
             model=self.model,
             # CRITICAL: no filesystem settings / CLAUDE.md — context is only
-            # what we compose below (base prompt + any detected AI-DLC rules).
+            # what we compose (base prompt + stage/AI-DLC steering). Preserved for
+            # v2 stage runs too: v2 hooks/tools never auto-load.
             setting_sources=[],
-            system_prompt=_system_prompt(task, steering),
+            system_prompt=system_prompt,
             cwd=str(workdir),
             # Worker DB isolation: the worker runs inside a disposable worktree and
             # may execute the target repo's own test suite. Point any Postgres it
@@ -160,7 +163,8 @@ class SdkWorker:
 
         # A Controller starting in a target worktree probes for an AI-DLC install.
         steering = aidlc.probe(workdir)
-        options = self._options(task, workdir, steering)
+        system_prompt = _resolve_system_prompt(task, steering)
+        options = self._options(task, workdir, system_prompt)
         prompt = task.prompt
         if steering is not None:
             prompt = aidlc.apply_invocation(prompt, greenfield=task.greenfield)
@@ -241,13 +245,9 @@ def _usage_to_step(usage: dict, model: str, latency_ms: int) -> StepUsage:
     )
 
 
-def _system_prompt(task: Task, steering: AidlcSteering | None = None) -> str:
-    """Compose the worker's entire context. Explicit by design — nothing is
-    auto-loaded from the filesystem.
-
-    When the target worktree carries an AI-DLC install, its own rules are folded
-    in via :func:`aidlc.compose_system_prompt`; otherwise the worker runs plain.
-    """
+def _base_prompt(task: Task) -> str:
+    """The worker framing + the sim/burn read-only-vs-write constraint (the tool block
+    enforces it too; this states it in prose)."""
     if task.task_type is TaskType.SIDE_EFFECTFUL:
         constraint = (
             "This is a side-effectful task: you may edit files in the working "
@@ -258,13 +258,51 @@ def _system_prompt(task: Task, steering: AidlcSteering | None = None) -> str:
             "This is a read-only investigation: inspect the working directory "
             "and report findings. Do not modify any files."
         )
-    base = (
+    return (
         "You are an autonomous engineering worker operating inside an isolated "
         "git worktree. Your entire context is provided here — there is no "
         "project configuration to consult.\n"
         f"{constraint}\n"
         "Work directly and report a concise result."
     )
+
+
+def _resolve_system_prompt(task: Task, steering: AidlcSteering | None) -> str:
+    """Choose the worker's system prompt for this run.
+
+    A v2 stage-unit run (``task.stage_slug`` set + a v2 install detected) steers from
+    that single stage's definition + lead-agent knowledge (see
+    :func:`aidlc_v2.steering.compose_stage_prompt`) — not the whole methodology and not
+    the generic prompt. Every other run uses :func:`_system_prompt`.
+    """
+    if (
+        task.stage_slug
+        and steering is not None
+        and steering.flavor == aidlc.FLAVOR_AIDLC_V2
+        and steering.catalog_root is not None
+    ):
+        from .aidlc_v2 import catalog as v2catalog
+        from .aidlc_v2 import steering as v2steering
+
+        stage = next(
+            (s for s in v2catalog.load_catalog(steering.catalog_root)
+             if s.slug == task.stage_slug),
+            None,
+        )
+        if stage is not None:
+            return _base_prompt(task) + "\n\n" + v2steering.compose_stage_prompt(
+                stage, steering.catalog_root)
+    return _system_prompt(task, steering)
+
+
+def _system_prompt(task: Task, steering: AidlcSteering | None = None) -> str:
+    """Compose the worker's entire context. Explicit by design — nothing is
+    auto-loaded from the filesystem.
+
+    When the target worktree carries an AI-DLC install, its own rules are folded
+    in via :func:`aidlc.compose_system_prompt`; otherwise the worker runs plain.
+    """
+    base = _base_prompt(task)
     if steering is not None:
         return aidlc.compose_system_prompt(base, steering)
     return base

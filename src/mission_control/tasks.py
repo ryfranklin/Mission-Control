@@ -45,3 +45,7 @@ class Task:
     # Explicit operator override of the egress content guard (recorded for audit). Default
     # False → a secret/PII in the pushed content blocks the run.
     allow_secrets: bool = False
+    # When set, this run executes ONE AI-DLC v2 catalog stage (its slug). The worker
+    # steers from that stage's definition + lead-agent knowledge (see aidlc_v2.steering)
+    # instead of the generic prompt. None → a built-in / non-stage run.
+    stage_slug: Optional[str] = None

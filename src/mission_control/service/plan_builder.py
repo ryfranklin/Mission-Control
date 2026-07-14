@@ -221,6 +221,9 @@ class PlanBuilder:
             plan_id=plan_id, plan_unit_seq=unit.seq,
             workstream=plan.workstream if plan else None,
             allow_secrets=bool(plan.allow_secrets) if plan else False,
+            # A v2 unit carries its stage slug → the worker steers from that stage's
+            # definition + lead-agent knowledge (see aidlc_v2.steering). None for v1.
+            stage_slug=getattr(unit, "stage_slug", None),
         )
 
     # -- dependency logic --------------------------------------------------

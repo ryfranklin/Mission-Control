@@ -75,6 +75,7 @@ class RunState(TypedDict, total=False):
     task_type: str  # roles.SIM / roles.BURN
     prompt: str
     greenfield: bool
+    stage_slug: str  # optional AI-DLC v2 stage this run executes (steers the worker)
     workstream: str  # optional workstream name → the mc/ws/<name> branch this run builds on
     allow_secrets: bool  # explicit operator override of the egress content guard (audited)
     guard_override: str  # audit note when the content guard was overridden on this run
@@ -122,6 +123,7 @@ def _task(state: RunState) -> Task:
         task_type=_TASK_TYPE_BY_VALUE[state["task_type"]],
         prompt=state["prompt"],
         greenfield=state.get("greenfield", False),
+        stage_slug=state.get("stage_slug"),
     )
 
 
@@ -620,6 +622,8 @@ def initial_state(task: Task, *, run_id: Optional[str] = None) -> RunState:
     }
     if task.workstream:
         state["workstream"] = task.workstream
+    if task.stage_slug:
+        state["stage_slug"] = task.stage_slug
     if task.allow_secrets:
         state["allow_secrets"] = True
     if run_id is not None:
