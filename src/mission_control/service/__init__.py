@@ -81,7 +81,8 @@ def build_default_manager(
 
     # The builder hands a finalized plan to Mission Control: it translates units into
     # runs on the launch path and advances the build as each run terminates. It marks a
-    # unit ``done`` in git (docs_sync) on each success, so build progress is portable.
+    # unit ``done`` in git (docs_sync) on each success, so build progress is portable, and
+    # bootstraps a greenfield plan's remote at build start (same default cache root).
     builder = PlanBuilder(plan_store, manager, docs_sync=docs_sync)
     manager.set_run_observer(builder.on_run_terminal)
     return manager, plan_manager, builder, pool

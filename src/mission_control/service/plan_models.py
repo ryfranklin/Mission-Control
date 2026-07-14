@@ -31,6 +31,14 @@ class OpenPlanRequest(BaseModel):
     workstream: Optional[str] = Field(
         None, description="Optional workstream: build reconciles through mc/ws/<name>."
     )
+    remote_dest: Optional[str] = Field(
+        None, description="Greenfield: remote destination to bootstrap (create + push) so "
+        "the project is portable from unit 1. Required for a greenfield build.",
+    )
+    allow_secrets: bool = Field(
+        False, description="Explicit operator override of the egress content guard for this "
+        "plan's commits (audited). Default false — a secret/PII blocks the commit.",
+    )
 
     @field_validator("mode")
     @classmethod
@@ -96,6 +104,8 @@ class PlanSummary(BaseModel):
     target: Optional[str]  # the PORTABLE identity (a normalized remote ref)
     local_path: Optional[str] = None  # the DERIVED machine-local working dir
     workstream: Optional[str] = None  # the optional mc/ws/<name> line the build reconciles through
+    remote_dest: Optional[str] = None  # greenfield bootstrap destination (consumed at build start)
+    allow_secrets: bool = False  # explicit egress content-guard override (audited)
     mode: str
     methodology: str
     cloud_target: str

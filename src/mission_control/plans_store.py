@@ -57,6 +57,8 @@ _DDL = (
         target       TEXT,
         local_path   TEXT,
         workstream   TEXT,
+        remote_dest  TEXT,
+        allow_secrets BOOLEAN NOT NULL DEFAULT false,
         mode         TEXT NOT NULL,
         methodology  TEXT NOT NULL DEFAULT 'aidlc',
         cloud_target TEXT NOT NULL DEFAULT 'aws',
@@ -73,6 +75,12 @@ _DDL = (
     "ALTER TABLE plans ADD COLUMN IF NOT EXISTS local_path TEXT",
     # Optional workstream: the plan's build reconciles through the mc/ws/<name> branch.
     "ALTER TABLE plans ADD COLUMN IF NOT EXISTS workstream TEXT",
+    # Greenfield only: the operator-supplied remote destination bootstrap creates+pushes
+    # to. Consumed once at build start (then ``target`` holds the resulting portable ref).
+    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS remote_dest TEXT",
+    # Explicit operator override of the egress content guard for this plan's commits
+    # (audited). Default false → a secret/PII in pushed content blocks the commit.
+    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS allow_secrets BOOLEAN NOT NULL DEFAULT false",
     # The interactive transcript: operator turns and the planner's replies, in order.
     # seq is a per-plan counter (continues across process restarts).
     """
@@ -136,6 +144,11 @@ class PlanRow:
     # Optional workstream: the plan's build reconciles through the mc/ws/<name> branch
     # rather than directly onto trunk. Defaulted for rows created before this column.
     workstream: Optional[str] = None
+    # Greenfield only: the operator-supplied remote destination to bootstrap (create +
+    # push) at build start. Defaulted for rows created before this column.
+    remote_dest: Optional[str] = None
+    # Explicit operator override of the egress content guard for this plan (audited).
+    allow_secrets: bool = False
 
     @property
     def working_path(self) -> Optional[str]:
@@ -216,22 +229,27 @@ class PlanStore:
         cloud_target: str,
         local_path: Optional[str] = None,
         workstream: Optional[str] = None,
+        remote_dest: Optional[str] = None,
+        allow_secrets: bool = False,
         stage: Optional[str] = None,
         status: str = STATUS_DRAFTING,
     ) -> None:
         """Register a new plan session. A no-op if the row already exists, so a
         re-open never resets an in-progress plan. ``target`` is the portable ref;
-        ``local_path`` the derived working dir; ``workstream`` the optional mc/ws line."""
+        ``local_path`` the derived working dir; ``workstream`` the optional mc/ws line;
+        ``remote_dest`` the greenfield bootstrap destination; ``allow_secrets`` the
+        explicit content-guard override."""
         with self._pool.connection() as conn:
             conn.execute(
                 """
-                INSERT INTO plans (id, target, local_path, workstream, mode, methodology, cloud_target, stage, status)
-                VALUES (%(id)s, %(target)s, %(local_path)s, %(workstream)s, %(mode)s, %(methodology)s, %(cloud)s, %(stage)s, %(status)s)
+                INSERT INTO plans (id, target, local_path, workstream, remote_dest, allow_secrets, mode, methodology, cloud_target, stage, status)
+                VALUES (%(id)s, %(target)s, %(local_path)s, %(workstream)s, %(remote_dest)s, %(allow_secrets)s, %(mode)s, %(methodology)s, %(cloud)s, %(stage)s, %(status)s)
                 ON CONFLICT (id) DO NOTHING
                 """,
                 {
                     "id": plan_id, "target": target, "local_path": local_path,
-                    "workstream": workstream,
+                    "workstream": workstream, "remote_dest": remote_dest,
+                    "allow_secrets": allow_secrets,
                     "mode": mode, "methodology": methodology, "cloud": cloud_target,
                     "stage": stage, "status": status,
                 },

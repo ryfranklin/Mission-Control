@@ -33,6 +33,12 @@ def build_env(tmp_path, monkeypatch):
     Greenfield builds scaffold their workspace under a temp dir."""
     monkeypatch.delenv("MC_PLANNER_METHODOLOGY", raising=False)
     monkeypatch.delenv("MC_PLANNER_CLOUD", raising=False)
+    monkeypatch.delenv("MC_GREENFIELD_REMOTE", raising=False)
+    # Isolate the acquisition cache to a temp dir: the run graph acquires via
+    # ensure_local() using project_ref.DEFAULT_CACHE_ROOT (read at call time), so a
+    # bootstrapped greenfield remote is cloned here, never into the real ~/.mission-control.
+    from mission_control import project_ref
+    monkeypatch.setattr(project_ref, "DEFAULT_CACHE_ROOT", tmp_path / "cache")
     try:
         checkpointer, pool = postgres_checkpointer(setup=True)
     except Exception as e:  # noqa: BLE001
@@ -43,7 +49,8 @@ def build_env(tmp_path, monkeypatch):
         checkpointer=checkpointer, runs_store=runs,
         worker_factory=lambda: StubWorker(), telemetry_dir=tmp_path / "telemetry",
     )
-    builder = PlanBuilder(plan_store, manager, workspaces_dir=tmp_path / "workspaces")
+    builder = PlanBuilder(plan_store, manager, workspaces_dir=tmp_path / "workspaces",
+                          cache_root=tmp_path / "cache")
     manager.set_run_observer(builder.on_run_terminal)
     plan_manager = PlanManager(plan_store)
     with TestClient(create_app(manager, plan_manager, builder)) as c:
@@ -169,12 +176,13 @@ def test_rejected_gate_scrubs_the_unit_not_the_plan(build_env, target_repo):
     assert not (target_repo / STUB_BURN_FILE).exists()          # nothing applied
 
 
-# -- Fix 1: a greenfield "new" plan scaffolds a target and builds for real -
+# -- greenfield bootstraps a real remote (portable identity from unit 1) ----
 
-def test_greenfield_plan_scaffolds_a_target_and_builds(build_env):
+def test_greenfield_bootstraps_a_remote_and_builds(build_env, tmp_path):
+    from mission_control import project_ref
     client, store = build_env
-    pid = client.post("/plans", json={"mode": "greenfield"}).json()["id"]  # no target
-    # Greenfield readiness = the required INCEPTION stages laid down; plus a change.
+    dest = tmp_path / "created-remote.git"     # a fresh destination; bootstrap creates it
+    pid = client.post("/plans", json={"mode": "greenfield", "remote_dest": str(dest)}).json()["id"]
     for seq, title in enumerate(("Workspace Detection", "Requirements Analysis",
                                  "Workflow Planning")):
         store.upsert_unit(pid, seq, title=title, phase=Phase.INCEPTION)
@@ -182,9 +190,10 @@ def test_greenfield_plan_scaffolds_a_target_and_builds(build_env):
 
     fin = client.post(f"/plans/{pid}/finalize")
     assert fin.status_code == 200 and fin.json()["status"] == ps.STATUS_BUILDING
-    # A workspace was scaffolded as the DERIVED working dir (scratch) — NOT recorded as
-    # the portable target (an anonymous local scaffold is not a portable identity).
-    assert fin.json()["local_path"] and not fin.json()["target"]
+    # Greenfield now has a PORTABLE identity from birth: target is the bootstrapped ref,
+    # NOT an anonymous local scaffold.
+    assert fin.json()["target"] == project_ref.normalize_remote(str(dest))
+    assert (dest / "HEAD").exists()                             # the remote was created
 
     # The INCEPTION stages run as sims; the change waits at the gate as a burn.
     d = _wait(client, pid, lambda x: _by_seq(x).get(3, {}).get("status") == "awaiting_gate")
@@ -194,7 +203,21 @@ def test_greenfield_plan_scaffolds_a_target_and_builds(build_env):
 
     assert client.post(f"/runs/{runs[3]['run_id']}/approve").status_code == 200
     done = _wait(client, pid, lambda x: x["status"] == ps.STATUS_DONE)
-    assert _by_seq(done)[3]["status"] == "applied"              # built cleanly
+    assert _by_seq(done)[3]["status"] == "applied"              # built + pushed to the remote
+
+
+def test_greenfield_without_destination_fails_loudly(build_env):
+    client, store = build_env
+    pid = client.post("/plans", json={"mode": "greenfield"}).json()["id"]  # NO remote_dest
+    for seq, title in enumerate(("Workspace Detection", "Requirements Analysis",
+                                 "Workflow Planning")):
+        store.upsert_unit(pid, seq, title=title, phase=Phase.INCEPTION)
+    store.upsert_unit(pid, 3, title="Build the app", phase=Phase.CONSTRUCTION, depends_on=[2])
+
+    # Finalize refuses to build: greenfield must not fall back to a local-only workspace.
+    fin = client.post(f"/plans/{pid}/finalize")
+    assert fin.status_code == 400
+    assert "destination" in fin.json()["detail"].lower()
 
 
 def test_direct_run_launch_rejects_non_git_and_nested_targets(build_env, tmp_path):
@@ -234,72 +257,6 @@ def test_is_git_repo_requires_own_root_not_an_ancestor(tmp_path):
     assert _is_git_repo(child) is False                 # inside parent, not its own root
     sp.run(["git", "-C", str(child), "init", "-b", "main"], check=True, capture_output=True)
     assert _is_git_repo(child) is True                  # now its own root → accepted
-
-
-def test_greenfield_target_inside_a_parent_repo_never_touches_the_parent(build_env, tmp_path):
-    # Regression for the ~/repos incident: a greenfield target that is a plain subdir of
-    # a parent repo must be initialized as its OWN repo and built there — the parent
-    # repo must be left completely untouched (no worktree branches created in it).
-    import subprocess as sp
-    client, store = build_env
-
-    parent = tmp_path / "parent"
-    parent.mkdir()
-    for args in (["init", "-b", "main"], ["config", "user.email", "p@e.co"],
-                 ["config", "user.name", "P"]):
-        sp.run(["git", "-C", str(parent), *args], check=True, capture_output=True)
-    (parent / "README.md").write_text("# parent\n")
-    sp.run(["git", "-C", str(parent), "add", "-A"], check=True, capture_output=True)
-    sp.run(["git", "-C", str(parent), "commit", "-m", "init"], check=True, capture_output=True)
-    child = parent / "project"
-    child.mkdir()                                       # plain subdir inside the parent repo
-
-    pid = client.post("/plans", json={"mode": "greenfield", "target": str(child)}).json()["id"]
-    for seq, title in enumerate(("Workspace Detection", "Requirements Analysis",
-                                 "Workflow Planning")):
-        store.upsert_unit(pid, seq, title=title, phase=Phase.INCEPTION)
-    store.upsert_unit(pid, 3, title="First change", phase=Phase.CONSTRUCTION, depends_on=[2])
-
-    assert client.post(f"/plans/{pid}/finalize").status_code == 200
-    assert (child / ".git").is_dir()                    # child became its OWN repo
-
-    d = _wait(client, pid, lambda x: _by_seq(x).get(3, {}).get("status") == "awaiting_gate")
-    assert client.post(f"/runs/{_by_seq(d)[3]['run_id']}/approve").status_code == 200
-    done = _wait(client, pid, lambda x: x["status"] == ps.STATUS_DONE)
-    assert _by_seq(done)[3]["status"] == "applied"       # built in the child repo
-
-    # The PARENT repo was never touched — no mc/task worktree branches leaked into it.
-    branches = sp.run(["git", "-C", str(parent), "branch", "--all"],
-                      capture_output=True, text=True).stdout
-    assert "mc/task" not in branches
-    assert sp.run(["git", "-C", str(parent), "status", "--porcelain"],
-                  capture_output=True, text=True).stdout.strip() == "?? project/"
-
-
-def test_greenfield_empty_nongit_target_is_initialized_not_failed(build_env, tmp_path):
-    # Regression: an operator points a greenfield plan at an EMPTY, NON-git directory.
-    # The build must `git init` it in place (not fail every run at worktree creation).
-    client, store = build_env
-    empty = tmp_path / "Doc-Intelligence-Hub"
-    empty.mkdir()                                               # exists, but no .git, no files
-    pid = client.post("/plans", json={"mode": "greenfield", "target": str(empty)}).json()["id"]
-    for seq, title in enumerate(("Workspace Detection", "Requirements Analysis",
-                                 "Workflow Planning")):
-        store.upsert_unit(pid, seq, title=title, phase=Phase.INCEPTION)
-    store.upsert_unit(pid, 3, title="First change", phase=Phase.CONSTRUCTION, depends_on=[2])
-
-    fin = client.post(f"/plans/{pid}/finalize")
-    assert fin.status_code == 200
-    # The named directory was initialized in place — the build targets it, not a scaffold.
-    assert fin.json()["target"] == str(empty)
-    assert (empty / ".git").is_dir()
-
-    d = _wait(client, pid, lambda x: _by_seq(x).get(3, {}).get("status") == "awaiting_gate")
-    runs = _by_seq(d)
-    assert runs[0]["status"] == "done"                          # sims ran (no worktree failure)
-    assert client.post(f"/runs/{runs[3]['run_id']}/approve").status_code == 200
-    done = _wait(client, pid, lambda x: x["status"] == ps.STATUS_DONE)
-    assert _by_seq(done)[3]["status"] == "applied"
 
 
 # -- Fix 2: a build left mid-flight resumes on restart --------------------

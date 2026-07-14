@@ -40,7 +40,7 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
-from . import live, pricing, project_ref, repo_source, roles, runs_store, worktree
+from . import content_guard, live, pricing, project_ref, repo_source, roles, runs_store, worktree
 from .plans_store import PlanStore
 from .runs_store import RunStore
 from .tasks import Task, TaskType
@@ -63,6 +63,7 @@ OUTCOME_BLOCKED = "blocked"
 PUSH_PUSHED = "pushed"       # merged AND pushed to origin (trunk or workstream branch)
 PUSH_REJECTED = "rejected"   # push refused as non-fast-forward
 PUSH_CONFLICT = "conflict"   # integrating the remote advance produced a merge conflict
+PUSH_BLOCKED = "blocked"     # egress content guard blocked the commit (secret/PII)
 PUSH_ERROR = "error"         # push failed on creds / network (surfaced loudly)
 PUSH_SKIPPED = "skipped"     # no remote to push to (a remote-less local target)
 
@@ -75,6 +76,8 @@ class RunState(TypedDict, total=False):
     prompt: str
     greenfield: bool
     workstream: str  # optional workstream name → the mc/ws/<name> branch this run builds on
+    allow_secrets: bool  # explicit operator override of the egress content guard (audited)
+    guard_override: str  # audit note when the content guard was overridden on this run
     local_repo: str  # the resolved local working path (acquired at dispatch from the ref)
     worktree_path: str
     worktree_branch: str
@@ -159,6 +162,8 @@ def _terminal_status(
     ``push_rejected``; a no-go burn is ``scrubbed``; a sim is ``done``."""
     if task_type == roles.BURN:
         if decision == roles.GO:
+            if push_status == PUSH_BLOCKED:
+                return runs_store.STATUS_BLOCKED_SECRETS
             if push_status == PUSH_CONFLICT:
                 return runs_store.STATUS_MERGE_CONFLICT
             if push_status in (PUSH_REJECTED, PUSH_ERROR):
@@ -256,34 +261,50 @@ def _apply_burn(deps: _Deps, state: RunState) -> dict:
 
     The push is the write hop that lets an approved burn leave the host, and it fires
     ONLY here — reached only via the go edge, so never on a sim, a no-go, or a burn
-    no-op. A rejected push (non-fast-forward / conflict) or a creds/network failure is
-    recorded as a distinct outcome (not raised) so teardown still runs and the run ends
-    on a legible terminal state rather than leaking a worktree. We never force-push.
+    no-op. A rejected push (non-fast-forward / conflict), a creds/network failure, or an
+    egress content-guard block is recorded as a distinct outcome (not raised) so teardown
+    still runs and the run ends on a legible terminal state rather than leaking a
+    worktree. We never force-push and never auto-redact.
 
     Guard: never apply without a recorded go decision (defense in depth beyond the
     routing edge)."""
     if state.get("decision") != roles.GO:
         raise RuntimeError("apply_burn reached without a recorded go decision")
     wt = _worktree(deps, state)
-    worktree.commit_changes(wt, f"apply task {state['task_id']}")
     local = _local_repo(deps, state)
     ws = state.get("workstream")
 
+    # EGRESS GUARD: scan the staged unit output before it is committed + pushed. A
+    # secret/PII blocks the burn as a distinct terminal state (not raised — teardown must
+    # run); an explicit operator override lets it through and is recorded for audit.
+    override_note: list = []
+    try:
+        worktree.commit_changes(
+            wt, f"apply task {state['task_id']}",
+            allow_secrets=bool(state.get("allow_secrets")),
+            audit=lambda findings: override_note.append(content_guard.summarize(findings)),
+        )
+    except content_guard.GuardViolation as exc:
+        return {"applied": False, "push_status": PUSH_BLOCKED, "push_detail": str(exc)[:500]}
+    guard_override = ("content guard OVERRIDDEN by operator ack — " + override_note[0]) \
+        if override_note else None
+
+    base: dict = {"guard_override": guard_override} if guard_override else {}
     if ws and repo_source.has_origin(local):
         # Workstream run: reconcile onto the mc/ws/<name> branch (NOT trunk — trunk only
         # advances via an explicit promote). The change is committed in the isolated task
         # worktree; push it (integrating any remote advance on the workstream branch)
         # from there, so the shared clone's HEAD is never touched. "applied" means it
         # landed on the workstream branch — false on a conflict/rejection (nothing did).
-        return _push_result({}, local, repo_source.workstream_branch(ws), work_dir=wt.path)
+        return _push_result(base, local, repo_source.workstream_branch(ws), work_dir=wt.path)
 
     # Trunk run (or remote-less target): merge into the local trunk, then push it.
     worktree.merge_into_target(wt, f"apply task {state['task_id']}")
-    result: dict = {"applied": True}
+    base["applied"] = True
     if not repo_source.has_origin(local):
-        result["push_status"] = PUSH_SKIPPED  # nothing to push (remote-less target)
-        return result
-    return _push_result(result, local, repo_source.current_branch(local), work_dir=local)
+        base["push_status"] = PUSH_SKIPPED  # nothing to push (remote-less target)
+        return base
+    return _push_result(base, local, repo_source.current_branch(local), work_dir=local)
 
 
 def _push_result(result: dict, local: Path, branch: str, *, work_dir) -> dict:
@@ -330,11 +351,15 @@ def _teardown(deps: _Deps, state: RunState) -> dict:
     store, run_id = _ledger(deps, state)
     if store is not None:
         push_status = state.get("push_status")
-        # A push that didn't land (rejected, errored, or a merge conflict) is the run's
-        # headline fact — put its reason / conflicting files in the detail so the control
-        # room / CLI / Slack can show why; otherwise use the worker summary.
-        if push_status in (PUSH_REJECTED, PUSH_ERROR, PUSH_CONFLICT):
+        # A push that didn't land (rejected, errored, merge conflict, or a content-guard
+        # block) is the run's headline fact — put its reason / offending file(s) in the
+        # detail so the control room / CLI / Slack can show why. An overridden content
+        # guard is recorded here too, so the operator ack is auditable. Otherwise the
+        # worker summary.
+        if push_status in (PUSH_REJECTED, PUSH_ERROR, PUSH_CONFLICT, PUSH_BLOCKED):
             detail = (state.get("push_detail") or "push did not land")[:500]
+        elif state.get("guard_override"):
+            detail = state["guard_override"][:500]
         else:
             detail = (state.get("worker_summary") or "")[:500] or None
         store.finish(
@@ -568,6 +593,8 @@ def initial_state(task: Task, *, run_id: Optional[str] = None) -> RunState:
     }
     if task.workstream:
         state["workstream"] = task.workstream
+    if task.allow_secrets:
+        state["allow_secrets"] = True
     if run_id is not None:
         state["run_id"] = run_id
     return state

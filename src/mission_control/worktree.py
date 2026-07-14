@@ -170,11 +170,20 @@ def has_changes(worktree: Worktree) -> bool:
     return bool(out.strip())
 
 
-def commit_changes(worktree: Worktree, message: str) -> bool:
-    """Stage + commit everything in the worktree. Returns False if nothing changed."""
+def commit_changes(worktree: Worktree, message: str, *,
+                   allow_secrets: bool = False, audit=None) -> bool:
+    """Stage + commit everything in the worktree. Returns False if nothing changed.
+
+    EGRESS GUARD: the staged content is about to be committed and pushed, so it is
+    scanned for secrets/PII first (:mod:`content_guard`). A finding raises
+    ``content_guard.GuardViolation`` and NO commit is made — unless ``allow_secrets`` (an
+    explicit operator override), in which case the findings are handed to ``audit`` and
+    the commit proceeds. Scans only this worktree's index — never ambient env / history."""
+    from . import content_guard
     if not has_changes(worktree):
         return False
     _git(worktree.path, "add", "-A")
+    content_guard.enforce_staged(worktree.path, allow=allow_secrets, audit=audit)
     _git(worktree.path, "commit", "-m", message)
     return True
 

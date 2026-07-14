@@ -42,3 +42,6 @@ class Task:
     # Optional workstream name → the long-lived mc/ws/<name> branch this task builds on
     # and reconciles into (None → work directly on trunk, the single-line default).
     workstream: Optional[str] = None
+    # Explicit operator override of the egress content guard (recorded for audit). Default
+    # False → a secret/PII in the pushed content blocks the run.
+    allow_secrets: bool = False

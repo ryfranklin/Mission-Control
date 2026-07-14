@@ -93,10 +93,14 @@ class PlanManager:
         methodology: Optional[str] = None,
         cloud_target: Optional[str] = None,
         workstream: Optional[str] = None,
+        remote_dest: Optional[str] = None,
+        allow_secrets: bool = False,
     ) -> PlanRow:
         """Open a planning session. methodology/cloud fall back to the instance
         defaults (env → 'aidlc'/'aws') unless overridden per request. An optional
-        ``workstream`` makes the build reconcile through the mc/ws/<name> branch."""
+        ``workstream`` makes the build reconcile through the mc/ws/<name> branch;
+        ``remote_dest`` is the greenfield remote to bootstrap (create + push) at build
+        start so the project is portable from unit 1."""
         if mode not in aidlc.MODES:
             raise PlanConflict(f"mode must be one of {aidlc.MODES}")
         plan_id = f"plan-{uuid4().hex}"
@@ -112,6 +116,8 @@ class PlanManager:
             target=ref,
             local_path=local_path,
             workstream=(workstream or None),
+            remote_dest=(remote_dest or None),
+            allow_secrets=bool(allow_secrets),
             mode=mode,
             methodology=methodology or self._methodology,
             cloud_target=cloud_target or self._cloud,

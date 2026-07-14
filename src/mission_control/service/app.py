@@ -16,6 +16,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from sse_starlette.sse import EventSourceResponse
 from starlette.concurrency import run_in_threadpool
 
+from ..repo_source import BootstrapError
 from .manager import RunConflict, RunManager, RunNotFound
 from .metrics import compute_metrics
 from .models import (
@@ -253,7 +254,8 @@ def create_app(
             row = plans.open_plan(
                 target=body.target, mode=body.mode,
                 methodology=body.methodology, cloud_target=body.cloud_target,
-                workstream=body.workstream,
+                workstream=body.workstream, remote_dest=body.remote_dest,
+                allow_secrets=body.allow_secrets,
             )
         except PlanConflict as exc:
             raise HTTPException(status_code=400, detail=str(exc))
@@ -324,7 +326,12 @@ def create_app(
         except PlanNotReady as exc:
             raise HTTPException(status_code=409, detail=f"plan not ready: {exc.reason}")
         if app.state.builder is not None:
-            await app.state.builder.start_build(plan_id)
+            try:
+                await app.state.builder.start_build(plan_id)
+            except BootstrapError as exc:
+                # Greenfield with no remote destination (or a failed create/push) — a loud,
+                # legible refusal rather than a silent non-portable local-only build.
+                raise HTTPException(status_code=400, detail=f"cannot start build: {exc}")
         return _plan_detail(plans, plan_id)
 
     # Server-rendered control-room UI (htmx, no JS build) over the same seam.

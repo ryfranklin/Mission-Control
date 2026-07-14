@@ -29,6 +29,12 @@ class RepoAcquireError(RuntimeError):
     """Raised when cloning/fetching a target fails — surfaced, never swallowed."""
 
 
+class BootstrapError(RuntimeError):
+    """Raised when a greenfield build has no remote destination to create+push to, or
+    the create/push fails. Greenfield must NOT silently fall back to a non-portable
+    local-only dir — the whole point is identity + durability from unit 1."""
+
+
 class PushRejected(RuntimeError):
     """The remote refused the push as non-fast-forward (a race we lost that wasn't a
     content conflict). A legible, expected outcome — the caller records a distinct
@@ -313,6 +319,91 @@ def promote(local_repo, name: str, *, message: Optional[str] = None) -> None:
         push_to_remote(wt.path, trunk, lock_repo=repo)
     finally:
         worktree.remove_worktree(wt)
+
+
+# -- greenfield bootstrap: create the remote so identity exists from unit 1 --
+
+def bootstrap_remote(dest: str, scratch_dir, *, allow_secrets: bool = False) -> str:
+    """Create a project's remote from an operator-supplied destination and return its
+    normalized :mod:`project_ref` id — so a greenfield build has a stable, portable
+    identity (and a durable remote) BEFORE unit 1, exactly like a brownfield target.
+
+    The seed commit is scanned by :mod:`content_guard` before it is pushed; a secret
+    blocks the bootstrap unless ``allow_secrets`` (an explicit operator override). A
+    ``.gitignore`` for common secret files is seeded as defense-in-depth.
+
+    ``dest`` is the operator's remote destination (a URL, or a local path standing in as
+    the remote — never a hardcoded host/org/account). ``scratch_dir`` is EPHEMERAL: the
+    initial commit is staged there and pushed; the durable copy is the remote, re-acquired
+    via :func:`ensure_local` afterwards. The caller seeds ``scratch_dir`` (e.g. the plan
+    docs) before calling; a minimal README is added if none is present.
+
+    For a LOCAL destination that doesn't exist yet it is created as an empty bare repo, so
+    the operator needn't hand-create it. For a URL the remote endpoint is assumed to exist
+    (creating one over the wire needs a host API — out of scope for an agnostic runtime).
+    Reuses :func:`push_to_remote`. Raises :class:`BootstrapError` when no destination is
+    given (never a silent local-only fallback) or the create/push fails."""
+    if not dest or not str(dest).strip():
+        raise BootstrapError(
+            "greenfield build requires a remote destination (arg / env / API field); "
+            "refusing to fall back to a non-portable local-only workspace")
+    dest = str(dest).strip()
+    scratch = Path(scratch_dir)
+    scratch.mkdir(parents=True, exist_ok=True)
+    if not (scratch / "README.md").exists():
+        (scratch / "README.md").write_text(
+            "# Project\n\nBootstrapped by Mission Control.\n", encoding="utf-8")
+    # Defense-in-depth: seed a .gitignore for common secret files so they never get
+    # staged in the first place (the content guard is the enforcement; this is the first
+    # line). Repo-agnostic — filename shapes only, no account/host names.
+    gitignore = scratch / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text(_SECRET_GITIGNORE, encoding="utf-8")
+
+    # A local destination that isn't a repo yet is created as an empty bare remote.
+    if not project_ref.is_remote_url(dest):
+        dpath = Path(dest).expanduser()
+        if not _is_git_dir(dpath):
+            dpath.parent.mkdir(parents=True, exist_ok=True)
+            created = subprocess.run(["git", "init", "--bare", str(dpath)],
+                                     capture_output=True, text=True)
+            if created.returncode != 0:
+                raise BootstrapError(f"could not create remote at {dest!r}: {created.stderr.strip()}")
+            subprocess.run(["git", "-C", str(dpath), "symbolic-ref", "HEAD", "refs/heads/main"],
+                           capture_output=True, text=True)
+
+    for args in (["init", "-b", "main"],
+                 ["config", "user.email", "planner@mission-control.local"],
+                 ["config", "user.name", "Mission Control Planner"],
+                 ["add", "-A"]):
+        done = subprocess.run(["git", "-C", str(scratch), *args], capture_output=True, text=True)
+        if done.returncode != 0:
+            raise BootstrapError(f"bootstrap stage failed ({args[0]}): {done.stderr.strip()}")
+    # EGRESS GUARD: the seed is about to be committed + pushed — scan it first.
+    from . import content_guard
+    content_guard.enforce_staged(scratch, allow=allow_secrets)
+    committed = subprocess.run(["git", "-C", str(scratch), "commit", "-m",
+                                "bootstrap: initialize project"], capture_output=True, text=True)
+    if committed.returncode != 0:
+        raise BootstrapError(f"bootstrap commit failed: {committed.stderr.strip()}")
+    subprocess.run(["git", "-C", str(scratch), "remote", "add", "origin", dest],
+                   check=True, capture_output=True)
+    # Push the seed onto the (empty) remote's trunk — creates it; loud on failure.
+    push_to_remote(scratch, "main")
+    return project_ref.normalize_remote(dest)
+
+
+# Common secret-file shapes to keep OUT of a committed/pushed repo (first line of
+# defense; the content guard is the enforcement). No account/host specifics.
+_SECRET_GITIGNORE = "\n".join([
+    "# Mission Control: keep secrets out of the shared remote.",
+    ".env", ".env.*", "*.env",
+    "*.pem", "*.key", "*_rsa", "*_dsa", "*_ed25519", "id_rsa*",
+    "*.p12", "*.pfx", "*.keystore",
+    "credentials", "credentials.*", ".netrc", ".npmrc", ".pypirc",
+    "*.secret", "secrets.*", ".aws/", ".ssh/",
+    "",
+])
 
 
 # -- internals -------------------------------------------------------------

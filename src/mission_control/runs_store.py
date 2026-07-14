@@ -33,13 +33,14 @@ STATUS_AWAITING_GATE = "awaiting_gate"
 STATUS_APPLIED = "applied"  # burn approved, merged, and pushed (trunk or workstream)
 STATUS_PUSH_REJECTED = "push_rejected"  # approved, but the push was non-fast-forward
 STATUS_MERGE_CONFLICT = "merge_conflict"  # approved, but integrating the remote conflicted
+STATUS_BLOCKED_SECRETS = "blocked_secrets"  # egress blocked: staged content had a secret/PII
 STATUS_SCRUBBED = "scrubbed"
 STATUS_FAILED = "failed"
 STATUS_DONE = "done"
 
 # States after which no more work happens; each stamps ended_at exactly once.
 TERMINAL_STATUSES = frozenset(
-    {STATUS_APPLIED, STATUS_PUSH_REJECTED, STATUS_MERGE_CONFLICT,
+    {STATUS_APPLIED, STATUS_PUSH_REJECTED, STATUS_MERGE_CONFLICT, STATUS_BLOCKED_SECRETS,
      STATUS_SCRUBBED, STATUS_FAILED, STATUS_DONE}
 )
 

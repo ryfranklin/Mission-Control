@@ -31,10 +31,10 @@ status; its dependents stay blocked, but the plan itself continues.
 from __future__ import annotations
 
 import os
-import subprocess
+import shutil
 from pathlib import Path
 
-from .. import aidlc, roles, worktree
+from .. import aidlc, plan_docs, repo_source, roles, worktree
 from ..plans_store import (
     STATUS_BUILDING,
     STATUS_DONE,
@@ -62,17 +62,19 @@ class PlanBuilder:
     """Schedules a plan's units onto the run launch path, in dependency order."""
 
     def __init__(self, plan_store: PlanStore, run_manager, *, workspaces_dir=None,
-                 docs_sync=None) -> None:
+                 docs_sync=None, cache_root=None) -> None:
         self._plans = plan_store
         self._runs = run_manager
         # Persists a unit's ``done`` mark to git (write flight-plan.yaml + commit +
         # push) — the portable progress record. None → no git sync (offline / tests).
         self._docs_sync = docs_sync
-        # SCRATCH area for a not-yet-created greenfield repo (one dir per plan). This is
-        # NOT a durable identity — it never becomes the plan's portable ``target`` (it's
-        # a machine-local path, the very thing portability retired). A greenfield build
-        # gets a real remote in a later slice; until then it runs locally off this
-        # scratch clone with no portable ref (docs sync is a no-op without a target).
+        # Where remotes are cached/acquired (ensure_local). None → project_ref default.
+        # Kept consistent with docs_sync's cache root so both hit the same clone.
+        self._cache_root = Path(cache_root) if cache_root else None
+        # EPHEMERAL scratch for greenfield bootstrap ONLY — the initial commit is staged
+        # here then pushed to the created remote and the dir is discarded. It is NEVER the
+        # durable target: after bootstrap the plan's ``target`` is the pushed remote's ref
+        # and the working copy is the acquired cache clone.
         self._workspaces = Path(
             workspaces_dir or os.environ.get("MC_PLAN_WORKSPACES", "plan-workspaces")
         )
@@ -80,32 +82,51 @@ class PlanBuilder:
     # -- kickoff (called from the finalize endpoint, on the loop) ----------
 
     async def start_build(self, plan_id: str) -> None:
-        """Move the plan to ``building`` and dispatch its deps-free units. Async so it
+        """Move the plan to ``building`` and dispatch its runnable units. Async so it
         runs on the event loop (the launch path spawns background drives there).
 
-        A greenfield build needs a **git repo** to host worktrees — being a directory
-        is not enough. So if the target isn't a usable repo we make it one before
-        dispatching: an existing (e.g. empty) directory is ``git init``-ed in place (the
-        operator pointed the build there); a missing / absent target gets a fresh
-        scaffolded workspace. This closes the failure where an empty non-git target
-        passed the old "is it a dir?" check and every run then failed at worktree
-        creation."""
+        A greenfield plan (no target yet) is BOOTSTRAPPED first: an operator-supplied
+        remote destination is created + seeded (initial commit with aidlc-docs/) + pushed,
+        the plan's ``target`` is set to the resulting portable ref, and the remote is
+        acquired locally. After that there is NO greenfield/brownfield difference — both
+        are "a repo with a remote" and run the same acquire → worktree → gate → push path.
+        Greenfield with no destination fails loudly (never an anonymous local-only dir)."""
         plan = self._plans.get_plan(plan_id)
         if plan is None:
             return
-        if plan.mode == aidlc.MODE_GREENFIELD and not _is_git_repo(plan.working_path):
-            base = (
-                Path(plan.working_path) if _is_dir(plan.working_path)
-                else self._workspaces / plan_id
-            )
-            repo = self._ensure_repo(base)
-            # Record ONLY the derived working dir (scratch). Deliberately NOT set as the
-            # plan's ``target`` — an anonymous local scaffold is a machine-local path,
-            # not a portable identity. Greenfield gets a real remote (and thus a target
-            # + docs push) in a later slice.
-            self._plans.set_local_path(plan_id, repo)
+        if plan.mode == aidlc.MODE_GREENFIELD and not plan.target:
+            self._bootstrap_greenfield(plan_id, plan)
         self._plans.set_status(plan_id, STATUS_BUILDING)
         self._advance(plan_id)
+
+    def _bootstrap_greenfield(self, plan_id: str, plan) -> None:
+        """Create the project's remote so identity + durability exist from unit 1. The
+        operator's destination comes from the plan (``remote_dest``) or the injected
+        ``MC_GREENFIELD_REMOTE`` env — never a hardcoded host/org. Seeds the initial
+        commit with the current plan docs, pushes, then records the portable ref as the
+        plan's ``target`` and acquires the remote locally as the build's working copy."""
+        dest = plan.remote_dest or os.environ.get("MC_GREENFIELD_REMOTE")
+        if not dest:
+            raise repo_source.BootstrapError(
+                "greenfield build requires a remote destination (plan remote_dest / "
+                "MC_GREENFIELD_REMOTE); refusing a non-portable local-only workspace")
+        scratch = self._workspaces / plan_id
+        try:
+            self._seed_scratch(plan_id, scratch)          # README + aidlc-docs/ (the plan)
+            ref = repo_source.bootstrap_remote(dest, scratch,
+                                               allow_secrets=bool(plan.allow_secrets))
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)    # scratch is ephemeral
+        self._plans.set_target(plan_id, ref)              # the portable identity now exists
+        local = repo_source.ensure_local(ref, root=self._cache_root)  # acquire the remote
+        self._plans.set_local_path(plan_id, str(local))
+
+    def _seed_scratch(self, plan_id: str, scratch: Path) -> None:
+        """Populate the ephemeral bootstrap scratch with the initial commit's content:
+        the plan docs (so the created remote carries aidlc-docs/inception/ from birth)."""
+        scratch.mkdir(parents=True, exist_ok=True)
+        plan_docs.dump_plan(plan_docs.plan_doc_from_store(self._plans, plan_id),
+                            plan_docs.docs_dir(scratch))
 
     # -- restart durability: resume in-flight builds -----------------------
 
@@ -193,6 +214,7 @@ class PlanBuilder:
             target=target, task_type=unit.task_type, prompt=_prompt_for(unit),
             plan_id=plan_id, plan_unit_seq=unit.seq,
             workstream=plan.workstream if plan else None,
+            allow_secrets=bool(plan.allow_secrets) if plan else False,
         )
 
     # -- dependency logic --------------------------------------------------
@@ -223,46 +245,10 @@ class PlanBuilder:
         return dead
 
 
-    # -- greenfield workspace: init-in-place or scaffold -------------------
-
-    def _ensure_repo(self, repo: Path) -> str:
-        """Make ``repo`` a git repo with at least one commit (worktree add needs a
-        HEAD), idempotently, and return its path. Works both for an operator-named
-        directory (init in place) and a fresh scaffold path."""
-        repo = repo.expanduser()
-        repo.mkdir(parents=True, exist_ok=True)
-        if not _is_git_repo(repo):
-            for args in (
-                ["init", "-b", "main"],
-                ["config", "user.email", "planner@mission-control.local"],
-                ["config", "user.name", "Mission Control Planner"],
-            ):
-                subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
-        if _no_head(repo):  # need an initial commit before a worktree can branch off it
-            readme = repo / "README.md"
-            if not readme.exists():
-                readme.write_text(f"# {repo.name}\n\nWorkspace for a Mission Control build.\n")
-            subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "--allow-empty", "-m", "init"],
-                           check=True, capture_output=True)
-        return str(repo)
-
-
-def _is_dir(target) -> bool:
-    return bool(target) and Path(target).expanduser().is_dir()
-
-
 def _is_git_repo(target) -> bool:
     """True only when ``target`` is its OWN git root — delegates to the shared,
     safety-critical check in :mod:`mission_control.worktree` (never a parent repo)."""
     return worktree.is_git_repo(target)
-
-
-def _no_head(repo: Path) -> bool:
-    """True if the repo has no commits yet (``git worktree add`` needs a HEAD)."""
-    r = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q", "HEAD"],
-                       capture_output=True)
-    return r.returncode != 0
 
 
 def _prompt_for(unit) -> str:

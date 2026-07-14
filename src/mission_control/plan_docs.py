@@ -244,11 +244,16 @@ def sync_to_repo(store, plan_id: str, *, cache_root: Optional[Path] = None) -> b
 
     # Commit the docs directly on the working copy's branch (no task worktree — these
     # are read-only-to-code artifacts). Serialized with other shared-repo mutations.
+    # EGRESS GUARD: scan the staged docs before committing/pushing — a secret/PII blocks
+    # it unless the plan carries an explicit operator override (recorded on the plan).
+    from . import content_guard
     rel = str(DOCS_SUBDIR)
     with worktree._repo_lock(local):
         worktree._git(local, "add", rel)
         status = worktree._git(local, "status", "--porcelain", rel).stdout
         if status.strip():
+            content_guard.enforce_staged(
+                local, pathspec=rel, allow=bool(getattr(plan, "allow_secrets", False)))
             worktree._git(local, "commit", "-m", f"aidlc-docs: plan {plan_id} checkpoint")
     if repo_source.has_origin(local):
         repo_source.push_to_remote(local, repo_source.current_branch(local))

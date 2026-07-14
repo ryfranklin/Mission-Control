@@ -40,6 +40,7 @@ import httpx
 from . import roles
 from .runs_store import (
     STATUS_APPLIED,
+    STATUS_BLOCKED_SECRETS,
     STATUS_DONE,
     STATUS_FAILED,
     STATUS_MERGE_CONFLICT,
@@ -55,6 +56,7 @@ EXIT_FAILURE = 1
 EXIT_SCRUBBED = 2
 EXIT_PUSH_REJECTED = 3  # applied locally, but the push didn't land
 EXIT_MERGE_CONFLICT = 4  # approved, but integrating the remote conflicted (operator must resolve)
+EXIT_BLOCKED_SECRETS = 5  # egress blocked: staged content had a secret/PII
 
 # Terminal run status → CLI exit code (the watch/launch--watch contract).
 _EXIT_FOR_STATUS = {
@@ -64,6 +66,7 @@ _EXIT_FOR_STATUS = {
     STATUS_SCRUBBED: EXIT_SCRUBBED,
     STATUS_PUSH_REJECTED: EXIT_PUSH_REJECTED,
     STATUS_MERGE_CONFLICT: EXIT_MERGE_CONFLICT,
+    STATUS_BLOCKED_SECRETS: EXIT_BLOCKED_SECRETS,
 }
 
 
