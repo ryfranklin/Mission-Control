@@ -71,6 +71,11 @@ _DDL = (
     # target now carries the PORTABLE ref (normalized remote); local_path is the
     # derived machine-local working dir — a separate field, never the identity.
     "ALTER TABLE runs ADD COLUMN IF NOT EXISTS local_path TEXT",
+    # The changed-files diff a go APPLIED, captured at apply time (the payload
+    # worktree.changes() produces). Persisted so an applied/torn-down run can still
+    # show what it changed, after the live worktree is gone. Nullable: only a burn
+    # that actually changed files gets one; sims and no-change runs stay NULL.
+    "ALTER TABLE runs ADD COLUMN IF NOT EXISTS changes_json JSONB",
     "CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (status)",
     "CREATE INDEX IF NOT EXISTS runs_created_at_idx ON runs (created_at DESC)",
     "CREATE INDEX IF NOT EXISTS runs_plan_idx ON runs (plan_id)",
@@ -114,6 +119,10 @@ class RunRow:
     # here). Separate from ``target`` — a portable ref must not be a local path.
     # Defaulted so RunRow(**row) works for rows created before this column.
     local_path: Optional[str] = None
+    # The changed-files diff a go applied (branch/message/files/stat/patch), captured
+    # at apply time and persisted so it survives worktree teardown. None for sims,
+    # no-change burns, and rows created before this column.
+    changes_json: Optional[dict] = None
 
 
 # Columns whose non-None values narrow a list_runs() query.
@@ -215,6 +224,21 @@ class RunStore:
     def mark_awaiting_gate(self, run_id: str) -> None:
         """Move to ``awaiting_gate`` (a burn paused at the durable go/no-go gate)."""
         self._set_status(run_id, STATUS_AWAITING_GATE)
+
+    def set_changes(self, run_id: str, changes: dict) -> None:
+        """Persist the changed-files diff a go applied for ``run_id`` (the payload
+        ``worktree.changes()`` produces). Idempotent: a re-run of the apply node
+        re-writes the same payload rather than duplicating. Additive — touches only
+        ``changes_json`` and never moves the row's status/stamps."""
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO runs (run_id, thread_id, status, cost_usd, created_at, changes_json)
+                VALUES (%(run_id)s, %(run_id)s, %(status)s, 0, now(), %(changes)s)
+                ON CONFLICT (run_id) DO UPDATE SET changes_json = EXCLUDED.changes_json
+                """,
+                {"run_id": run_id, "status": STATUS_RUNNING, "changes": Jsonb(changes)},
+            )
 
     def finish(
         self,

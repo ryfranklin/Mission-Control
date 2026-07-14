@@ -198,8 +198,10 @@ def create_app(
 
     @app.get("/runs/{run_id}/changes")
     def run_changes(run_id: str, mgr: RunManager = Depends(get_manager)) -> dict:
-        """The diff a **go** would apply — the material for a go/no-go decision. 404 if
-        the run isn't paused at the gate (no isolated worktree to diff)."""
+        """The changed-files diff for a run: the live pending diff (``phase="pending"``)
+        while it's running / at the gate, or the durable applied diff (``phase="applied"``)
+        once it has left the gate. 404 only when there's nothing to show — a sim, a
+        no-change burn, or a run that never produced a diff."""
         try:
             changes = mgr.run_changes(run_id)
         except RunNotFound:

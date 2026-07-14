@@ -96,3 +96,86 @@ def test_changes_endpoint_shows_the_pending_burn_at_the_gate(client, target_repo
 
 def test_changes_endpoint_404_for_unknown_run(client):
     assert client.get("/runs/run-nope/changes").status_code == 404
+
+
+# -- durable diff: the applied burn stays viewable after the gate (no Docker) ----
+
+class _NoChangeWorker:
+    """A burn worker that touches nothing — a no-op burn (nothing to persist)."""
+
+    def investigate(self, task, workdir):
+        from mission_control.telemetry import StepUsage
+        from mission_control.worker import WorkerResult
+        step = StepUsage(model="claude-haiku-4-5", input_tokens=10, output_tokens=5,
+                         cache_read_tokens=0, cache_creation_tokens=0, latency_ms=1)
+        return WorkerResult(summary="[noop] nothing to do", made_changes=False, steps=[step])
+
+
+def _wait_mem(client, rid, wanted, timeout=30.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        s = client.get(f"/runs/{rid}").json()["status"]
+        if s in wanted:
+            return s
+        time.sleep(0.02)
+    raise AssertionError(f"{rid} never reached {wanted}")
+
+
+def test_applied_burn_diff_persists_and_is_served_after_the_gate(make_service, mem_store, target_repo):
+    client = make_service(mem_store)
+    rid = client.post("/runs", json={"target": str(target_repo), "task_type": roles.BURN,
+                                     "prompt": "make a change"}).json()["run_id"]
+    _wait_mem(client, rid, {"awaiting_gate"})
+
+    # At the gate: the LIVE pending diff.
+    pending = client.get(f"/runs/{rid}/changes")
+    assert pending.status_code == 200
+    pj = pending.json()
+    assert pj["phase"] == "pending"
+    assert any(f["path"] == "STUB_BURN.txt" for f in pj["files"])
+
+    # Approve → apply → teardown. The worktree is gone, but the diff must survive.
+    assert client.post(f"/runs/{rid}/approve").status_code == 200
+    _wait_mem(client, rid, {"applied"})
+
+    applied = client.get(f"/runs/{rid}/changes")
+    assert applied.status_code == 200
+    aj = applied.json()
+    assert aj["phase"] == "applied"
+    assert aj["status"] == "applied"
+    assert any(f["path"] == "STUB_BURN.txt" for f in aj["files"])
+    assert "STUB_BURN.txt" in aj["patch"]
+    assert mem_store.get_run(rid).changes_json is not None
+
+
+def test_no_change_burn_persists_nothing_and_still_404s(make_service, mem_store, target_repo):
+    client = make_service(mem_store, worker_factory=lambda: _NoChangeWorker())
+    rid = client.post("/runs", json={"target": str(target_repo), "task_type": roles.BURN,
+                                     "prompt": "do nothing"}).json()["run_id"]
+    _wait_mem(client, rid, {"awaiting_gate"})
+    assert client.post(f"/runs/{rid}/approve").status_code == 200
+    # A no-op burn on a go ends applied (nothing merged) with no persisted diff.
+    _wait_mem(client, rid, {"applied", "done", "scrubbed"})
+    assert client.get(f"/runs/{rid}/changes").status_code == 404
+    assert mem_store.get_run(rid).changes_json is None
+
+
+# -- the additive migration is idempotent (Postgres) -----------------------
+
+def test_changes_json_migration_is_idempotent():
+    try:
+        _cp, pool = postgres_checkpointer(setup=True)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"Postgres unavailable: {e}")
+    try:
+        store = build_runs_store(pool, setup=True)
+        store.setup()  # second run must not error (ADD COLUMN IF NOT EXISTS)
+        with pool.connection() as conn:
+            cur = conn.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = 'runs' AND column_name = 'changes_json'"
+            )
+            row = cur.fetchone()
+        assert row is not None and row[0] == "jsonb"
+    finally:
+        pool.close()

@@ -88,6 +88,7 @@ class InMemoryRunStore:
             "task_type": None, "status": "queued", "cost_usd": 0.0,
             "created_at": self._now(), "started_at": None, "ended_at": None,
             "detail": None, "plan_id": None, "plan_unit_seq": None,
+            "changes_json": None,
         })
 
     # transitions ---------------------------------------------------------
@@ -111,6 +112,10 @@ class InMemoryRunStore:
     def mark_awaiting_gate(self, run_id):
         with self._lock:
             self._ensure(run_id)["status"] = "awaiting_gate"
+
+    def set_changes(self, run_id, changes):
+        with self._lock:
+            self._ensure(run_id)["changes_json"] = changes
 
     def finish(self, run_id, *, status, cost_usd, detail=None):
         with self._lock:
