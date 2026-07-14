@@ -38,6 +38,7 @@ from .. import aidlc, plan_docs, repo_source, roles, worktree
 from ..plans_store import (
     STATUS_BUILDING,
     STATUS_DONE,
+    UNIT_DEFERRED,
     UNIT_DONE,
     PlanStore,
 )
@@ -196,16 +197,21 @@ class PlanBuilder:
                 self._mark_unit_done(plan_id, unit.seq)
                 done.add(unit.seq)
         dead = self._dead_seqs(units, by_seq)  # own run failed, or a dep is dead
+        # Deferred units (AI-DLC v2 ``operation`` stages) are RECORDED in the plan but
+        # never dispatched in v1 (they need cloud creds). They count as resolved so the
+        # plan can still complete; they are never launched and never block a dependent.
+        deferred = {u.seq for u in units if u.status == UNIT_DEFERRED}
 
         for unit in units:  # units come back in seq order
-            if unit.seq in done or unit.seq in by_seq or unit.seq in dead:
-                continue  # already done (git) / dispatched this session / will never run
+            if unit.seq in done or unit.seq in by_seq or unit.seq in dead \
+                    or unit.seq in deferred:
+                continue  # done / dispatched / dead / deferred-never-dispatched
             if not all(dep in done for dep in (unit.depends_on or [])):
                 continue  # a dependency isn't done yet → not (yet) dispatchable
             self._dispatch(plan_id, target, unit)
             by_seq = {r.plan_unit_seq: r for r in self._runs.child_runs(plan_id)}
 
-        if self._all_resolved(units, done, dead):
+        if self._all_resolved(units, done | deferred, dead):
             self._plans.set_status(plan_id, STATUS_DONE)
 
     def _dispatch(self, plan_id: str, target: str, unit) -> None:

@@ -25,7 +25,8 @@ from ..plans_store import (
     PlanStore,
     PlanTurn,
 )
-from .planner import DocsSync, DoneEvent, PlannerEngine
+from ..aidlc_v2 import plan as v2plan
+from .planner import DocsSync, DoneEvent, PlannerEngine, _v2_catalog_for
 
 # Instance defaults: env, themselves defaulting to the methodology's own defaults.
 # Read lazily (at manager construction) so tests can set the env per case.
@@ -201,9 +202,21 @@ class PlanManager:
 
     def readiness(self, plan_id: str):
         """The plan's explicit finalize criteria, each flagged met/unmet — surfaced in
-        ``GET /plans/{id}`` so the UI can show what is still blocking finalize."""
+        ``GET /plans/{id}`` so the UI can show what is still blocking finalize.
+
+        A v2 target's gate = every applicable ``kind=="plan"`` stage laid down + a
+        non-empty, well-formed work-list (reusing the shared readiness machinery); any
+        other target keeps the built-in greenfield/brownfield rule, unchanged."""
         plan = self._require(plan_id)
         units = self._store.list_units(plan_id)
+        catalog = _v2_catalog_for(plan)
+        if catalog is not None:
+            completed = {u.stage_slug for u in units
+                         if u.phase == aidlc.Phase.INCEPTION.value and u.stage_slug}
+            build = [u for u in units
+                     if u.stage_slug and u.phase != aidlc.Phase.INCEPTION.value]
+            return v2plan.readiness(catalog, mode=plan.mode, scope=None,
+                                    completed_slugs=completed, units=build)
         requirements = self._store.list_requirements(plan_id)
         inception = [u.title for u in units if u.phase == aidlc.Phase.INCEPTION.value]
         return aidlc.readiness_report(

@@ -33,10 +33,14 @@ from typing import Iterator, Optional, Protocol
 
 from .. import aidlc
 from ..aidlc import BrownfieldCriterion, InceptionStage, Phase
+from ..aidlc_v2 import catalog as v2catalog
+from ..aidlc_v2 import plan as v2plan
 from ..plans_store import (
     ROLE_OPERATOR,
     ROLE_PLANNER,
     STATUS_READY,
+    UNIT_DEFERRED,
+    UNIT_PENDING,
     PlanRow,
     PlanStore,
     PlanTurn,
@@ -467,8 +471,16 @@ class PlannerEngine:
         yield from self._reply_flow(plan_id, turns[-1].content)
 
     def _reply_flow(self, plan_id: str, operator_content: str) -> Iterator[EngineEvent]:
-        """Dispatch the pending operator turn to the mode-appropriate handler."""
+        """Dispatch the pending operator turn to the mode-appropriate handler.
+
+        A target with AI-DLC **v2** installed drives its walk from the vendored catalog
+        (see :meth:`_v2_turn`), replacing the built-in INCEPTION_STAGES walk. Every other
+        target keeps the existing built-in greenfield/brownfield flow, unchanged."""
         plan = self._store.get_plan(plan_id)
+        catalog = _v2_catalog_for(plan)
+        if catalog is not None:
+            yield from self._v2_turn(plan, plan_id, operator_content, catalog)
+            return
         completed = [u.title for u in self._store.list_units(plan_id)
                      if u.phase == Phase.INCEPTION.value]
         wd_title = aidlc.INCEPTION_STAGE_BY_KEY["workspace_detection"].title
@@ -533,6 +545,96 @@ class PlannerEngine:
         self._store.upsert_requirement(
             plan_id, aidlc.REQ_KEY_RE_RUN, value=result.run_id, state=aidlc.REQ_READY)
         return f"Reverse-engineered the codebase via sim run {result.run_id}. "
+
+    # -- AI-DLC v2 walk (catalog-driven) -----------------------------------
+
+    def _v2_turn(self, plan, plan_id, operator_content, catalog):
+        """One turn of the v2 walk: advance the interactive ``kind=="plan"`` stages in
+        dependency order (each laid down as an INCEPTION unit, its ``produces`` recorded
+        as requirements), then FINALIZE by emitting the work-list from the catalog's
+        applicable non-plan stages. Deterministic: any substantive answer advances the
+        current stage — so it drives cleanly under the stub brain and a real LLM alike."""
+        mode, scope = plan.mode, None
+        done = self._v2_completed_slugs(plan_id)
+        remaining = [s for s in v2plan.plan_stages(catalog, mode=mode, scope=scope)
+                     if s.slug not in done]
+        parts: list[str] = []
+
+        # Walk complete already → finalize (idempotent: emits units once).
+        if not remaining:
+            yield from self._v2_finalize(plan, plan_id, catalog, mode, scope, parts)
+            return
+
+        stage = remaining[0]
+        if not operator_content.strip():  # need an answer before advancing
+            yield from self._stream_text(v2plan.stage_question(stage), parts)
+            yield from self._finish(plan_id, parts)
+            return
+
+        # Complete the current plan stage: lay it down + record what it must produce.
+        self._lay_down(plan_id, stage.title, Phase.INCEPTION, stage_slug=stage.slug)
+        for artifact in stage.produces:
+            self._store.upsert_requirement(
+                plan_id, f"{stage.slug}:{artifact}", value="(captured)",
+                state=aidlc.REQ_READY)
+        self._store.set_stage(plan_id, stage.slug)
+        yield from self._stream_text(f"Recorded {stage.title}. ", parts)
+
+        still = [s for s in remaining[1:] if s.slug not in {stage.slug}]
+        if still:
+            yield from self._stream_text("\n\n" + v2plan.stage_question(still[0]), parts)
+            yield from self._finish(plan_id, parts, StageEvent(stage.title, "in_place"))
+        else:  # last plan stage → finalize
+            yield from self._v2_finalize(plan, plan_id, catalog, mode, scope, parts,
+                                         last_stage=stage.title)
+
+    def _v2_finalize(self, plan, plan_id, catalog, mode, scope, parts, last_stage=None):
+        """Emit the v2 work-list (once) and mark the plan ready."""
+        self._emit_v2_units(plan_id, catalog, mode, scope)
+        self._store.set_status(plan_id, STATUS_READY)
+        yield from self._stream_text("\n\n" + self._v2_summary(plan_id), parts)
+        event = StageEvent(last_stage or "Units Generation", STATUS_READY)
+        yield from self._finish(plan_id, parts, event)
+
+    def _emit_v2_units(self, plan_id, catalog, mode, scope) -> None:
+        """Append one unit per applicable non-plan stage, in dependency order, wiring
+        ``depends_on`` from the stage DAG (mapped to the units' seqs). Deferred stages
+        are recorded with :data:`UNIT_DEFERRED` so the builder never dispatches them.
+        Guarded on 'already have build units' so a re-drive never duplicates."""
+        if self._has_build_units(plan_id):
+            return
+        seq = self._next_seq(plan_id)
+        slug_to_seq: dict[str, int] = {}
+        for pu in v2plan.build_units(catalog, mode=mode, scope=scope):
+            deps = [slug_to_seq[r] for r in pu.requires if r in slug_to_seq]
+            self._store.upsert_unit(
+                plan_id, seq, title=pu.title, phase=pu.phase, task_type=pu.task_type,
+                stage_slug=pu.stage_slug, depends_on=deps,
+                status=UNIT_DEFERRED if pu.deferred else UNIT_PENDING,
+            )
+            slug_to_seq[pu.stage_slug] = seq
+            seq += 1
+
+    def _v2_completed_slugs(self, plan_id) -> set:
+        """The plan stages already laid down (by stage_slug on their INCEPTION units)."""
+        return {u.stage_slug for u in self._store.list_units(plan_id)
+                if u.phase == Phase.INCEPTION.value and u.stage_slug}
+
+    def _has_build_units(self, plan_id) -> bool:
+        """Whether the plan already has a v2 work-list (non-INCEPTION units carrying a
+        stage_slug) — the dedupe guard so units are emitted exactly once."""
+        return any(u.stage_slug and u.phase != Phase.INCEPTION.value
+                   for u in self._store.list_units(plan_id))
+
+    def _v2_summary(self, plan_id) -> str:
+        build = [u for u in self._store.list_units(plan_id)
+                 if u.stage_slug and u.phase != Phase.INCEPTION.value]
+        deferred = [u for u in build if u.status == UNIT_DEFERRED]
+        return (
+            "Planning is complete. The INCEPTION stages are in place and the work-list "
+            f"has {len(build)} unit(s) ({len(deferred)} deferred). The plan is ready to "
+            "finalize."
+        )
 
     # -- greenfield stage walk ---------------------------------------------
 
@@ -658,9 +760,12 @@ class PlannerEngine:
         yield from self._stream_text(text, parts)
         yield from self._finish(plan_id, parts)
 
-    def _lay_down(self, plan_id: str, title: str, phase: Phase) -> None:
-        """Record a completed stage as an INCEPTION unit ('in place')."""
-        self._store.upsert_unit(plan_id, self._next_seq(plan_id), title=title, phase=phase)
+    def _lay_down(self, plan_id: str, title: str, phase: Phase,
+                  stage_slug: Optional[str] = None) -> None:
+        """Record a completed stage as an INCEPTION unit ('in place'). ``stage_slug``
+        identifies the source v2 stage (None for built-in stages)."""
+        self._store.upsert_unit(plan_id, self._next_seq(plan_id), title=title, phase=phase,
+                                stage_slug=stage_slug)
 
     def _has_construction_units(self, plan_id: str) -> bool:
         """Whether the plan already has a CONSTRUCTION work-list (dedupe guard so the
@@ -723,3 +828,20 @@ def _first_unmet(report) -> Optional[BrownfieldCriterion]:
 def _warranted(requirements) -> bool:
     """User stories are warranted iff a personas requirement has been captured."""
     return any(r.key == WARRANT_REQUIREMENT_KEY for r in requirements)
+
+
+def _v2_catalog_for(plan) -> Optional[list]:
+    """The v2 stage catalog for a plan whose target has AI-DLC v2 installed, else None.
+    Read-only: probes the working copy for the v2 flavor and loads the catalog it
+    carries. Any other install (or none) → None, so the built-in walk runs."""
+    if plan is None:
+        return None
+    work = plan.working_path
+    if not work or not Path(work).is_dir():
+        return None
+    steering = aidlc.probe(Path(work))
+    if steering is None or steering.flavor != aidlc.FLAVOR_AIDLC_V2:
+        return None
+    if steering.catalog_root is None:
+        return None
+    return v2catalog.load_catalog(steering.catalog_root)

@@ -69,6 +69,34 @@ def test_load_missing_plan_raises(tmp_path):
         plan_docs.load_plan(tmp_path)
 
 
+def test_v2_units_roundtrip_with_stage_slug_and_task_type(tmp_path):
+    """A v2 unit lives in a v2 phase (e.g. a design stage in ``construction``) where the
+    phase alone can't determine sim vs. burn — so stage_slug + task_type must survive the
+    round-trip, and task_type is trusted (not derived) for the non-v1 phase."""
+    plan = PlanDoc(
+        mode="greenfield",
+        status="ready",
+        units=[
+            # a design stage: v2 phase 'construction' but kind sim → task_type 'sim'
+            UnitDoc(0, "Functional Design", "construction", [], "pending",
+                    stage_slug="functional-design", stored_task_type="sim"),
+            # a code stage: 'construction' + burn
+            UnitDoc(1, "Code Generation", "construction", [0], "pending",
+                    stage_slug="code-generation", stored_task_type="burn"),
+            # an operation stage: recorded but deferred
+            UnitDoc(2, "Deployment Execution", "operation", [1], "deferred",
+                    stage_slug="deployment-execution", stored_task_type="burn"),
+        ],
+    )
+    plan_docs.dump_plan(plan, tmp_path)
+    loaded = plan_docs.load_plan(tmp_path)
+    assert loaded.units == plan.units
+    assert [u.task_type for u in loaded.units] == ["sim", "burn", "burn"]
+    assert [u.stage_slug for u in loaded.units] == [
+        "functional-design", "code-generation", "deployment-execution"]
+    assert loaded.units[2].status == "deferred"
+
+
 # -- Postgres + git reconciliation -----------------------------------------
 
 def _git(repo: Path, *args: str) -> str:

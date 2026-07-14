@@ -176,6 +176,71 @@ def test_rejected_gate_scrubs_the_unit_not_the_plan(build_env, target_repo):
     assert not (target_repo / STUB_BURN_FILE).exists()          # nothing applied
 
 
+# -- deferred (v2 operation) units are recorded but never dispatched -------
+
+@pytest.fixture
+def plan_store_pg():
+    try:
+        _checkpointer, pool = postgres_checkpointer(setup=True)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"Postgres unavailable (run `docker compose up -d`): {e}")
+    yield build_plans_store(pool, setup=True)
+    pool.close()
+
+
+class _FakeRuns:
+    """Records launches; never actually runs anything (enough to drive the scheduler)."""
+
+    def __init__(self):
+        self.launched = []
+
+    def child_runs(self, plan_id):
+        return []
+
+    def launch(self, *, plan_unit_seq, **kwargs):
+        self.launched.append(plan_unit_seq)
+
+
+def _open_building(store, target, units):
+    """Open a BUILDING plan on ``target`` with ``units`` = list of
+    (seq, phase, task_type, status, stage_slug, depends_on)."""
+    pid = f"plan-{uuid4().hex}"
+    store.open_plan(pid, target=str(target), local_path=str(target), mode="greenfield",
+                    methodology="aidlc", cloud_target="aws", status=ps.STATUS_BUILDING)
+    for seq, phase, task_type, status, slug, deps in units:
+        store.upsert_unit(pid, seq, title=f"unit {seq}", phase=phase, task_type=task_type,
+                          status=status, stage_slug=slug, depends_on=deps)
+    return pid
+
+
+def test_deferred_unit_is_never_dispatched(plan_store_pg, target_repo, tmp_path):
+    store = plan_store_pg
+    runs = _FakeRuns()
+    builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
+                          cache_root=tmp_path / "cache")
+    # seq0 a dispatchable construction burn; seq1 a DEFERRED operation burn.
+    pid = _open_building(store, target_repo, [
+        (0, "construction", roles.BURN, ps.UNIT_PENDING, "code-generation", []),
+        (1, "operation", roles.BURN, ps.UNIT_DEFERRED, "deployment-execution", []),
+    ])
+    builder._advance(pid)
+    assert runs.launched == [0]            # only the non-deferred unit dispatched
+    assert 1 not in runs.launched          # the deferred operation unit never launched
+
+
+def test_plan_of_only_deferred_units_completes(plan_store_pg, target_repo, tmp_path):
+    store = plan_store_pg
+    runs = _FakeRuns()
+    builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
+                          cache_root=tmp_path / "cache")
+    pid = _open_building(store, target_repo, [
+        (0, "operation", roles.BURN, ps.UNIT_DEFERRED, "incident-response", []),
+    ])
+    builder._advance(pid)
+    assert runs.launched == []                              # nothing dispatched
+    assert store.get_plan(pid).status == ps.STATUS_DONE     # deferred counts as resolved
+
+
 # -- greenfield bootstraps a real remote (portable identity from unit 1) ----
 
 def test_greenfield_bootstraps_a_remote_and_builds(build_env, tmp_path):

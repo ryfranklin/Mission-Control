@@ -61,11 +61,21 @@ class UnitDoc:
     phase: str
     depends_on: list
     status: str
+    # The v2 catalog stage this unit derives from (None for built-in/v1 plans).
+    stage_slug: Optional[str] = None
+    # The unit's stored task_type — used ONLY for v2 phases, where the phase alone does
+    # not determine sim vs. burn. For v1 phases it is ignored (task_type is derived).
+    stored_task_type: Optional[str] = None
 
     @property
     def task_type(self) -> str:
-        """Derived from phase (never trusted from the file)."""
-        return aidlc.task_type_for_phase(Phase(self.phase)).value
+        """For a built-in (v1) phase, DERIVED from phase (never trusted from the file).
+        For a v2 phase (not a v1 :class:`Phase`), the stored task_type is authoritative —
+        the kind, not the phase, decides sim vs. burn."""
+        try:
+            return aidlc.task_type_for_phase(Phase(self.phase)).value
+        except ValueError:
+            return self.stored_task_type or ""
 
 
 @dataclass
@@ -87,6 +97,16 @@ class PlanDoc:
     status: str
     units: list = field(default_factory=list)          # list[UnitDoc]
     requirements: list = field(default_factory=list)   # list[RequirementDoc]
+
+
+def _is_v1_phase(phase) -> bool:
+    """Whether ``phase`` is a built-in (v1) :class:`Phase` value (INCEPTION/CONSTRUCTION),
+    for which task_type is derived rather than trusted from the file."""
+    try:
+        Phase(str(phase))
+        return True
+    except ValueError:
+        return False
 
 
 # -- serialization ---------------------------------------------------------
@@ -114,6 +134,9 @@ def dump_plan(plan: PlanDoc, dir) -> None:
                 "task_type": u.task_type,          # rendered; derived from phase on load
                 "depends_on": list(u.depends_on),
                 "status": u.status,
+                # stage_slug travels only for v2 units (identifies the source stage);
+                # omitted for v1 units so their on-disk shape is unchanged.
+                **({"stage_slug": u.stage_slug} if u.stage_slug else {}),
             }
             for u in sorted(plan.units, key=lambda u: u.seq)
         ],
@@ -143,6 +166,13 @@ def load_plan(dir) -> PlanDoc:
             phase=str(u["phase"]),
             depends_on=[int(d) for d in (u.get("depends_on") or [])],
             status=str(u.get("status", "pending")),
+            stage_slug=(str(u["stage_slug"]) if u.get("stage_slug") else None),
+            # task_type is trusted only for a v2 phase (where phase can't derive it); for
+            # a v1 phase it stays None so the derived property (and equality) is unchanged.
+            stored_task_type=(
+                str(u["task_type"]) if (u.get("task_type") and not _is_v1_phase(u["phase"]))
+                else None
+            ),
         )
         for u in (data.get("units") or [])
     ]
@@ -190,7 +220,10 @@ def plan_doc_from_store(store, plan_id: str) -> PlanDoc:
         raise KeyError(plan_id)
     units = [
         UnitDoc(seq=u.seq, title=u.title, phase=u.phase,
-                depends_on=list(u.depends_on or []), status=u.status)
+                depends_on=list(u.depends_on or []), status=u.status,
+                stage_slug=u.stage_slug,
+                # symmetric with load_plan: task_type is carried only for v2 phases.
+                stored_task_type=(None if _is_v1_phase(u.phase) else u.task_type))
         for u in store.list_units(plan_id)
     ]
     requirements = [
@@ -210,8 +243,12 @@ def reconcile_into_store(store, plan_id: str, plan: PlanDoc) -> None:
         store.set_status(plan_id, plan.status)
     store.clear_units(plan_id)
     for u in sorted(plan.units, key=lambda u: u.seq):
-        store.upsert_unit(plan_id, u.seq, title=u.title, phase=Phase(u.phase),
-                          depends_on=list(u.depends_on), status=u.status)
+        # Pass phase as a raw string + explicit task_type/stage_slug so a v2 phase
+        # ("construction"/"operation") is not coerced through the v1 Phase enum. For a
+        # v1 unit, u.task_type is the derived value — identical to deriving in the store.
+        store.upsert_unit(plan_id, u.seq, title=u.title, phase=u.phase,
+                          depends_on=list(u.depends_on), status=u.status,
+                          task_type=u.task_type, stage_slug=u.stage_slug)
     store.clear_requirements(plan_id)
     for r in plan.requirements:
         store.upsert_requirement(plan_id, r.key, value=r.value, state=r.state)

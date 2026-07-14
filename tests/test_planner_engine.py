@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from mission_control import StubWorker, roles
 from mission_control.aidlc import Phase
+from mission_control.aidlc_v2 import install as install_v2
 from mission_control.graph import (
     build_plans_store,
     build_runs_store,
@@ -167,6 +168,71 @@ def test_user_stories_stage_runs_only_when_warranted(plan_env):
     titles = [u.title for u in store.list_units(pid)]
     assert "User Stories" in titles
     assert client.get(f"/plans/{pid}").json()["status"] == ps.STATUS_READY
+
+
+# -- AI-DLC v2: the walk + work-list come from the vendored catalog --------
+
+def test_v2_target_derives_units_from_catalog(plan_env, target_repo):
+    client, store = plan_env
+    install_v2(target_repo)  # target now carries AI-DLC v2
+
+    pid = client.post("/plans", json={
+        "target": str(target_repo), "mode": "greenfield",
+    }).json()["id"]
+
+    # Drive the catalog-derived plan-stage walk to completion (each turn advances one
+    # kind=="plan" stage; there are ~17 for greenfield). Bounded loop, offline stub.
+    for _ in range(40):
+        _turn(client, pid, "go")
+        if store.get_plan(pid).status == ps.STATUS_READY:
+            break
+    assert store.get_plan(pid).status == ps.STATUS_READY
+
+    units = store.list_units(pid)
+    build = [u for u in units if u.stage_slug and u.phase != Phase.INCEPTION.value]
+    by_slug = {u.stage_slug: u for u in build}
+
+    # Units == the catalog's non-plan applicable stages (7 construction + 7 operation).
+    assert {u.phase for u in build} == {"construction", "operation"}
+    assert len(build) == 14
+    # Every build unit identifies its source stage.
+    assert all(u.stage_slug for u in build)
+
+    # sim/burn types follow the catalog kind, not the phase.
+    for slug in ("code-generation", "build-and-test", "ci-pipeline", "infrastructure-design"):
+        assert by_slug[slug].task_type == roles.BURN
+    for slug in ("functional-design", "nfr-requirements", "nfr-design"):
+        assert by_slug[slug].task_type == roles.SIM
+
+    # operation stages are recorded but DEFERRED (never dispatched in v1).
+    op = [u for u in build if u.phase == "operation"]
+    assert op and all(u.status == ps.UNIT_DEFERRED for u in op)
+    # construction units are dispatchable (pending), not deferred.
+    assert all(u.status == ps.UNIT_PENDING
+               for u in build if u.phase == "construction")
+
+    # depends_on is dependency-valid: a unit never precedes one it depends on.
+    position = {u.seq: i for i, u in enumerate(build)}
+    for u in build:
+        for dep in u.depends_on:
+            assert position[dep] < position[u.seq]
+
+    # The v2 readiness gate passes → finalize locks the plan.
+    fin = client.post(f"/plans/{pid}/finalize")
+    assert fin.status_code == 200 and fin.json()["status"] == ps.STATUS_FINALIZED
+
+
+def test_no_v2_target_uses_builtin_walk(plan_env, target_repo):
+    """A target WITHOUT v2 installed still runs the built-in INCEPTION_STAGES walk."""
+    client, store = plan_env
+    pid = client.post("/plans", json={
+        "target": str(target_repo), "mode": "greenfield",
+    }).json()["id"]
+    _turn(client, pid, "A brand-new tool")
+    titles = {u.title for u in store.list_units(pid)}
+    # built-in stage title (not a v2 catalog slug) → the built-in walk ran
+    assert "Workspace Detection" in titles
+    assert not any(u.stage_slug for u in store.list_units(pid))
 
 
 # -- defaults: AWS / .aidlc unless overridden ------------------------------
