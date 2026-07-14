@@ -55,6 +55,25 @@ DEFAULT_MAX_TURNS = 20
 # `sim` genuinely cannot write, even though its worktree is disposable anyway.
 _MUTATING_TOOLS = ["Write", "Edit", "NotebookEdit", "Bash", "KillShell"]
 
+# Fallback seam DB (docker-compose default) when MC_POSTGRES_URL is unset — only
+# used to *derive* the isolated worker URL below, never connected to here.
+_DEFAULT_PG_URL = "postgresql://mc:mc@localhost:5432/mission_control"
+
+
+def _worker_pg_url() -> str:
+    """Isolated Postgres URL handed to the worker subprocess so a self-targeting
+    build's tests never touch the live seam DB. Explicit override via
+    ``MC_WORKER_POSTGRES_URL``; otherwise the seam URL with its database name
+    suffixed ``_worker`` (a separate DB on the same server)."""
+    explicit = os.environ.get("MC_WORKER_POSTGRES_URL")
+    if explicit:
+        return explicit
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(os.environ.get("MC_POSTGRES_URL") or _DEFAULT_PG_URL)
+    db = parts.path.lstrip("/") or "mission_control"
+    return urlunsplit(parts._replace(path="/" + db + "_worker"))
+
 
 class WorkerError(RuntimeError):
     """The SDK worker failed to complete a task (auth, API, or a hard error)."""
@@ -115,6 +134,13 @@ class SdkWorker:
             setting_sources=[],
             system_prompt=_system_prompt(task, steering),
             cwd=str(workdir),
+            # Worker DB isolation: the worker runs inside a disposable worktree and
+            # may execute the target repo's own test suite. Point any Postgres it
+            # touches at a dedicated database so a *self-targeting* build never
+            # reads/writes/migrates the live seam DB (MC_POSTGRES_URL) — that once
+            # broke the running seam's cached query plan mid-build. Explicit worker
+            # context per CLAUDE.md; override via MC_WORKER_POSTGRES_URL.
+            env={**os.environ, "MC_POSTGRES_URL": _worker_pg_url()},
             max_turns=self.max_turns,
             # The worker acts inside a disposable, isolated worktree; the
             # orchestrator's go/no-go gate is the real side-effect boundary, so
