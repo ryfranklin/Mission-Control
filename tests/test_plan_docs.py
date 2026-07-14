@@ -279,6 +279,30 @@ def test_v2_stage_go_marks_state_and_commits_artifacts(store, v2_remote, tmp_pat
     assert "aidlc-docs/construction/functional-design/business-logic-model.md" in tree
 
 
+def test_content_guard_covers_committed_v2_artifacts(store, v2_remote, tmp_path):
+    """The egress guard scans the WHOLE aidlc-docs/ tree — so a secret in a produced v2
+    artifact blocks the commit, not just secrets in flight-plan.yaml."""
+    from mission_control.content_guard import GuardViolation
+
+    ref, _ = project_ref.resolve_target(str(v2_remote))
+    cache = tmp_path / "cache"
+    pid = f"plan-{uuid4().hex}"
+    store.open_plan(pid, target=ref, local_path=None, mode="greenfield",
+                    methodology="aidlc", cloud_target="aws")
+    store.upsert_unit(pid, 0, title="Code Generation", phase="construction",
+                      task_type=roles.BURN, stage_slug="code-generation")
+    store.set_status(pid, "ready")
+
+    # a produced artifact under aidlc-docs/ carrying an obvious secret
+    local = repo_source.ensure_local(ref, root=cache)
+    art = local / "aidlc-docs" / "construction" / "code-generation" / "code-summary.md"
+    art.parent.mkdir(parents=True, exist_ok=True)
+    art.write_text("aws_secret_access_key = AKIAIOSFODNN7EXAMPLEabcdefghijklmnopqrstuvwx\n")
+
+    with pytest.raises(GuardViolation):
+        plan_docs.sync_to_repo(store, pid, cache_root=cache)
+
+
 def test_postgres_git_divergence_resolves_to_git(store, remote, tmp_path):
     """Git is authoritative: a Postgres cache that has drifted from the committed plan
     is overwritten to match git on reconcile."""

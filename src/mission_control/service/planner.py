@@ -605,6 +605,7 @@ class PlannerEngine:
             return
         seq = self._next_seq(plan_id)
         slug_to_seq: dict[str, int] = {}
+        deferred: list[str] = []
         for pu in v2plan.build_units(catalog, mode=mode, scope=scope):
             deps = [slug_to_seq[r] for r in pu.requires if r in slug_to_seq]
             self._store.upsert_unit(
@@ -612,8 +613,18 @@ class PlannerEngine:
                 stage_slug=pu.stage_slug, depends_on=deps,
                 status=UNIT_DEFERRED if pu.deferred else UNIT_PENDING,
             )
+            if pu.deferred:
+                deferred.append(pu.stage_slug)
             slug_to_seq[pu.stage_slug] = seq
             seq += 1
+        # Surface WHY the operation stages are recorded-but-not-dispatched, so the plan
+        # carries a clear, machine-readable reason (travels in flight-plan.yaml).
+        if deferred:
+            self._store.upsert_requirement(
+                plan_id, "operation:deferred",
+                value=("operation-phase stages need cloud credentials — parsed and "
+                       "recorded, but not dispatched in v1: " + ", ".join(deferred)),
+                state=aidlc.REQ_READY)
 
     def _v2_completed_slugs(self, plan_id) -> set:
         """The plan stages already laid down (by stage_slug on their INCEPTION units)."""
