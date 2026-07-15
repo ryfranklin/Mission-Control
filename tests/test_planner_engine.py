@@ -192,9 +192,12 @@ def test_v2_target_derives_units_from_catalog(plan_env, target_repo):
     build = [u for u in units if u.stage_slug and u.phase != Phase.INCEPTION.value]
     by_slug = {u.stage_slug: u for u in build}
 
-    # Units == the catalog's non-plan applicable stages (7 construction + 7 operation).
-    assert {u.phase for u in build} == {"construction", "operation"}
-    assert len(build) == 14
+    # CAPCOM produces the whole chain: inception writes the design artifacts, construction
+    # consumes them, operation is recorded-deferred.
+    assert {u.phase for u in build} == {"inception", "construction", "operation"}
+    # inception producers are present so construction isn't run blind
+    assert {"requirements-analysis", "application-design", "units-generation"} \
+        <= set(by_slug)
     # Every build unit identifies its source stage.
     assert all(u.stage_slug for u in build)
 
@@ -210,9 +213,9 @@ def test_v2_target_derives_units_from_catalog(plan_env, target_repo):
     # operation stages are recorded but DEFERRED (never dispatched in v1).
     op = [u for u in build if u.phase == "operation"]
     assert op and all(u.status == ps.UNIT_DEFERRED for u in op)
-    # construction units are dispatchable (pending), not deferred.
+    # inception + construction units are dispatchable (pending), not deferred.
     assert all(u.status == ps.UNIT_PENDING
-               for u in build if u.phase == "construction")
+               for u in build if u.phase in ("inception", "construction"))
 
     # depends_on is dependency-valid: a unit never precedes one it depends on.
     position = {u.seq: i for i, u in enumerate(build)}

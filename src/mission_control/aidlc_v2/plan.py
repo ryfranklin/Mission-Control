@@ -23,8 +23,12 @@ from ..roles import BURN, SIM
 from .catalog import StageSpec, applicable
 from .catalog import gates as catalog_gates
 
-# The v2 kinds that become dispatchable MC work (vs. ``plan``, the interactive walk).
-_WORK_KINDS = ("sim", "burn")
+# The phases MC executes as producing build units, in dependency order. The earlier
+# initialization/ideation phases are the interactive walk's intent-gathering (not
+# autonomous build agents); from INCEPTION onward CAPCOM PRODUCES the full artifact chain
+# — inception writes requirements/application-design/unit-of-work, construction consumes
+# them — so every downstream stage has real inputs on disk (no blind runs).
+_BUILD_PHASES = ("inception", "construction", "operation")
 
 
 @dataclass(frozen=True)
@@ -52,12 +56,13 @@ def plan_stages(catalog: list[StageSpec], *, mode: str, scope: str | None = None
 
 def unit_stages(catalog: list[StageSpec], *, mode: str, scope: str | None = None
                 ) -> list[StageSpec]:
-    """The non-plan stages that become MC units, in dependency order. Deferred stages
-    are INCLUDED (recorded) — ``enable_deferred=True`` — but carry ``deferred=True`` so
-    the caller can mark them not-to-dispatch."""
+    """The stages CAPCOM executes as producing build units (inception → construction →
+    operation), in dependency order. Deferred stages are INCLUDED (recorded) —
+    ``enable_deferred=True`` — but carry ``deferred=True`` so the caller can mark them
+    not-to-dispatch. Initialization/ideation are excluded — that is the walk's intent."""
     return [
         s for s in catalog
-        if s.kind in _WORK_KINDS
+        if s.phase in _BUILD_PHASES
         and applicable(s, mode=mode, scope=scope, enable_deferred=True)
     ]
 

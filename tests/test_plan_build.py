@@ -274,6 +274,46 @@ def test_producing_stage_that_writes_nothing_is_flagged(plan_store_pg, target_re
 
     reqs = {r.key for r in store.list_requirements(pid)}
     assert "functional-design:no-output" in reqs             # flagged, not silent
+    # CAPCOM HELD it: blocked (not done), so a dependent never deploys onto missing inputs.
+    assert store.list_units(pid)[0].status == ps.UNIT_BLOCKED
+
+
+def test_capcom_holds_dependents_when_a_stage_produces_nothing(plan_store_pg,
+                                                               target_repo, tmp_path):
+    """CAPCOM gate: a producing stage that writes nothing is BLOCKED, and its dependent
+    is never dispatched (held) — the fleet is not deployed onto missing inputs."""
+    store = plan_store_pg
+
+    class _Runs:
+        def __init__(self):
+            self.launched = []
+            self.run = None
+
+        def child_runs(self, plan_id):
+            return [self.run] if self.run else []
+
+        def get_run(self, run_id):
+            return self.run
+
+        def launch(self, **kwargs):
+            self.launched.append(kwargs.get("plan_unit_seq"))
+
+    runs = _Runs()
+    builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
+                          cache_root=tmp_path / "cache", docs_sync=None)
+    # seq0 a producing design stage; seq1 depends on it (a code stage).
+    pid = _open_building(store, target_repo, [
+        (0, "construction", roles.BURN, ps.UNIT_PENDING, "functional-design", []),
+        (1, "construction", roles.BURN, ps.UNIT_PENDING, "code-generation", [0]),
+    ])
+    # seq0 succeeds but produces NOTHING → CAPCOM blocks it.
+    runs.run = SimpleNamespace(run_id="run-0", plan_unit_seq=0,
+                               status=STATUS_APPLIED, changes_json=None)
+    builder.on_run_terminal("run-0", pid)
+
+    by_seq = {u.seq: u for u in store.list_units(pid)}
+    assert by_seq[0].status == ps.UNIT_BLOCKED               # held, not done
+    assert 1 not in runs.launched                            # dependent NOT deployed
 
 
 def test_no_go_records_request_changes_and_leaves_stage_incomplete(plan_store_pg,

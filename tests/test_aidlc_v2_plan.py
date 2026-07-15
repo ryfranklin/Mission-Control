@@ -40,12 +40,19 @@ def test_plan_stages_include_reverse_engineering_for_brownfield(catalog):
 # -- the work-list -----------------------------------------------------------
 
 
-def test_units_are_the_applicable_non_plan_stages(catalog):
+def test_units_are_the_producing_stages_inception_through_operation(catalog):
     units = v2plan.build_units(catalog, mode=MODE)
-    # every non-plan (sim/burn) stage becomes exactly one unit
-    expected = {s.slug for s in catalog if s.kind in ("sim", "burn")}
+    # CAPCOM produces the whole chain: every applicable inception/construction/operation
+    # stage is a build unit (initialization/ideation are the walk's intent, not units).
+    expected = {s.slug for s in catalog
+                if s.phase in ("inception", "construction", "operation")
+                and v2catalog.applicable(s, mode=MODE)}
+    # operation is deferred but still recorded → present in the set
+    expected |= {s.slug for s in catalog if s.phase == "operation"}
     assert {u.stage_slug for u in units} == expected
-    assert len(units) == len(expected)
+    # inception producers are included so construction has real inputs
+    assert {"requirements-analysis", "application-design", "units-generation"} \
+        <= {u.stage_slug for u in units}
 
 
 def test_units_are_writable_and_gate_only_code_stages(catalog):
@@ -72,14 +79,16 @@ def test_units_are_in_dependency_valid_order(catalog):
             )
 
 
-def test_requires_drops_plan_stage_dependencies(catalog):
+def test_code_generation_depends_on_its_full_producing_chain(catalog):
     by_slug = {u.stage_slug: u for u in v2plan.build_units(catalog, mode=MODE)}
     cg = by_slug["code-generation"]
-    # units-generation is a plan stage → not a unit → dropped from requires
-    assert "units-generation" not in cg.requires
-    # its real design/infra prerequisites survive
-    assert {"functional-design", "nfr-requirements", "nfr-design",
+    # units-generation is now a produced INCEPTION unit → it IS a real dependency (the
+    # chain is complete; code-generation waits for its unit-of-work + designs).
+    assert {"units-generation", "functional-design", "nfr-requirements", "nfr-design",
             "infrastructure-design"} <= set(cg.requires)
+    # requires only reference other build units (no dangling ideation/initialization deps)
+    unit_slugs = set(by_slug)
+    assert set(cg.requires) <= unit_slugs
 
 
 def test_operation_stages_recorded_as_deferred(catalog):

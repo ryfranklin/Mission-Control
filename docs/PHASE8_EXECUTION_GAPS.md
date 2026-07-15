@@ -83,10 +83,27 @@ Chosen and built:
    counting as done.
 - Secrets: burns forbidden from writing secret-shaped values (prevents the guard dead-end).
 
+## CAPCOM — the build coordinator (resolves the partial-inputs gap)
+
+`CAPCOM` (`roles.COORDINATOR`; Capsule Communicator) is MC's coordinator over the whole
+build — it produces the full artifact chain in dependency order and won't deploy a stage
+onto missing inputs:
+
+- **Inception stages now PRODUCE.** `build_units` covers `inception → construction →
+  operation` (initialization/ideation stay the walk's intent). Inception writes
+  `requirements` / `application-design` / `unit-of-work`; construction consumes them — so
+  a downstream stage always has real inputs on disk, not a guess.
+- **Verification gate ("hold the fleet").** After each producing stage, CAPCOM checks its
+  artifacts actually landed. A stage that succeeds but writes NOTHING is set `blocked`
+  (not `done`) with a `<slug>:no-output` requirement, and its dependents are HELD — the
+  code fleet never deploys onto missing inputs.
+- **Gate code stages only.** Design/doc/inception stages write + auto-apply; the human
+  go/no-go is reserved for the code-writing stages.
+
 ## Still deferred (follow-ups)
-- **Full INCEPTION artifact production.** Construction stages currently read
-  `requirements.md` + the design artifacts the design stages now produce; the richer
-  inception artifacts (unit-of-work, application-design, components) are not yet produced
-  as files, so construction has partial (not complete) upstream inputs.
-- **Auto-re-run / re-questionnaire loop.** Verification currently FLAGS a no-output stage;
-  it does not yet automatically re-run it with adjusted inputs.
+- **Interactive agreement loop.** CAPCOM currently HOLDS + surfaces a stage that produced
+  nothing (operator acts); it does not yet run an interactive re-questionnaire with the
+  project's agent to auto-resolve and re-run a held stage.
+- **Cosmetic:** an inception stage appears twice in the plan — once as a walk record
+  (`INCEPTION`, done) and once as a producing build unit (`inception`). Functionally
+  correct; a UI/plan-model cleanup is pending.

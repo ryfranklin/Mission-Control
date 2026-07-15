@@ -39,6 +39,7 @@ from .. import aidlc, plan_docs, repo_source, roles, worktree
 from ..plans_store import (
     STATUS_BUILDING,
     STATUS_DONE,
+    UNIT_BLOCKED,
     UNIT_DEFERRED,
     UNIT_DONE,
     PlanStore,
@@ -153,29 +154,38 @@ class PlanBuilder:
         run = self._runs.get_run(run_id)
         if run is not None and run.plan_unit_seq is not None:
             if run.status in _SUCCESS:
-                self._verify_output(plan_id, run.plan_unit_seq, run)
-                self._mark_unit_done(plan_id, run.plan_unit_seq)
+                # CAPCOM's verification gate: mark the unit done ONLY if it actually
+                # produced its artifacts; a produced-nothing stage is blocked instead, so
+                # its dependents are never deployed onto missing inputs.
+                if self._verify_output(plan_id, run.plan_unit_seq, run):
+                    self._mark_unit_done(plan_id, run.plan_unit_seq)
             elif run.status == STATUS_SCRUBBED:  # a NO-GO at the gate
                 self._request_changes(plan_id, run.plan_unit_seq,
                                       getattr(run, "detail", None))
         self._advance(plan_id)
 
-    def _verify_output(self, plan_id: str, seq: int, run) -> None:
-        """The 'lead agent' completeness check: a producing v2 stage that succeeded but
-        WROTE NOTHING almost certainly ran without its inputs (the failure mode from a
-        broken pipeline). Flag it with a ``<slug>:no-output`` requirement so a
-        "succeeded" stage that produced no artifacts is VISIBLE rather than silently
-        counted as done. (Auto-re-run of a flagged stage is a follow-up.)"""
+    def _verify_output(self, plan_id: str, seq: int, run) -> bool:
+        """CAPCOM's completeness check: did this stage actually produce its artifacts?
+
+        Returns True (proceed → mark done) when the stage wrote files or isn't a v2 stage
+        unit. Returns False when a producing v2 stage SUCCEEDED but WROTE NOTHING — it
+        almost certainly ran without its inputs; CAPCOM then BLOCKS it (its dependents are
+        held) and records a ``<slug>:no-output`` requirement so the gap is visible rather
+        than silently counted done."""
         unit = next((u for u in self._plans.list_units(plan_id) if u.seq == seq), None)
         if unit is None or not getattr(unit, "stage_slug", None):
-            return  # only v2 stage units are verified against their produces:
+            return True  # not a v2 stage unit → nothing to verify
         if getattr(run, "changes_json", None):
-            return  # it wrote files → produced something
+            return True  # it wrote files → produced something
+        self._plans.set_unit_status(plan_id, seq, UNIT_BLOCKED)
         self._plans.upsert_requirement(
             plan_id, f"{unit.stage_slug}:no-output",
-            value="stage completed but wrote no artifacts — likely missing inputs; "
-                  "review before relying on downstream stages",
+            value="stage produced no artifacts — held by CAPCOM; its dependents will "
+                  "not run until this stage's outputs are created",
             state=aidlc.REQ_OPEN)
+        if self._docs_sync is not None:
+            self._docs_sync(plan_id)
+        return False
 
     def _request_changes(self, plan_id: str, seq: int, feedback: Optional[str]) -> None:
         """Record a NO-GO'd stage's gate feedback as a 'request changes' — the v2
@@ -232,16 +242,27 @@ class PlanBuilder:
         # THIS session (so we don't re-dispatch an in-flight unit or one that will never
         # finish). done_seqs comes from git-reconciled status, not from local runs.
         by_seq = {r.plan_unit_seq: r for r in self._runs.child_runs(plan_id)}
+        # CAPCOM held these — ran but produced nothing. Treated like dead (dependents held,
+        # never dispatched, counts as resolved) and NEVER healed to done, even though its
+        # run "succeeded", because it failed the artifact check.
+        blocked = {u.seq for u in units if u.status == UNIT_BLOCKED}
         done: set = set()
         for unit in units:
             if unit.status == UNIT_DONE:
                 done.add(unit.seq)
+            elif unit.seq in blocked:
+                continue  # produced nothing → not done, not healed
             elif (r := by_seq.get(unit.seq)) is not None and r.status in _SUCCESS:
                 # A successful run whose done-mark was lost (crash between the run and the
-                # status write): heal it — mark done + push. Idempotent on re-entry.
-                self._mark_unit_done(plan_id, unit.seq)
-                done.add(unit.seq)
-        dead = self._dead_seqs(units, by_seq)  # own run failed, or a dep is dead
+                # status write): heal it — verify output, then mark done + push. A
+                # produced-nothing run is blocked here, not healed. Idempotent on re-entry.
+                if self._verify_output(plan_id, unit.seq, r):
+                    self._mark_unit_done(plan_id, unit.seq)
+                    done.add(unit.seq)
+                else:
+                    blocked.add(unit.seq)
+        # own run failed / dep dead / CAPCOM-held (incl. this pass) → dependents held too
+        dead = self._dead_seqs(units, by_seq, extra_dead=blocked)
         # Deferred units (AI-DLC v2 ``operation`` stages) are RECORDED in the plan but
         # never dispatched in v1 (they need cloud creds). They count as resolved so the
         # plan can still complete; they are never launched and never block a dependent.
@@ -250,7 +271,7 @@ class PlanBuilder:
         for unit in units:  # units come back in seq order
             if unit.seq in done or unit.seq in by_seq or unit.seq in dead \
                     or unit.seq in deferred:
-                continue  # done / dispatched / dead / deferred-never-dispatched
+                continue  # done / dispatched / dead / held / deferred-never-dispatched
             if not all(dep in done for dep in (unit.depends_on or [])):
                 continue  # a dependency isn't done yet → not (yet) dispatchable
             self._dispatch(plan_id, target, unit)
@@ -287,12 +308,17 @@ class PlanBuilder:
         return all(u.seq in done or u.seq in dead for u in units)
 
     @staticmethod
-    def _dead_seqs(units, by_seq) -> set:
+    def _dead_seqs(units, by_seq, extra_dead=frozenset()) -> set:
         """Units that will never reach ``done``: seeded by a unit whose OWN run failed
-        this session (a no-go/scrubbed/failed/push-rejected run), then propagated to
-        every dependent. (A committed-``done`` unit is never dead — its run succeeded.)"""
-        dead: set = {u.seq for u in units
-                     if (r := by_seq.get(u.seq)) is not None and r.status in _FAILED}
+        this session (a no-go/scrubbed/failed/push-rejected run), a unit CAPCOM blocked
+        for producing nothing (committed ``blocked`` status, or freshly blocked this pass
+        via ``extra_dead``), then propagated to every dependent. (A committed-``done``
+        unit is never dead — its run succeeded and produced.)"""
+        dead: set = set(extra_dead) | {
+            u.seq for u in units
+            if u.status == UNIT_BLOCKED
+            or ((r := by_seq.get(u.seq)) is not None and r.status in _FAILED)
+        }
         changed = True
         while changed:
             changed = False

@@ -51,6 +51,10 @@ UNIT_DONE = "done"
 # ``operation`` stage — deferred in v1, needs cloud creds). It travels in the plan and
 # counts as resolved for plan completion, but the builder never launches it.
 UNIT_DEFERRED = "deferred"
+# A stage that ran but produced none of its artifacts — CAPCOM's verification failed it.
+# Its dependents are held (never deployed onto missing inputs); surfaced for the operator
+# rather than silently counted done. Resolved for plan completion (it won't re-run here).
+UNIT_BLOCKED = "blocked"
 
 # One statement per entry: the autocommit pool prepares statements, which forbids
 # multiple commands in a single execute() (same constraint as the runs ledger).

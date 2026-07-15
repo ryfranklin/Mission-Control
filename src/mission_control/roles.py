@@ -16,3 +16,8 @@ NO_GO = "no-go"                  # approval / merge gate: reject
 SCRUB = "scrub"                  # kill a task (and tear it down)
 PLAN = "Flight Plan"             # a plan (the planner's durable, hand-off-able output)
 PLANNER = "Flight Planner"       # the planner persona in the interactive session
+# The build coordinator: drives stages in dependency order, verifies each stage's
+# artifacts actually landed, and gates the next on the previous being complete — so the
+# worker fleet never deploys onto missing inputs. Named for the Capsule Communicator,
+# Mission Control's single voice to the crew.
+COORDINATOR = "CAPCOM"
