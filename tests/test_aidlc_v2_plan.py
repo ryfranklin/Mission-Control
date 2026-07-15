@@ -137,6 +137,26 @@ def test_readiness_needs_all_plan_stages_and_a_worklist(catalog):
     assert is_ready(r2)
 
 
+def test_missing_inputs_diagnoses_absent_consumed_artifacts(catalog, tmp_path):
+    """CAPCOM's diagnosis: which of a stage's consumed artifacts are absent on disk."""
+    record = tmp_path / "aidlc-docs"
+    (record / "inception").mkdir(parents=True)
+    # code-generation consumes requirements + unit-of-work (+ designs). Put SOME on disk.
+    (record / "inception" / "requirements.md").write_text("# reqs\n")
+    (record / "inception" / "unit-of-work.md").write_text("# units\n")
+
+    missing = v2plan.missing_inputs(catalog, "code-generation", record)
+    # present ones are not reported; absent design artifacts are
+    assert "requirements" not in missing
+    assert "unit-of-work" not in missing
+    assert "business-logic-model" in missing        # not written yet → diagnosed missing
+
+    # with nothing on disk, every consumed artifact is missing
+    empty = v2plan.missing_inputs(catalog, "code-generation", tmp_path / "nope")
+    consumed = {c.artifact for c in next(s for s in catalog if s.slug == "code-generation").consumes}
+    assert set(empty) == consumed
+
+
 def test_readiness_flags_malformed_units(catalog):
     plan_slugs = {s.slug for s in v2plan.plan_stages(catalog, mode=MODE)}
     bad = [_FakeUnit("", "construction", "nonsense", [])]  # no slug, bad task_type

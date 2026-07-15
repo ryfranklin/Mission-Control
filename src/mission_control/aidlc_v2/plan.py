@@ -17,6 +17,7 @@ mapping into MC's plan units / readiness lives here.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from ..aidlc import ReadinessCriterion
 from ..roles import BURN, SIM
@@ -154,6 +155,19 @@ def readiness(
     crits.append(ReadinessCriterion(
         "units", "Work-list is ready", bool(build) and not malformed, detail))
     return crits
+
+
+def missing_inputs(catalog, stage_slug: str, record_root) -> list[str]:
+    """The artifacts a stage ``consumes:`` that are NOT present on disk under
+    ``record_root`` (the target's ``aidlc-docs/``) — CAPCOM's diagnosis of *why* a stage
+    likely produced nothing. Presence is checked by filename stem (an artifact
+    ``unit-of-work`` is present iff some ``unit-of-work.md`` exists in the tree)."""
+    stage = next((s for s in catalog if s.slug == stage_slug), None)
+    if stage is None:
+        return []
+    root = Path(record_root)
+    present = {p.stem for p in root.rglob("*.md")} if root.is_dir() else set()
+    return [c.artifact for c in stage.consumes if c.artifact not in present]
 
 
 def stage_question(stage: StageSpec) -> str:

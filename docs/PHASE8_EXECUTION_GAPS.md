@@ -112,7 +112,18 @@ onto missing inputs:
   (intent gathering); inception onward is produced by CAPCOM at build. Walk phases and
   build-unit phases are disjoint, so a stage appears exactly once in the plan.
 
+## Diagnostic re-run (closed)
+
+The re-run is no longer a blind nudge. When a stage produces nothing, CAPCOM inspects
+which of the stage's `consumes:` artifacts are actually absent from the target's
+`aidlc-docs/` (`plan.missing_inputs`) and re-dispatches with a **diagnosis** — it names
+the missing inputs and tells the worker to proceed on what's present (and note what
+isn't). If the stage is ultimately held, the `<slug>:no-output` requirement records the
+diagnosed missing inputs, so *why* it's held is visible, not just *that* it is.
+
 ## Remaining (smaller)
-- The re-run's escalation is prompt-only ("you wrote nothing; create the files"); a
-  richer back-and-forth with the project's agent to diagnose *why* inputs were missing is
-  a future refinement.
+- Presence is checked heuristically by filename stem (`unit-of-work` ⇒ `unit-of-work.md`);
+  a producer emitting an artifact under a different filename could read as missing.
+- A true multi-turn negotiation (CAPCOM ↔ the producing stage to regenerate a missing
+  upstream artifact automatically) is still future; today CAPCOM diagnoses + re-runs the
+  consumer, and holds with the reason if inputs truly can't be produced.

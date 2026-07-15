@@ -65,14 +65,28 @@ _FAILED = frozenset({STATUS_SCRUBBED, STATUS_FAILED, STATUS_PUSH_REJECTED, STATU
 # stage can't loop forever (the operator's "no unnecessary loops"). Overridable per run.
 MAX_STAGE_ATTEMPTS = int(os.environ.get("MC_STAGE_MAX_ATTEMPTS", "2"))
 
-# Appended to a retry's prompt — the "interact to resolve" nudge: the previous attempt
-# produced nothing, so the worker MUST create the artifacts this time.
+# Appended to a retry's prompt when CAPCOM can't diagnose a specific missing input.
 _RETRY_NOTE = (
     "\n\nCAPCOM RETRY — your previous attempt at this stage wrote NO files. You MUST "
     "actually create this stage's artifacts on disk now (write the files; do not merely "
     "describe them or report that inputs are missing). Use the inputs already present in "
     "the working directory."
 )
+
+
+def _escalation_note(missing: list) -> str:
+    """CAPCOM's diagnostic re-run instruction. When specific consumed inputs are absent
+    on disk, name them so the worker adapts (proceed on what's present, note what's not);
+    otherwise fall back to the generic retry nudge."""
+    if not missing:
+        return _RETRY_NOTE
+    return (
+        "\n\nCAPCOM DIAGNOSIS — your previous attempt wrote NO files. These inputs you "
+        "consume are NOT present on disk: " + ", ".join(missing) + ". Proceed using the "
+        "inputs that ARE available and produce your artifacts from those. If a missing "
+        "input is strictly required, still write your best-effort output and note exactly "
+        "what was missing at the top of the file. You MUST write your files this time."
+    )
 
 
 class PlanBuilder:
@@ -193,31 +207,49 @@ class PlanBuilder:
         return bool(getattr(run, "changes_json", None))
 
     def _handle_no_output(self, plan_id: str, seq: int) -> None:
-        """CAPCOM's re-run loop: a producing stage wrote nothing. Re-dispatch it (with an
-        escalated 'you MUST write the files' note) up to :data:`MAX_STAGE_ATTEMPTS`
-        total; if it still produces nothing, HOLD it (blocked) and surface it."""
+        """CAPCOM's re-run loop: a producing stage wrote nothing. Diagnose WHICH consumed
+        inputs are missing on disk, and re-dispatch with that diagnosis (name the missing
+        inputs) up to :data:`MAX_STAGE_ATTEMPTS`; if it still produces nothing, HOLD it
+        (blocked) and surface the diagnosis."""
         unit = self._unit(plan_id, seq)
         if unit is None or not getattr(unit, "stage_slug", None):
             return
         plan = self._plans.get_plan(plan_id)
         target = plan.working_path if plan else None
+        missing = self._missing_inputs(target, unit.stage_slug)
         if unit.attempts < MAX_STAGE_ATTEMPTS and _is_git_repo(target):
+            detail = ("re-running; inputs missing on disk: " + ", ".join(missing)) \
+                if missing else "re-running (attempt produced nothing)"
             self._plans.upsert_requirement(
-                plan_id, f"{unit.stage_slug}:retry",
-                value=f"attempt {unit.attempts} produced no artifacts — CAPCOM re-running",
-                state=aidlc.REQ_OPEN)
-            self._dispatch(plan_id, target, unit)  # bumps attempts + appends the retry note
+                plan_id, f"{unit.stage_slug}:retry", value=detail, state=aidlc.REQ_OPEN)
+            self._dispatch(plan_id, target, unit, note=_escalation_note(missing))
         else:
-            self._hold(plan_id, unit)
+            self._hold(plan_id, unit, missing)
 
-    def _hold(self, plan_id: str, unit) -> None:
+    def _missing_inputs(self, target, stage_slug: str) -> list:
+        """Which of the stage's consumed artifacts are absent from the target's
+        aidlc-docs — CAPCOM's diagnosis. Empty when the target has no v2 catalog."""
+        if not target:
+            return []
+        steering = aidlc.probe(Path(target))
+        if steering is None or steering.flavor != aidlc.FLAVOR_AIDLC_V2 \
+                or steering.catalog_root is None:
+            return []
+        from ..aidlc_v2 import catalog as v2catalog
+        from ..aidlc_v2 import plan as v2plan
+        catalog = v2catalog.load_catalog(steering.catalog_root)
+        return v2plan.missing_inputs(catalog, stage_slug, Path(target) / "aidlc-docs")
+
+    def _hold(self, plan_id: str, unit, missing=()) -> None:
         """Block a stage that produced nothing after its retries — dependents are held
-        (never deployed onto missing inputs) and the gap is surfaced, not silently done."""
+        (never deployed onto missing inputs) and the gap (incl. the diagnosed missing
+        inputs) is surfaced, not silently done."""
+        why = (" (missing inputs: " + ", ".join(missing) + ")") if missing else ""
         self._plans.set_unit_status(plan_id, unit.seq, UNIT_BLOCKED)
         self._plans.upsert_requirement(
             plan_id, f"{unit.stage_slug}:no-output",
-            value=f"stage produced no artifacts after {unit.attempts} attempt(s) — held "
-                  "by CAPCOM; its dependents will not run until its outputs are created",
+            value=f"stage produced no artifacts after {unit.attempts} attempt(s){why} — "
+                  "held by CAPCOM; its dependents will not run until its outputs exist",
             state=aidlc.REQ_OPEN)
         if self._docs_sync is not None:
             self._docs_sync(plan_id)
@@ -317,12 +349,12 @@ class PlanBuilder:
         if self._all_resolved(units, done | deferred, dead):
             self._plans.set_status(plan_id, STATUS_DONE)
 
-    def _dispatch(self, plan_id: str, target: str, unit) -> None:
+    def _dispatch(self, plan_id: str, target: str, unit, note: str = "") -> None:
         plan = self._plans.get_plan(plan_id)
-        # Count this dispatch (the re-run cap reads it); a retry (attempt > 1) carries an
-        # escalated note telling the worker its last attempt wrote nothing.
-        attempt = self._plans.bump_unit_attempts(plan_id, unit.seq)
-        prompt = _prompt_for(unit) + (_RETRY_NOTE if attempt > 1 else "")
+        # Count this dispatch (the re-run cap reads it). A retry passes CAPCOM's
+        # diagnostic ``note`` (which inputs were missing); the first dispatch passes none.
+        self._plans.bump_unit_attempts(plan_id, unit.seq)
+        prompt = _prompt_for(unit) + note
         self._runs.launch(
             target=target, task_type=unit.task_type, prompt=prompt,
             plan_id=plan_id, plan_unit_seq=unit.seq,
