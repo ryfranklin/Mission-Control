@@ -94,6 +94,12 @@ def compose_stage_prompt(stage: StageSpec, catalog_root: Path) -> str:
             "NOT stop at documentation, and do NOT confine your output to `aidlc-docs/`.",
             f"- ALSO record this stage's declared artifacts ({produces}) — the plan / "
             "summary docs — under `aidlc-docs/` (or the location the protocol names).",
+            "- NEVER write real or realistic secrets/credentials into any file — no "
+            "passwords, API keys, tokens, or `scheme://user:password@host` connection "
+            "strings, not even as examples. Use obvious placeholders "
+            "(`<DB_PASSWORD>`, `${API_KEY}`, `changeme`) and reference secrets by name "
+            "only. Mission Control's egress guard BLOCKS any commit that contains a "
+            "secret-shaped value, which fails the whole stage.",
         ]
     else:  # sim (and any read-only stage): analysis/design only, never mutate code
         output_rules = [

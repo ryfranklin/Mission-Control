@@ -78,6 +78,9 @@ def test_burn_stage_instructs_writing_real_code_not_only_docs(catalog):
     # it must NOT be caged into docs-only output (the bug we fixed)
     assert "produce nothing else" not in prompt
     assert "confine your output to `aidlc-docs/`" in prompt
+    # ...and it must forbid secret-shaped values (the egress guard blocks them otherwise)
+    assert "NEVER write real or realistic secrets" in prompt
+    assert "placeholders" in prompt
 
 
 def test_sim_stage_stays_read_only_docs_only(catalog):
