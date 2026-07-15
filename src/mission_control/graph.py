@@ -76,6 +76,7 @@ class RunState(TypedDict, total=False):
     task_type: str  # roles.SIM / roles.BURN
     prompt: str
     greenfield: bool
+    gated: bool  # side-effectful task pauses at go/no-go (False → writable-but-ungated)
     stage_slug: str  # optional AI-DLC v2 stage this run executes (steers the worker)
     workstream: str  # optional workstream name → the mc/ws/<name> branch this run builds on
     allow_secrets: bool  # explicit operator override of the egress content guard (audited)
@@ -124,6 +125,7 @@ def _task(state: RunState) -> Task:
         task_type=_TASK_TYPE_BY_VALUE[state["task_type"]],
         prompt=state["prompt"],
         greenfield=state.get("greenfield", False),
+        gated=state.get("gated", True),
         stage_slug=state.get("stage_slug"),
     )
 
@@ -260,15 +262,21 @@ def _record_failure_cost(deps: _Deps, state: RunState, steps) -> None:
 
 
 def _gate(deps: _Deps, state: RunState) -> dict:
-    """Durable go/no-go (``roles.GO`` / ``roles.NO_GO``). Read-only sims never gate.
+    """Durable go/no-go (``roles.GO`` / ``roles.NO_GO``). Read-only sims never gate, and
+    a writable-but-ungated stage (``gated=False``) auto-approves without halting.
 
-    For a burn this calls LangGraph ``interrupt()``: the graph HALTS here (before
+    For a gated burn this calls LangGraph ``interrupt()``: the graph HALTS here (before
     apply_burn), persists to the checkpointer, and waits for a human decision
     supplied on resume via ``Command(resume=...)``. Anything that isn't an explicit
-    go is treated as no-go — a burn is never applied without an approval on record.
+    go is treated as no-go — a gated burn is never applied without an approval on record.
     """
     if state["task_type"] != roles.BURN:
         return {"decision": None}
+    if not state.get("gated", True):
+        # Writable-but-ungated (a v2 design/doc stage): it produced artifacts and is
+        # low-risk, so auto-approve — apply + push without halting for a human. The
+        # human go/no-go is reserved for code-writing stages (gated=True).
+        return {"decision": roles.GO}
     store, run_id = _ledger(deps, state)
     if store is not None:  # about to halt for a human — reflect that in the ledger
         store.mark_awaiting_gate(run_id)
@@ -648,6 +656,8 @@ def initial_state(task: Task, *, run_id: Optional[str] = None) -> RunState:
         state["workstream"] = task.workstream
     if task.stage_slug:
         state["stage_slug"] = task.stage_slug
+    if not task.gated:  # writable-but-ungated stage (auto-applies, no human gate)
+        state["gated"] = False
     if task.allow_secrets:
         state["allow_secrets"] = True
     if run_id is not None:

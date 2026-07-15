@@ -68,6 +68,22 @@ def test_burn_pauses_at_gate_then_go_applies(target_repo):
     assert len(list_worktrees(target_repo)) == 1
 
 
+def test_ungated_writable_stage_auto_applies_without_gate(target_repo):
+    """A writable-but-ungated stage (gated=False) — a v2 design/doc stage — writes its
+    output and AUTO-APPLIES: it never halts at the gate, yet the change still lands."""
+    graph = build_run_graph(target_repo, worker=StubWorker())
+    final = run_via_graph(
+        graph,
+        Task("write-1", TaskType.SIDE_EFFECTFUL, "produce docs", gated=False),
+        thread_id="write-1",
+    )
+    assert not awaiting_gate(graph, "write-1")            # never paused for a human
+    assert final["decision"] == roles.GO                  # auto-approved
+    assert final["applied"] is True
+    assert STUB_BURN_FILE in _tracked(target_repo)        # its output landed
+    assert len(list_worktrees(target_repo)) == 1          # no leak
+
+
 def test_burn_nogo_scrubs_clean(target_repo):
     graph = build_run_graph(target_repo, worker=StubWorker())
     before = _head(target_repo)

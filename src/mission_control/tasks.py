@@ -49,3 +49,9 @@ class Task:
     # steers from that stage's definition + lead-agent knowledge (see aidlc_v2.steering)
     # instead of the generic prompt. None → a built-in / non-stage run.
     stage_slug: Optional[str] = None
+    # Whether a side-effectful task pauses at the go/no-go gate for a human decision.
+    # Default True (a burn is gated). A v2 design/doc stage that WRITES artifacts but is
+    # low-risk runs with gated=False → it auto-applies (writable-but-ungated), reserving
+    # the human gate for code-writing stages. Ignored for read-only tasks (they never
+    # reach the gate).
+    gated: bool = True
