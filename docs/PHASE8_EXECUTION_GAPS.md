@@ -62,8 +62,31 @@ So Approach A needs a **third execution mode: "writable but ungated"** for doc/d
 stages, reserving the go/no-go gate for code-writing stages. That is a change to the
 gate/safety model and needs sign-off before implementation.
 
-## Done so far
-- Burns forbidden from writing secret-shaped values (steering) — prevents the guard
-  dead-end.
-- Code-writing burns now instructed to write real source, not only docs (`stage.kind`
-  branch in `compose_stage_prompt`).
+## Resolution — Approach A implemented (gate code stages only)
+
+Chosen and built:
+1. **Gate decoupled from write-capability.** A stage can WRITE and AUTO-APPLY without a
+   human GO (`Task.gated` → RunState → the gate node auto-approves when `gated=False`).
+2. **Every producing stage writes; only code stages gate.** `catalog.gates()` (an MC-owned
+   set: `code-generation`, `build-and-test`, `ci-pipeline`) decides. `build_units` emits
+   all producing stages as writable (`BURN`) units; design/doc/IaC stages are ungated
+   (write + auto-apply), code stages are human-gated. `plan_units.gated` persists it and
+   it round-trips through `flight-plan.yaml`.
+3. **Producing steering.** `compose_stage_prompt` branches on `gates()`: a design/doc
+   stage is told to WRITE its artifacts under `aidlc-docs/` ("actually create the files")
+   and not touch source; a code stage writes real source (and no secrets).
+4. **INCEPTION stages stop running as blind read-only sims.** v2 plan-stage units are laid
+   down `done` (planning records), so the builder no longer re-dispatches 17 read-only
+   sims that produced nothing.
+5. **Verification ("lead agent", v1).** A producing stage that SUCCEEDS but writes no
+   artifacts is flagged with a `<slug>:no-output` requirement instead of silently
+   counting as done.
+- Secrets: burns forbidden from writing secret-shaped values (prevents the guard dead-end).
+
+## Still deferred (follow-ups)
+- **Full INCEPTION artifact production.** Construction stages currently read
+  `requirements.md` + the design artifacts the design stages now produce; the richer
+  inception artifacts (unit-of-work, application-design, components) are not yet produced
+  as files, so construction has partial (not complete) upstream inputs.
+- **Auto-re-run / re-questionnaire loop.** Verification currently FLAGS a no-output stage;
+  it does not yet automatically re-run it with adjusted inputs.

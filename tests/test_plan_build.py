@@ -22,7 +22,7 @@ from mission_control.graph import (
     postgres_checkpointer,
 )
 from mission_control import plans_store as ps
-from mission_control.runs_store import STATUS_DONE, STATUS_SCRUBBED
+from mission_control.runs_store import STATUS_APPLIED, STATUS_DONE, STATUS_SCRUBBED
 from mission_control.service import PlanBuilder, PlanManager, RunManager, create_app
 
 STUB_BURN_FILE = "STUB_BURN.txt"
@@ -240,6 +240,40 @@ def test_plan_of_only_deferred_units_completes(plan_store_pg, target_repo, tmp_p
     builder._advance(pid)
     assert runs.launched == []                              # nothing dispatched
     assert store.get_plan(pid).status == ps.STATUS_DONE     # deferred counts as resolved
+
+
+def test_producing_stage_that_writes_nothing_is_flagged(plan_store_pg, target_repo, tmp_path):
+    """The verification step: a producing v2 stage that SUCCEEDS but writes no artifacts
+    (changes_json empty) is flagged with a `<slug>:no-output` requirement instead of
+    silently counting as done."""
+    store = plan_store_pg
+
+    class _Runs:
+        def __init__(self):
+            self.run = None
+
+        def child_runs(self, plan_id):
+            return [self.run] if self.run else []
+
+        def get_run(self, run_id):
+            return self.run
+
+        def launch(self, **kwargs):
+            pass
+
+    runs = _Runs()
+    builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
+                          cache_root=tmp_path / "cache", docs_sync=None)
+    pid = _open_building(store, target_repo, [
+        (0, "construction", roles.BURN, ps.UNIT_PENDING, "functional-design", []),
+    ])
+    # a SUCCESSFUL run that produced NO files (changes_json None)
+    runs.run = SimpleNamespace(run_id="run-0", plan_unit_seq=0,
+                               status=STATUS_APPLIED, changes_json=None)
+    builder.on_run_terminal("run-0", pid)
+
+    reqs = {r.key for r in store.list_requirements(pid)}
+    assert "functional-design:no-output" in reqs             # flagged, not silent
 
 
 def test_no_go_records_request_changes_and_leaves_stage_incomplete(plan_store_pg,

@@ -83,15 +83,19 @@ def test_burn_stage_instructs_writing_real_code_not_only_docs(catalog):
     assert "placeholders" in prompt
 
 
-def test_sim_stage_stays_read_only_docs_only(catalog):
-    """A sim (design) stage stays read-only: it documents under aidlc-docs/ and must
-    not be told to write project source."""
+def test_design_stage_writes_docs_but_not_source(catalog):
+    """A design/doc stage (ungated) is told to WRITE its artifacts under aidlc-docs/ —
+    it is a producer, not a read-only validator — but must not touch application source
+    (that's the code stages' gated job)."""
     root = v2catalog.default_methodology_root()
     stage = _stage(catalog, "functional-design")
-    assert stage.kind == "sim"
+    assert not v2catalog.gates(stage.slug)                   # ungated design stage
     prompt = v2steering.compose_stage_prompt(stage, root)
-    assert "READ-ONLY analysis stage" in prompt
-    assert "do NOT modify project source" in prompt
+    assert "DESIGN/DOC stage" in prompt
+    assert "WRITE your artifacts" in prompt
+    assert "Actually create the files" in prompt
+    assert "do not modify application SOURCE" in prompt.lower() \
+        or "Do NOT modify application SOURCE" in prompt
     assert "CODE/CHANGE stage" not in prompt
 
 

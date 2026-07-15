@@ -153,11 +153,29 @@ class PlanBuilder:
         run = self._runs.get_run(run_id)
         if run is not None and run.plan_unit_seq is not None:
             if run.status in _SUCCESS:
+                self._verify_output(plan_id, run.plan_unit_seq, run)
                 self._mark_unit_done(plan_id, run.plan_unit_seq)
             elif run.status == STATUS_SCRUBBED:  # a NO-GO at the gate
                 self._request_changes(plan_id, run.plan_unit_seq,
                                       getattr(run, "detail", None))
         self._advance(plan_id)
+
+    def _verify_output(self, plan_id: str, seq: int, run) -> None:
+        """The 'lead agent' completeness check: a producing v2 stage that succeeded but
+        WROTE NOTHING almost certainly ran without its inputs (the failure mode from a
+        broken pipeline). Flag it with a ``<slug>:no-output`` requirement so a
+        "succeeded" stage that produced no artifacts is VISIBLE rather than silently
+        counted as done. (Auto-re-run of a flagged stage is a follow-up.)"""
+        unit = next((u for u in self._plans.list_units(plan_id) if u.seq == seq), None)
+        if unit is None or not getattr(unit, "stage_slug", None):
+            return  # only v2 stage units are verified against their produces:
+        if getattr(run, "changes_json", None):
+            return  # it wrote files → produced something
+        self._plans.upsert_requirement(
+            plan_id, f"{unit.stage_slug}:no-output",
+            value="stage completed but wrote no artifacts — likely missing inputs; "
+                  "review before relying on downstream stages",
+            state=aidlc.REQ_OPEN)
 
     def _request_changes(self, plan_id: str, seq: int, feedback: Optional[str]) -> None:
         """Record a NO-GO'd stage's gate feedback as a 'request changes' — the v2
@@ -254,6 +272,9 @@ class PlanBuilder:
             # The unit title is the run's subject — shown while it dispatches so the
             # operator sees WHAT is running, not a blank card, for the minutes it takes.
             subject=unit.title,
+            # A design/doc stage writes + auto-applies (gated=False); a code stage halts
+            # for a human GO (gated=True). Non-v2 units default to gated.
+            gated=getattr(unit, "gated", True),
         )
 
     # -- dependency logic --------------------------------------------------

@@ -198,11 +198,14 @@ def test_v2_target_derives_units_from_catalog(plan_env, target_repo):
     # Every build unit identifies its source stage.
     assert all(u.stage_slug for u in build)
 
-    # sim/burn types follow the catalog kind, not the phase.
-    for slug in ("code-generation", "build-and-test", "ci-pipeline", "infrastructure-design"):
-        assert by_slug[slug].task_type == roles.BURN
-    for slug in ("functional-design", "nfr-requirements", "nfr-design"):
-        assert by_slug[slug].task_type == roles.SIM
+    # Every producing unit WRITES its artifacts (all BURN). What differs is the gate:
+    # code-writing stages halt for a human GO; design/doc stages write + auto-apply.
+    assert all(u.task_type == roles.BURN for u in build if u.status != ps.UNIT_DEFERRED)
+    for slug in ("code-generation", "build-and-test", "ci-pipeline"):
+        assert by_slug[slug].gated is True                       # code → human gate
+    for slug in ("functional-design", "nfr-requirements", "nfr-design",
+                 "infrastructure-design"):
+        assert by_slug[slug].gated is False                      # design/doc → auto-apply
 
     # operation stages are recorded but DEFERRED (never dispatched in v1).
     op = [u for u in build if u.phase == "operation"]

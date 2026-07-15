@@ -128,6 +128,10 @@ _DDL = (
     # The v2 stage this unit was derived from (its catalog slug), so a worker can find
     # the right stage file. NULL for built-in (v1) plans — backward-compatible.
     "ALTER TABLE plan_units ADD COLUMN IF NOT EXISTS stage_slug TEXT",
+    # Whether this unit halts for a human go/no-go (a code-writing v2 stage) vs. writes
+    # and auto-applies (a design/doc stage). Default true = the historical behavior (a
+    # side-effectful unit gates). Backward-compatible.
+    "ALTER TABLE plan_units ADD COLUMN IF NOT EXISTS gated BOOLEAN NOT NULL DEFAULT true",
 )
 
 
@@ -203,6 +207,9 @@ class PlanUnit:
     # The v2 catalog stage this unit derives from (None for built-in/v1 plans).
     # Defaulted so PlanUnit(**row) works for rows created before this column.
     stage_slug: Optional[str] = None
+    # Whether a side-effectful unit halts for a human go/no-go (code stage) or writes +
+    # auto-applies (design/doc stage). Defaulted (gates) for rows / mocks predating it.
+    gated: bool = True
 
 
 # Columns whose non-None values narrow a list_plans() query.
@@ -414,6 +421,7 @@ class PlanStore:
         status: str = UNIT_PENDING,
         task_type: Optional[str] = None,
         stage_slug: Optional[str] = None,
+        gated: bool = True,
     ) -> PlanUnit:
         """Record or update one work-list unit, keyed by (plan_id, seq). Idempotent at
         the stage boundary that lays the work-list down.
@@ -433,21 +441,22 @@ class PlanStore:
             cur = conn.cursor(row_factory=dict_row)
             cur.execute(
                 """
-                INSERT INTO plan_units (plan_id, seq, title, phase, task_type, depends_on, status, stage_slug)
-                VALUES (%(pid)s, %(seq)s, %(title)s, %(phase)s, %(tt)s, %(deps)s, %(status)s, %(slug)s)
+                INSERT INTO plan_units (plan_id, seq, title, phase, task_type, depends_on, status, stage_slug, gated)
+                VALUES (%(pid)s, %(seq)s, %(title)s, %(phase)s, %(tt)s, %(deps)s, %(status)s, %(slug)s, %(gated)s)
                 ON CONFLICT (plan_id, seq) DO UPDATE SET
                     title      = EXCLUDED.title,
                     phase      = EXCLUDED.phase,
                     task_type  = EXCLUDED.task_type,
                     depends_on = EXCLUDED.depends_on,
                     status     = EXCLUDED.status,
-                    stage_slug = EXCLUDED.stage_slug
-                RETURNING plan_id, seq, title, phase, task_type, depends_on, status, created_at, stage_slug
+                    stage_slug = EXCLUDED.stage_slug,
+                    gated      = EXCLUDED.gated
+                RETURNING plan_id, seq, title, phase, task_type, depends_on, status, created_at, stage_slug, gated
                 """,
                 {
                     "pid": plan_id, "seq": seq, "title": title, "phase": phase_str,
                     "tt": task_type, "deps": Jsonb(deps), "status": status,
-                    "slug": stage_slug,
+                    "slug": stage_slug, "gated": gated,
                 },
             )
             row = cur.fetchone()

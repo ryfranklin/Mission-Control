@@ -40,6 +40,7 @@ from ..plans_store import (
     ROLE_PLANNER,
     STATUS_READY,
     UNIT_DEFERRED,
+    UNIT_DONE,
     UNIT_PENDING,
     PlanRow,
     PlanStore,
@@ -571,8 +572,10 @@ class PlannerEngine:
             yield from self._finish(plan_id, parts)
             return
 
-        # Complete the current plan stage: lay it down + record what it must produce.
-        self._lay_down(plan_id, stage.title, Phase.INCEPTION, stage_slug=stage.slug)
+        # Complete the current plan stage: lay it down (as a DONE planning record — not
+        # build work) + record what it must produce.
+        self._lay_down(plan_id, stage.title, Phase.INCEPTION, stage_slug=stage.slug,
+                       status=UNIT_DONE)
         for artifact in stage.produces:
             self._store.upsert_requirement(
                 plan_id, f"{stage.slug}:{artifact}", value="(captured)",
@@ -610,7 +613,7 @@ class PlannerEngine:
             deps = [slug_to_seq[r] for r in pu.requires if r in slug_to_seq]
             self._store.upsert_unit(
                 plan_id, seq, title=pu.title, phase=pu.phase, task_type=pu.task_type,
-                stage_slug=pu.stage_slug, depends_on=deps,
+                stage_slug=pu.stage_slug, depends_on=deps, gated=pu.gated,
                 status=UNIT_DEFERRED if pu.deferred else UNIT_PENDING,
             )
             if pu.deferred:
@@ -772,11 +775,14 @@ class PlannerEngine:
         yield from self._finish(plan_id, parts)
 
     def _lay_down(self, plan_id: str, title: str, phase: Phase,
-                  stage_slug: Optional[str] = None) -> None:
+                  stage_slug: Optional[str] = None, status: str = UNIT_PENDING) -> None:
         """Record a completed stage as an INCEPTION unit ('in place'). ``stage_slug``
-        identifies the source v2 stage (None for built-in stages)."""
+        identifies the source v2 stage (None for built-in stages). ``status`` defaults
+        to pending (a built-in INCEPTION unit dispatches as a validation sim); a v2 plan
+        stage passes ``done`` — it is a planning RECORD, not build work, so the builder
+        never re-dispatches it."""
         self._store.upsert_unit(plan_id, self._next_seq(plan_id), title=title, phase=phase,
-                                stage_slug=stage_slug)
+                                stage_slug=stage_slug, status=status)
 
     def _has_construction_units(self, plan_id: str) -> bool:
         """Whether the plan already has a CONSTRUCTION work-list (dedupe guard so the

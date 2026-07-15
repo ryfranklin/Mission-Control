@@ -48,14 +48,17 @@ def test_units_are_the_applicable_non_plan_stages(catalog):
     assert len(units) == len(expected)
 
 
-def test_unit_task_types_follow_kind_not_phase(catalog):
+def test_units_are_writable_and_gate_only_code_stages(catalog):
     by_slug = {u.stage_slug: u for u in v2plan.build_units(catalog, mode=MODE)}
-    # code stages → burn
-    for slug in ("code-generation", "build-and-test", "ci-pipeline", "infrastructure-design"):
-        assert by_slug[slug].task_type == BURN
-    # design stages → sim (even though they live in the construction phase)
-    for slug in ("functional-design", "nfr-requirements", "nfr-design"):
-        assert by_slug[slug].task_type == SIM
+    # Every producing stage WRITES its artifacts → all units are side-effectful (BURN).
+    assert all(u.task_type == BURN for u in by_slug.values())
+    # Only code-writing stages halt for a human GO.
+    for slug in ("code-generation", "build-and-test", "ci-pipeline"):
+        assert by_slug[slug].gated is True
+    # Design/doc stages write + auto-apply (ungated) — no human gate per stage.
+    for slug in ("functional-design", "nfr-requirements", "nfr-design",
+                 "infrastructure-design"):
+        assert by_slug[slug].gated is False
         assert by_slug[slug].phase == "construction"
 
 

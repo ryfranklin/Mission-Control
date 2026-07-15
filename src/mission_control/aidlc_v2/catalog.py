@@ -66,6 +66,19 @@ def classify(phase: str, slug: str) -> tuple[str, bool]:
     return _PHASE_DEFAULT.get(phase, ("plan", False))
 
 
+# Which build stages pause at the human go/no-go gate. MC-owned, and deliberately narrow:
+# only CODE-WRITING stages gate. Every other producing stage (design / IaC / doc) WRITES
+# its artifacts and auto-applies (ungated) — so the operator isn't asked to approve ~20
+# low-risk doc stages, only the ones that emit source. One obvious editable set.
+_GATED_SLUGS = frozenset({"code-generation", "build-and-test", "ci-pipeline"})
+
+
+def gates(slug: str) -> bool:
+    """Whether a build stage halts for a human GO (a code-writing stage) rather than
+    writing-and-auto-applying (a design/doc stage)."""
+    return slug in _GATED_SLUGS
+
+
 # -- the machine model -------------------------------------------------------
 
 

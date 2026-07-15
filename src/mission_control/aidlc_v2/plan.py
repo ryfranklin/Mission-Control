@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from ..aidlc import ReadinessCriterion
 from ..roles import BURN, SIM
 from .catalog import StageSpec, applicable
+from .catalog import gates as catalog_gates
 
 # The v2 kinds that become dispatchable MC work (vs. ``plan``, the interactive walk).
 _WORK_KINDS = ("sim", "burn")
@@ -32,7 +33,8 @@ class PlannedUnit:
 
     stage_slug: str
     phase: str          # the stage's v2 phase (e.g. "construction", "operation")
-    task_type: str      # SIM | BURN — from the stage kind, not the phase
+    task_type: str      # BURN — every producing stage writes its artifacts
+    gated: bool         # True → halts for a human GO (code stages); False → auto-applies
     title: str
     deferred: bool       # recorded but never dispatched (v1: operation needs cloud creds)
     requires: tuple[str, ...]  # non-plan stage slugs this unit depends on
@@ -86,7 +88,11 @@ def build_units(catalog: list[StageSpec], *, mode: str, scope: str | None = None
         units.append(PlannedUnit(
             stage_slug=s.slug,
             phase=s.phase,
-            task_type=BURN if s.kind == "burn" else SIM,
+            # Every producing stage WRITES its artifacts → all build units are
+            # side-effectful (BURN). What differs is the gate: only code-writing stages
+            # halt for a human GO; design/doc stages write and auto-apply (gated=False).
+            task_type=BURN,
+            gated=catalog_gates(s.slug),
             title=s.title,
             deferred=s.deferred,
             requires=tuple(requires),

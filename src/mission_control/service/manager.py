@@ -221,6 +221,7 @@ class RunManager:
         allow_secrets: bool = False,
         stage_slug: Optional[str] = None,
         subject: Optional[str] = None,
+        gated: bool = True,
     ) -> str:
         """Register a queued run and kick off the graph in the background, keyed by
         its thread_id (== run_id). Returns the run_id immediately. When built from a
@@ -250,7 +251,7 @@ class RunManager:
         run_id = f"run-{uuid4().hex}"
         task = Task(task_id=f"{task_type}-{uuid4().hex[:8]}", task_type=tt, prompt=prompt,
                     workstream=workstream, allow_secrets=allow_secrets,
-                    stage_slug=stage_slug)
+                    stage_slug=stage_slug, gated=gated)
         self._store.launch(run_id, task_type=task_type, target=ref,
                            local_path=str(target_path.resolve()),
                            plan_id=plan_id, plan_unit_seq=plan_unit_seq,

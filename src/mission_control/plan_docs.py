@@ -66,6 +66,9 @@ class UnitDoc:
     # The unit's stored task_type — used ONLY for v2 phases, where the phase alone does
     # not determine sim vs. burn. For v1 phases it is ignored (task_type is derived).
     stored_task_type: Optional[str] = None
+    # Whether the unit halts for a human go/no-go (code stage) or auto-applies (design/
+    # doc stage). Defaults to gated (the built-in behavior).
+    gated: bool = True
 
     @property
     def task_type(self) -> str:
@@ -137,6 +140,9 @@ def dump_plan(plan: PlanDoc, dir) -> None:
                 # stage_slug travels only for v2 units (identifies the source stage);
                 # omitted for v1 units so their on-disk shape is unchanged.
                 **({"stage_slug": u.stage_slug} if u.stage_slug else {}),
+                # gated travels only when it deviates from the default (an ungated,
+                # auto-applying design/doc stage) — v1/gated units stay byte-identical.
+                **({} if u.gated else {"gated": False}),
             }
             for u in sorted(plan.units, key=lambda u: u.seq)
         ],
@@ -173,6 +179,7 @@ def load_plan(dir) -> PlanDoc:
                 str(u["task_type"]) if (u.get("task_type") and not _is_v1_phase(u["phase"]))
                 else None
             ),
+            gated=bool(u.get("gated", True)),
         )
         for u in (data.get("units") or [])
     ]
@@ -221,7 +228,7 @@ def plan_doc_from_store(store, plan_id: str) -> PlanDoc:
     units = [
         UnitDoc(seq=u.seq, title=u.title, phase=u.phase,
                 depends_on=list(u.depends_on or []), status=u.status,
-                stage_slug=u.stage_slug,
+                stage_slug=u.stage_slug, gated=getattr(u, "gated", True),
                 # symmetric with load_plan: task_type is carried only for v2 phases.
                 stored_task_type=(None if _is_v1_phase(u.phase) else u.task_type))
         for u in store.list_units(plan_id)
@@ -248,7 +255,7 @@ def reconcile_into_store(store, plan_id: str, plan: PlanDoc) -> None:
         # v1 unit, u.task_type is the derived value — identical to deriving in the store.
         store.upsert_unit(plan_id, u.seq, title=u.title, phase=u.phase,
                           depends_on=list(u.depends_on), status=u.status,
-                          task_type=u.task_type, stage_slug=u.stage_slug)
+                          task_type=u.task_type, stage_slug=u.stage_slug, gated=u.gated)
     store.clear_requirements(plan_id)
     for r in plan.requirements:
         store.upsert_requirement(plan_id, r.key, value=r.value, state=r.state)

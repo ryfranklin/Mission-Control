@@ -18,6 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .catalog import StageSpec
+from .catalog import gates as _gates
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -79,13 +80,12 @@ def compose_stage_prompt(stage: StageSpec, catalog_root: Path) -> str:
     consumes = ", ".join(c.artifact for c in stage.consumes) if stage.consumes \
         else "(none — do not read prior artifacts)"
 
-    # The output constraint depends on the stage KIND. A `sim` stage is read-only
-    # analysis/design → it only writes its `produces:` docs under aidlc-docs/. A `burn`
-    # stage MUTATES the target → its primary deliverable is real code/config/tests in
-    # the project tree; the `produces:` are the accompanying plan/summary docs. (The old
-    # "produce EXACTLY … under aidlc-docs/ and produce nothing else" caged burn stages
-    # into writing docs instead of code — that is this bug's fix.)
-    if stage.kind == "burn":
+    # The output constraint depends on whether the stage GATES. A code-writing stage
+    # (gated) MUTATES the project → its primary deliverable is real source/IaC/tests. A
+    # design/doc stage (ungated) still WRITES — but its artifacts, and it writes them as
+    # Markdown under aidlc-docs/ and must not touch application source. (Every producing
+    # stage writes; the old "read-only sim" framing left design stages unable to produce.)
+    if _gates(stage.slug):
         output_rules = [
             "- This is a CODE/CHANGE stage: your PRIMARY deliverable is working output "
             "in the project itself — write real application source, infrastructure-as-"
@@ -101,11 +101,14 @@ def compose_stage_prompt(stage: StageSpec, catalog_root: Path) -> str:
             "only. Mission Control's egress guard BLOCKS any commit that contains a "
             "secret-shaped value, which fails the whole stage.",
         ]
-    else:  # sim (and any read-only stage): analysis/design only, never mutate code
+    else:  # design/doc producing stage: WRITE artifacts (docs), never app source
         output_rules = [
-            f"- This is a READ-ONLY analysis stage: produce EXACTLY these artifacts as "
-            f"Markdown under `aidlc-docs/` (or the location the protocol names): "
-            f"{produces}. Inspect and document only — do NOT modify project source.",
+            f"- This is a DESIGN/DOC stage: WRITE your artifacts (you HAVE write access) "
+            f"as Markdown under `aidlc-docs/` (or the location the protocol names). "
+            f"Produce EXACTLY these artifacts: {produces}. Actually create the files — "
+            f"do not merely describe them or report that inputs are missing.",
+            "- Do NOT modify application SOURCE code — writing code is a later, "
+            "human-gated stage. Your output is design/planning documents only.",
         ]
 
     parts = [
