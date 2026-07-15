@@ -50,6 +50,9 @@ class RunDetail(BaseModel):
     started_at: Optional[datetime]
     ended_at: Optional[datetime]
     detail: Optional[str]
+    # A short human description of the task, available from launch (dispatch) onward —
+    # so the UI shows what a run is doing before any worker output / terminal summary.
+    subject: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: RunRow) -> "RunDetail":

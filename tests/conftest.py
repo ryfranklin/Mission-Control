@@ -93,13 +93,14 @@ class InMemoryRunStore:
 
     # transitions ---------------------------------------------------------
     def launch(self, run_id, *, task_type=None, target=None, local_path=None,
-               plan_id=None, plan_unit_seq=None):
+               plan_id=None, plan_unit_seq=None, subject=None):
         with self._lock:
             if run_id not in self._rows:
                 row = self._ensure(run_id)
                 row["task_type"], row["target"] = task_type, target
                 row["local_path"] = local_path
                 row["plan_id"], row["plan_unit_seq"] = plan_id, plan_unit_seq
+                row["subject"] = subject
 
     def mark_running(self, run_id, *, target=None, local_path=None):
         with self._lock:

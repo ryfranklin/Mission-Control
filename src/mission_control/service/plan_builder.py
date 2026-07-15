@@ -251,6 +251,9 @@ class PlanBuilder:
             # A v2 unit carries its stage slug → the worker steers from that stage's
             # definition + lead-agent knowledge (see aidlc_v2.steering). None for v1.
             stage_slug=getattr(unit, "stage_slug", None),
+            # The unit title is the run's subject — shown while it dispatches so the
+            # operator sees WHAT is running, not a blank card, for the minutes it takes.
+            subject=unit.title,
         )
 
     # -- dependency logic --------------------------------------------------

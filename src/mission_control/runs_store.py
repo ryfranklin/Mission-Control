@@ -76,6 +76,10 @@ _DDL = (
     # show what it changed, after the live worktree is gone. Nullable: only a burn
     # that actually changed files gets one; sims and no-change runs stay NULL.
     "ALTER TABLE runs ADD COLUMN IF NOT EXISTS changes_json JSONB",
+    # A short human description of the task (e.g. the plan unit's title), set at launch
+    # so the UI can show what a run is doing while it dispatches — before any worker
+    # output or terminal summary. Nullable: standalone/legacy runs may not carry one.
+    "ALTER TABLE runs ADD COLUMN IF NOT EXISTS subject TEXT",
     "CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (status)",
     "CREATE INDEX IF NOT EXISTS runs_created_at_idx ON runs (created_at DESC)",
     "CREATE INDEX IF NOT EXISTS runs_plan_idx ON runs (plan_id)",
@@ -123,6 +127,10 @@ class RunRow:
     # at apply time and persisted so it survives worktree teardown. None for sims,
     # no-change burns, and rows created before this column.
     changes_json: Optional[dict] = None
+    # A short human description of the task, set at launch (e.g. the plan unit's title),
+    # so the UI has a subject to show while the run dispatches. Defaulted for rows /
+    # mock stores created before this column.
+    subject: Optional[str] = None
 
 
 # Columns whose non-None values narrow a list_runs() query.
@@ -158,23 +166,27 @@ class RunStore:
         local_path: Optional[str] = None,
         plan_id: Optional[str] = None,
         plan_unit_seq: Optional[int] = None,
+        subject: Optional[str] = None,
     ) -> None:
         """Record a newly submitted run as ``queued``. A no-op if the row already
         exists (so re-submitting or resuming never resets an in-flight run). A run
         built from a plan carries its ``plan_id`` + ``plan_unit_seq`` (the link).
-        ``target`` is the portable ref; ``local_path`` the derived working dir."""
+        ``target`` is the portable ref; ``local_path`` the derived working dir.
+        ``subject`` is a short human description of the task (e.g. the plan unit's
+        title), set at launch so the UI has something to show while the run dispatches —
+        before any worker output or terminal summary exists."""
         with self._pool.connection() as conn:
             conn.execute(
                 """
                 INSERT INTO runs (run_id, thread_id, task_type, target, local_path, status,
-                                  cost_usd, created_at, plan_id, plan_unit_seq)
+                                  cost_usd, created_at, plan_id, plan_unit_seq, subject)
                 VALUES (%(run_id)s, %(run_id)s, %(task_type)s, %(target)s, %(local_path)s,
-                        %(status)s, 0, now(), %(plan_id)s, %(unit_seq)s)
+                        %(status)s, 0, now(), %(plan_id)s, %(unit_seq)s, %(subject)s)
                 ON CONFLICT (run_id) DO NOTHING
                 """,
                 {"run_id": run_id, "task_type": task_type, "target": target,
                  "local_path": local_path, "status": STATUS_QUEUED,
-                 "plan_id": plan_id, "unit_seq": plan_unit_seq},
+                 "plan_id": plan_id, "unit_seq": plan_unit_seq, "subject": subject},
             )
 
     def plan_runs(self, plan_id: str) -> list[RunRow]:

@@ -57,7 +57,7 @@ class FakeRuns:
         return self._runs.get(run_id)
 
     def launch(self, *, target, task_type, prompt, plan_id, plan_unit_seq, workstream=None,
-               allow_secrets=False, stage_slug=None):
+               allow_secrets=False, stage_slug=None, subject=None):
         self.launched.append(plan_unit_seq)
         self._runs[f"run-{plan_unit_seq}"] = SimpleNamespace(
             plan_unit_seq=plan_unit_seq, status="running")

@@ -142,6 +142,15 @@ def _work_path(row) -> Optional[str]:
     return row.local_path or row.target
 
 
+def _subject_from_prompt(prompt: str, *, limit: int = 120) -> Optional[str]:
+    """A short subject derived from a task prompt: its first non-empty line, trimmed.
+    The fallback for a direct launch that supplies no explicit subject."""
+    line = next((ln.strip() for ln in (prompt or "").splitlines() if ln.strip()), "")
+    if not line:
+        return None
+    return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
+
+
 class RunManager:
     """Launches / resolves / cancels / streams / queries runs over the existing graph."""
 
@@ -211,10 +220,15 @@ class RunManager:
         workstream: Optional[str] = None,
         allow_secrets: bool = False,
         stage_slug: Optional[str] = None,
+        subject: Optional[str] = None,
     ) -> str:
         """Register a queued run and kick off the graph in the background, keyed by
         its thread_id (== run_id). Returns the run_id immediately. When built from a
         plan, ``plan_id``/``plan_unit_seq`` record the link on the run row.
+
+        ``subject`` is a short human description of the task shown while the run
+        dispatches; when omitted (a direct launch), it falls back to the first line of
+        the prompt so a run is never a blank card.
 
         ``target`` may be a local path OR a remote URL. Its PORTABLE identity (a
         normalized remote ref) is stored as the run's ``target``; the derived
@@ -239,7 +253,8 @@ class RunManager:
                     stage_slug=stage_slug)
         self._store.launch(run_id, task_type=task_type, target=ref,
                            local_path=str(target_path.resolve()),
-                           plan_id=plan_id, plan_unit_seq=plan_unit_seq)
+                           plan_id=plan_id, plan_unit_seq=plan_unit_seq,
+                           subject=(subject or _subject_from_prompt(prompt)))
 
         self._channel_for(run_id)
         self._spawn(self._drive(run_id, target_path, initial_state(task, run_id=run_id)))

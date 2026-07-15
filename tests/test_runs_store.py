@@ -182,3 +182,12 @@ def test_no_store_runs_behave_as_before(target_repo):
     final = run_via_graph(graph, Task("sim-untracked", TaskType.READ_ONLY, "look"))
     assert final["outcome"] == "completed"
     assert len(list_worktrees(target_repo)) == 1
+
+
+def test_launch_records_subject_for_dispatch_display(pg_pool):
+    """A run carries a human subject from launch (dispatch) onward — so the UI shows
+    what it's doing before any worker output / terminal summary."""
+    _cp, _pool, store = pg_pool
+    run_id = _rid("subject")
+    store.launch(run_id, task_type=roles.BURN, subject="Infrastructure Design")
+    assert store.get_run(run_id).subject == "Infrastructure Design"
