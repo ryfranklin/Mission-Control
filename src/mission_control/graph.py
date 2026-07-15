@@ -45,6 +45,7 @@ from .plans_store import PlanStore
 from .runs_store import RunStore
 from .tasks import Task, TaskType
 from .telemetry import StepUsage, TelemetrySink, events_from_steps
+from .sdk_worker import WorkerError
 from .worker import StubWorker, Worker
 
 # Default local Postgres (docker-compose.yml); overridden by MC_POSTGRES_URL / .env.
@@ -226,13 +227,36 @@ def _dispatch(deps: _Deps, state: RunState) -> dict:
 
 
 def _run_worker(deps: _Deps, state: RunState) -> dict:
-    """Run the existing Worker in the worktree. Side effects stay in the worktree."""
-    result = deps.worker.investigate(_task(state), _worktree(deps, state).path)
+    """Run the existing Worker in the worktree. Side effects stay in the worktree.
+
+    If the worker FAILS after spending tokens (e.g. it exhausted its turn budget), the
+    cost it incurred is recorded — priced telemetry emitted to the spine and the run's
+    cost written to the ledger — BEFORE the failure propagates, so a failed run is never
+    silently reported as ``$0``."""
+    try:
+        result = deps.worker.investigate(_task(state), _worktree(deps, state).path)
+    except WorkerError as exc:
+        _record_failure_cost(deps, state, getattr(exc, "steps", None))
+        raise
     return {
         "worker_summary": result.summary,
         "made_changes": result.made_changes,
         "steps": [asdict(s) for s in result.steps],
     }
+
+
+def _record_failure_cost(deps: _Deps, state: RunState, steps) -> None:
+    """Price + emit the steps a failed worker consumed, and record the cost on the run.
+    A no-op when the worker spent nothing (no steps) or tracking is off."""
+    if not steps:
+        return
+    cost = _emit_telemetry(
+        deps, {**state, "steps": [asdict(s) for s in steps]}, outcome="failed")
+    store, run_id = _ledger(deps, state)
+    if store is not None:
+        # Cost only — the terminal ``failed`` status + detail are stamped by the
+        # driver's mark_failed (which preserves this cost on its upsert).
+        store.record_cost(run_id, cost)
 
 
 def _gate(deps: _Deps, state: RunState) -> dict:

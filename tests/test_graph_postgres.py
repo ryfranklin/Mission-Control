@@ -173,3 +173,45 @@ def test_gate_nogo_scrubs_across_restart(target_repo, pg_ready):
     assert _head(target_repo) == before                    # scrub: target unchanged
     assert STUB_BURN_FILE not in _tracked(target_repo)
     assert len(list_worktrees(target_repo)) == 1           # scrub left no leak
+
+
+# -- a failed worker still records what it spent (no silent $0) -------------
+
+def test_failed_worker_records_cost_and_telemetry(pg_ready, target_repo, tmp_path):
+    """Regression: a worker that fails AFTER burning tokens (e.g. hit the turn cap)
+    must have that cost recorded on the ledger and emitted to the JSONL spine — not
+    dropped as $0."""
+    from mission_control.graph import build_run_graph, build_runs_store, run_tracked
+    from mission_control.runs_store import STATUS_FAILED
+    from mission_control.sdk_worker import WorkerError
+    from mission_control.telemetry import StepUsage
+
+    _cp, pool = postgres_checkpointer(setup=True)
+    store = build_runs_store(pool, setup=True)
+
+    class _FailedAfterSpending(StubWorker):
+        def investigate(self, task, workdir):
+            # a real run that ran out of turns still consumed tokens
+            raise WorkerError(
+                "worker error: Reached maximum number of turns (200)",
+                steps=[StepUsage(model="claude-haiku-4-5", input_tokens=120_000,
+                                 output_tokens=6_000, cache_read_tokens=40_000,
+                                 latency_ms=240_000)],
+            )
+
+    tel = tmp_path / "tel"
+    tel.mkdir()
+    graph = build_run_graph(target_repo, worker=_FailedAfterSpending(),
+                            telemetry_dir=tel, runs_store=store)
+    rid = f"fail-cost-{uuid4().hex[:8]}"
+    try:
+        with pytest.raises(Exception):
+            run_tracked(graph, store,
+                        Task(rid, TaskType.SIDE_EFFECTFUL, "a big change"), thread_id=rid)
+
+        row = store.get_run(rid)
+        assert row.status == STATUS_FAILED
+        assert row.cost_usd > 0                      # the burned tokens ARE priced
+        assert list(tel.glob("*.jsonl"))             # ...and land on the spine
+    finally:
+        pool.close()

@@ -267,7 +267,12 @@ class RunStore:
             )
 
     def mark_failed(self, run_id: str, detail: str) -> None:
-        """Terminal ``failed`` with an error string; stamps ``ended_at`` once."""
+        """Terminal ``failed`` with an error string; stamps ``ended_at`` once.
+
+        Deliberately does NOT touch ``cost_usd`` on an existing row — a failed run may
+        still have spent tokens (e.g. a worker that ran out of turns), and that cost is
+        recorded separately by :meth:`record_cost` before the failure surfaces here. The
+        INSERT's ``0`` only applies to the (rare) case of a never-launched run."""
         with self._pool.connection() as conn:
             conn.execute(
                 """
@@ -279,6 +284,17 @@ class RunStore:
                     ended_at = COALESCE(runs.ended_at, EXCLUDED.ended_at)
                 """,
                 {"run_id": run_id, "status": STATUS_FAILED, "detail": detail},
+            )
+
+    def record_cost(self, run_id: str, cost_usd: float) -> None:
+        """Set a run's cost (absolute, idempotent) without moving its status — used to
+        record what a run spent even when it FAILS (e.g. a worker that exhausted its
+        turn budget still burned real tokens). Kept separate from the terminal-status
+        writers so cost is honest regardless of outcome."""
+        with self._pool.connection() as conn:
+            conn.execute(
+                "UPDATE runs SET cost_usd = %(cost)s WHERE run_id = %(run_id)s",
+                {"cost": round(float(cost_usd), 8), "run_id": run_id},
             )
 
     def _set_status(self, run_id: str, status: str) -> None:

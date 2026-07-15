@@ -76,7 +76,15 @@ def _worker_pg_url() -> str:
 
 
 class WorkerError(RuntimeError):
-    """The SDK worker failed to complete a task (auth, API, or a hard error)."""
+    """The SDK worker failed to complete a task (auth, API, or a hard error).
+
+    Carries any priced ``steps`` the worker managed to consume before failing — a run
+    that errors (e.g. exhausted its turn budget) has still spent real tokens, and that
+    cost must be recorded rather than silently dropped."""
+
+    def __init__(self, *args, steps=None) -> None:
+        super().__init__(*args)
+        self.steps = list(steps or [])
 
 
 class SdkWorker:
@@ -188,7 +196,13 @@ class SdkWorker:
 
         if result is not None and result.is_error:
             detail = result.result or (result.errors or ["unknown error"])[0]
-            raise WorkerError(f"worker error on task {task.task_id}: {detail}")
+            # The error result still carries the usage consumed up to the failure (e.g.
+            # a run that hit the turn cap). Attach the priced steps so the cost is
+            # recorded on the failed run instead of being dropped as $0.
+            raise WorkerError(
+                f"worker error on task {task.task_id}: {detail}",
+                steps=_steps_from_result(result, model, turn_latencies_ms, total_latency_ms),
+            )
 
         summary = (result.result if result and result.result else "\n".join(texts)).strip()
         return WorkerResult(
