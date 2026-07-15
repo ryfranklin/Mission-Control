@@ -64,6 +64,12 @@ def compose_stage_prompt(stage: StageSpec, catalog_root: Path) -> str:
     Sources (and ONLY these): the stage file's Markdown body (its protocol steps), the
     ``lead_agent`` definition, and that agent's ``knowledge/`` files. Ends with the
     Mission-Control override that forbids v2's ``.ts`` tools / hooks / subagents.
+
+    The output rule is keyed on ``stage.kind``: a ``sim`` stage writes only its
+    ``produces:`` docs under ``aidlc-docs/`` (read-only design/analysis), while a
+    ``burn`` stage's PRIMARY deliverable is real source/config/tests in the working
+    directory — the ``produces:`` are the accompanying plan/summary docs. (Without this
+    split a burn like ``code-generation`` produces design docs, not code.)
     """
     catalog_root = Path(catalog_root)
     stage_body = _read_body(stage.path)
@@ -72,6 +78,29 @@ def compose_stage_prompt(stage: StageSpec, catalog_root: Path) -> str:
     produces = ", ".join(stage.produces) if stage.produces else "(none declared)"
     consumes = ", ".join(c.artifact for c in stage.consumes) if stage.consumes \
         else "(none — do not read prior artifacts)"
+
+    # The output constraint depends on the stage KIND. A `sim` stage is read-only
+    # analysis/design → it only writes its `produces:` docs under aidlc-docs/. A `burn`
+    # stage MUTATES the target → its primary deliverable is real code/config/tests in
+    # the project tree; the `produces:` are the accompanying plan/summary docs. (The old
+    # "produce EXACTLY … under aidlc-docs/ and produce nothing else" caged burn stages
+    # into writing docs instead of code — that is this bug's fix.)
+    if stage.kind == "burn":
+        output_rules = [
+            "- This is a CODE/CHANGE stage: your PRIMARY deliverable is working output "
+            "in the project itself — write real application source, infrastructure-as-"
+            "code, CI config, and tests to their proper paths in the working directory "
+            "(follow the stage's protocol and the project's existing conventions). Do "
+            "NOT stop at documentation, and do NOT confine your output to `aidlc-docs/`.",
+            f"- ALSO record this stage's declared artifacts ({produces}) — the plan / "
+            "summary docs — under `aidlc-docs/` (or the location the protocol names).",
+        ]
+    else:  # sim (and any read-only stage): analysis/design only, never mutate code
+        output_rules = [
+            f"- This is a READ-ONLY analysis stage: produce EXACTLY these artifacts as "
+            f"Markdown under `aidlc-docs/` (or the location the protocol names): "
+            f"{produces}. Inspect and document only — do NOT modify project source.",
+        ]
 
     parts = [
         f"## AI-DLC v2 stage: {stage.title} ({stage.slug})",
@@ -91,12 +120,10 @@ def compose_stage_prompt(stage: StageSpec, catalog_root: Path) -> str:
         "",
         "### Operating constraints (Mission Control — these OVERRIDE the material above)",
         "",
-        "- Follow this stage's protocol to produce its artifacts, but treat ALL "
+        "- Follow this stage's protocol to produce its output, but treat ALL "
         "state-tracking, audit logging, gate/approval, and orchestration mechanics as "
         "Mission Control's responsibility, not yours.",
-        f"- Produce EXACTLY these artifacts: {produces}. Write them under `aidlc-docs/` "
-        "(or the specific output location this stage's protocol names) and produce "
-        "nothing else.",
+        *output_rules,
         f"- Read ONLY these input artifacts: {consumes}. Do not go looking for others.",
         "- Do NOT invoke any `aidlc-*.ts` tool, any `bun .claude/tools/*` command, or any "
         "v2 hook — they are intentionally absent from this environment. IGNORE every "

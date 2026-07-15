@@ -62,8 +62,34 @@ def test_prompt_names_produces_and_consumes(catalog):
     prompt = v2steering.compose_stage_prompt(stage, root)
     for artifact in stage.produces:
         assert artifact in prompt
-    assert "Produce EXACTLY these artifacts" in prompt
     assert "Read ONLY these input artifacts" in prompt
+
+
+def test_burn_stage_instructs_writing_real_code_not_only_docs(catalog):
+    """Regression: a burn (code) stage's PRIMARY deliverable is source in the working
+    directory — not just its `produces:` design docs under aidlc-docs/. Without this the
+    code-generation stage produced a plan.md and no code."""
+    root = v2catalog.default_methodology_root()
+    stage = _stage(catalog, "code-generation")
+    assert stage.kind == "burn"
+    prompt = v2steering.compose_stage_prompt(stage, root)
+    assert "CODE/CHANGE stage" in prompt
+    assert "working directory" in prompt
+    # it must NOT be caged into docs-only output (the bug we fixed)
+    assert "produce nothing else" not in prompt
+    assert "confine your output to `aidlc-docs/`" in prompt
+
+
+def test_sim_stage_stays_read_only_docs_only(catalog):
+    """A sim (design) stage stays read-only: it documents under aidlc-docs/ and must
+    not be told to write project source."""
+    root = v2catalog.default_methodology_root()
+    stage = _stage(catalog, "functional-design")
+    assert stage.kind == "sim"
+    prompt = v2steering.compose_stage_prompt(stage, root)
+    assert "READ-ONLY analysis stage" in prompt
+    assert "do NOT modify project source" in prompt
+    assert "CODE/CHANGE stage" not in prompt
 
 
 def test_prompt_forbids_ts_tools_hooks_and_subagents(catalog):
