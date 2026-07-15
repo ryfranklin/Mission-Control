@@ -3,13 +3,48 @@ service factory for host-runnable (no-Docker) service/CLI tests."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
+
+
+def pytest_configure(config) -> None:
+    """Isolate the whole suite onto a dedicated ``*_test`` Postgres database, so running
+    ``pytest`` NEVER reads/writes the operator's working DB (the live seam). We derive
+    the test DB name from ``MC_POSTGRES_URL`` (suffix ``_test``), create it if absent,
+    and point the session's ``MC_POSTGRES_URL`` at it — every store the tests build
+    (via ``postgres_checkpointer``) then lands there. Honor an explicit
+    ``MC_TEST_POSTGRES_URL`` override. A no-op if Postgres is unreachable (those tests
+    skip anyway)."""
+    if os.environ.get("MC_TEST_POSTGRES_URL"):
+        os.environ["MC_POSTGRES_URL"] = os.environ["MC_TEST_POSTGRES_URL"]
+        return
+    base = os.environ.get("MC_POSTGRES_URL") or \
+        "postgresql://mc:mc@localhost:5432/mission_control?sslmode=disable"
+    parts = urlsplit(base)
+    db = (parts.path.lstrip("/") or "mission_control")
+    if db.endswith("_test"):
+        return  # already isolated
+    test_db = db + "_test"
+    test_url = urlunsplit(parts._replace(path="/" + test_db))
+    try:
+        import psycopg
+
+        admin = urlunsplit(parts._replace(path="/postgres"))
+        with psycopg.connect(admin, autocommit=True, connect_timeout=5) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM pg_database WHERE datname = %s", (test_db,)).fetchone()
+            if not exists:
+                conn.execute(f'CREATE DATABASE "{test_db}"')
+    except Exception:  # noqa: BLE001 — no Postgres → the pg-backed tests skip themselves
+        pass
+    os.environ["MC_POSTGRES_URL"] = test_url
 
 
 def _run(repo: Path, *args: str) -> str:
