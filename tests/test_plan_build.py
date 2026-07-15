@@ -242,78 +242,102 @@ def test_plan_of_only_deferred_units_completes(plan_store_pg, target_repo, tmp_p
     assert store.get_plan(pid).status == ps.STATUS_DONE     # deferred counts as resolved
 
 
-def test_producing_stage_that_writes_nothing_is_flagged(plan_store_pg, target_repo, tmp_path):
-    """The verification step: a producing v2 stage that SUCCEEDS but writes no artifacts
-    (changes_json empty) is flagged with a `<slug>:no-output` requirement instead of
-    silently counting as done."""
+class _RetryRuns:
+    """A run manager that models one run per dispatch (per attempt), so the CAPCOM re-run
+    loop can be driven: launch records the seq + creates a fresh in-flight run; a test
+    marks a specific run terminal (with/without output) and calls on_run_terminal."""
+
+    def __init__(self):
+        self.launched = []            # seq per dispatch (len grows on each retry)
+        self._runs = {}               # run_id -> namespace (insertion order = dispatch order)
+
+    def child_runs(self, plan_id):
+        return list(self._runs.values())   # latest run per seq is last → wins in by_seq
+
+    def get_run(self, run_id):
+        return self._runs.get(run_id)
+
+    def launch(self, *, plan_unit_seq, **kwargs):
+        self.launched.append(plan_unit_seq)
+        n = sum(1 for s in self.launched if s == plan_unit_seq)
+        rid = f"run-{plan_unit_seq}-{n}"
+        self._runs[rid] = SimpleNamespace(run_id=rid, plan_unit_seq=plan_unit_seq,
+                                          status="running", changes_json=None)
+        return rid
+
+    def finish(self, rid, *, changes_json=None):
+        r = self._runs[rid]
+        r.status = STATUS_APPLIED
+        r.changes_json = changes_json
+
+
+def test_capcom_reruns_a_no_output_stage_then_holds_it(plan_store_pg, target_repo, tmp_path):
+    """CAPCOM's bounded re-run loop: a producing stage that writes nothing is RE-RUN
+    (escalated), and only after the attempt cap is it HELD (blocked) + surfaced."""
     store = plan_store_pg
-
-    class _Runs:
-        def __init__(self):
-            self.run = None
-
-        def child_runs(self, plan_id):
-            return [self.run] if self.run else []
-
-        def get_run(self, run_id):
-            return self.run
-
-        def launch(self, **kwargs):
-            pass
-
-    runs = _Runs()
+    runs = _RetryRuns()
     builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
                           cache_root=tmp_path / "cache", docs_sync=None)
     pid = _open_building(store, target_repo, [
         (0, "construction", roles.BURN, ps.UNIT_PENDING, "functional-design", []),
     ])
-    # a SUCCESSFUL run that produced NO files (changes_json None)
-    runs.run = SimpleNamespace(run_id="run-0", plan_unit_seq=0,
-                               status=STATUS_APPLIED, changes_json=None)
-    builder.on_run_terminal("run-0", pid)
+    builder._advance(pid)                                # attempt 1 → run-0-1
+    assert runs.launched == [0]
 
-    reqs = {r.key for r in store.list_requirements(pid)}
-    assert "functional-design:no-output" in reqs             # flagged, not silent
-    # CAPCOM HELD it: blocked (not done), so a dependent never deploys onto missing inputs.
+    runs.finish("run-0-1", changes_json=None)            # produced nothing
+    builder.on_run_terminal("run-0-1", pid)              # < cap → RE-RUN (attempt 2)
+    assert runs.launched == [0, 0]                       # re-dispatched, not blocked
+    assert store.list_units(pid)[0].status != ps.UNIT_BLOCKED
+    assert "functional-design:retry" in {r.key for r in store.list_requirements(pid)}
+
+    runs.finish("run-0-2", changes_json=None)            # still nothing (cap reached)
+    builder.on_run_terminal("run-0-2", pid)              # → HELD
     assert store.list_units(pid)[0].status == ps.UNIT_BLOCKED
+    assert "functional-design:no-output" in {r.key for r in store.list_requirements(pid)}
 
 
-def test_capcom_holds_dependents_when_a_stage_produces_nothing(plan_store_pg,
-                                                               target_repo, tmp_path):
-    """CAPCOM gate: a producing stage that writes nothing is BLOCKED, and its dependent
-    is never dispatched (held) — the fleet is not deployed onto missing inputs."""
+def test_capcom_rerun_that_produces_marks_done(plan_store_pg, target_repo, tmp_path):
+    """If the re-run PRODUCES, the stage completes normally (the loop resolved it)."""
     store = plan_store_pg
-
-    class _Runs:
-        def __init__(self):
-            self.launched = []
-            self.run = None
-
-        def child_runs(self, plan_id):
-            return [self.run] if self.run else []
-
-        def get_run(self, run_id):
-            return self.run
-
-        def launch(self, **kwargs):
-            self.launched.append(kwargs.get("plan_unit_seq"))
-
-    runs = _Runs()
+    runs = _RetryRuns()
     builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
                           cache_root=tmp_path / "cache", docs_sync=None)
-    # seq0 a producing design stage; seq1 depends on it (a code stage).
+    pid = _open_building(store, target_repo, [
+        (0, "construction", roles.BURN, ps.UNIT_PENDING, "functional-design", []),
+    ])
+    builder._advance(pid)
+    runs.finish("run-0-1", changes_json=None)            # attempt 1: nothing
+    builder.on_run_terminal("run-0-1", pid)              # → re-run
+    runs.finish("run-0-2", changes_json={"files": ["business-logic-model.md"]})  # attempt 2: wrote it
+    builder.on_run_terminal("run-0-2", pid)
+    assert store.list_units(pid)[0].status == ps.UNIT_DONE
+
+
+def test_capcom_holds_dependents_when_a_stage_never_produces(plan_store_pg,
+                                                             target_repo, tmp_path):
+    """After the retries exhaust, a produced-nothing stage is BLOCKED and its dependent
+    is never dispatched — the fleet is not deployed onto missing inputs."""
+    store = plan_store_pg
+    runs = _RetryRuns()
+    builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
+                          cache_root=tmp_path / "cache", docs_sync=None)
     pid = _open_building(store, target_repo, [
         (0, "construction", roles.BURN, ps.UNIT_PENDING, "functional-design", []),
         (1, "construction", roles.BURN, ps.UNIT_PENDING, "code-generation", [0]),
     ])
-    # seq0 succeeds but produces NOTHING → CAPCOM blocks it.
-    runs.run = SimpleNamespace(run_id="run-0", plan_unit_seq=0,
-                               status=STATUS_APPLIED, changes_json=None)
-    builder.on_run_terminal("run-0", pid)
+    builder._advance(pid)                                # seq0 attempt 1
+    # drive seq0 through all its attempts, each producing nothing
+    for n in range(1, ps_max_attempts() + 1):
+        runs.finish(f"run-0-{n}", changes_json=None)
+        builder.on_run_terminal(f"run-0-{n}", pid)
 
-    by_seq = {u.seq: u for u in store.list_units(pid)}
-    assert by_seq[0].status == ps.UNIT_BLOCKED               # held, not done
-    assert 1 not in runs.launched                            # dependent NOT deployed
+    assert store.list_units(pid)[0].status == ps.UNIT_BLOCKED   # held after the cap
+    assert 1 not in runs.launched                               # dependent NEVER deployed
+
+
+def ps_max_attempts():
+    from mission_control.service.plan_builder import MAX_STAGE_ATTEMPTS
+    return MAX_STAGE_ATTEMPTS
 
 
 def test_no_go_records_request_changes_and_leaves_stage_incomplete(plan_store_pg,

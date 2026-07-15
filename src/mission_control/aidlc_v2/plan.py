@@ -44,13 +44,21 @@ class PlannedUnit:
     requires: tuple[str, ...]  # non-plan stage slugs this unit depends on
 
 
+# The phases the interactive walk covers (intent-gathering with the operator). INCEPTION
+# onward is NOT walked — CAPCOM produces those artifacts at build. Keeping the walk and
+# the build-unit phases disjoint means a stage appears exactly once in the plan (no
+# record/unit duplication).
+_WALK_PHASES = ("initialization", "ideation")
+
+
 def plan_stages(catalog: list[StageSpec], *, mode: str, scope: str | None = None
                 ) -> list[StageSpec]:
-    """The interactive INCEPTION walk: applicable ``kind=="plan"`` stages, in the
-    catalog's dependency order."""
+    """The interactive walk: the applicable initialization + ideation stages (intent
+    gathering), in dependency order. INCEPTION and beyond are produced by CAPCOM at build
+    (see :func:`unit_stages`), not walked — so no stage is both a walk record and a unit."""
     return [
         s for s in catalog
-        if s.kind == "plan" and applicable(s, mode=mode, scope=scope)
+        if s.phase in _WALK_PHASES and applicable(s, mode=mode, scope=scope)
     ]
 
 

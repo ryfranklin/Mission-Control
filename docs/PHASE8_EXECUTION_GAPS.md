@@ -100,10 +100,19 @@ onto missing inputs:
 - **Gate code stages only.** Design/doc/inception stages write + auto-apply; the human
   go/no-go is reserved for the code-writing stages.
 
-## Still deferred (follow-ups)
-- **Interactive agreement loop.** CAPCOM currently HOLDS + surfaces a stage that produced
-  nothing (operator acts); it does not yet run an interactive re-questionnaire with the
-  project's agent to auto-resolve and re-run a held stage.
-- **Cosmetic:** an inception stage appears twice in the plan — once as a walk record
-  (`INCEPTION`, done) and once as a producing build unit (`inception`). Functionally
-  correct; a UI/plan-model cleanup is pending.
+## Re-run loop + de-dup (both closed)
+
+- **CAPCOM re-run loop.** A producing stage that writes nothing is RE-DISPATCHED (with an
+  escalated "you MUST create the files" note) up to `MAX_STAGE_ATTEMPTS` (default 2,
+  `MC_STAGE_MAX_ATTEMPTS`), tracked by `plan_units.attempts`. If a re-run produces, the
+  stage completes; if it still writes nothing after the cap, it is HELD (blocked) and
+  surfaced — bounded, so no runaway loops. Crash-recovery is conservative (hold, no
+  retry).
+- **No more duplication.** The interactive walk now covers only initialization + ideation
+  (intent gathering); inception onward is produced by CAPCOM at build. Walk phases and
+  build-unit phases are disjoint, so a stage appears exactly once in the plan.
+
+## Remaining (smaller)
+- The re-run's escalation is prompt-only ("you wrote nothing; create the files"); a
+  richer back-and-forth with the project's agent to diagnose *why* inputs were missing is
+  a future refinement.

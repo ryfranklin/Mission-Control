@@ -60,6 +60,20 @@ from ..runs_store import (
 _SUCCESS = frozenset({RUN_STATUS_DONE, STATUS_APPLIED})
 _FAILED = frozenset({STATUS_SCRUBBED, STATUS_FAILED, STATUS_PUSH_REJECTED, STATUS_MERGE_CONFLICT})
 
+# CAPCOM's bounded re-run loop: a stage that produces nothing is re-dispatched (with
+# escalated instruction) up to this many total attempts, then held. Bounded so a stuck
+# stage can't loop forever (the operator's "no unnecessary loops"). Overridable per run.
+MAX_STAGE_ATTEMPTS = int(os.environ.get("MC_STAGE_MAX_ATTEMPTS", "2"))
+
+# Appended to a retry's prompt — the "interact to resolve" nudge: the previous attempt
+# produced nothing, so the worker MUST create the artifacts this time.
+_RETRY_NOTE = (
+    "\n\nCAPCOM RETRY — your previous attempt at this stage wrote NO files. You MUST "
+    "actually create this stage's artifacts on disk now (write the files; do not merely "
+    "describe them or report that inputs are missing). Use the inputs already present in "
+    "the working directory."
+)
+
 
 class PlanBuilder:
     """Schedules a plan's units onto the run launch path, in dependency order."""
@@ -154,38 +168,59 @@ class PlanBuilder:
         run = self._runs.get_run(run_id)
         if run is not None and run.plan_unit_seq is not None:
             if run.status in _SUCCESS:
-                # CAPCOM's verification gate: mark the unit done ONLY if it actually
-                # produced its artifacts; a produced-nothing stage is blocked instead, so
-                # its dependents are never deployed onto missing inputs.
-                if self._verify_output(plan_id, run.plan_unit_seq, run):
+                # CAPCOM's verification gate: mark done ONLY if the stage actually
+                # produced its artifacts. A produced-nothing stage is re-run (bounded),
+                # then held — its dependents never deploy onto missing inputs.
+                if self._produced(plan_id, run.plan_unit_seq, run):
                     self._mark_unit_done(plan_id, run.plan_unit_seq)
+                else:
+                    self._handle_no_output(plan_id, run.plan_unit_seq)
             elif run.status == STATUS_SCRUBBED:  # a NO-GO at the gate
                 self._request_changes(plan_id, run.plan_unit_seq,
                                       getattr(run, "detail", None))
         self._advance(plan_id)
 
-    def _verify_output(self, plan_id: str, seq: int, run) -> bool:
-        """CAPCOM's completeness check: did this stage actually produce its artifacts?
+    def _unit(self, plan_id: str, seq: int):
+        return next((u for u in self._plans.list_units(plan_id) if u.seq == seq), None)
 
-        Returns True (proceed → mark done) when the stage wrote files or isn't a v2 stage
-        unit. Returns False when a producing v2 stage SUCCEEDED but WROTE NOTHING — it
-        almost certainly ran without its inputs; CAPCOM then BLOCKS it (its dependents are
-        held) and records a ``<slug>:no-output`` requirement so the gap is visible rather
-        than silently counted done."""
-        unit = next((u for u in self._plans.list_units(plan_id) if u.seq == seq), None)
+    def _produced(self, plan_id: str, seq: int, run) -> bool:
+        """CAPCOM's completeness check (pure): did this stage produce its artifacts?
+        True when it wrote files or isn't a v2 stage unit; False when a producing v2 stage
+        SUCCEEDED but WROTE NOTHING (it almost certainly ran without its inputs)."""
+        unit = self._unit(plan_id, seq)
         if unit is None or not getattr(unit, "stage_slug", None):
-            return True  # not a v2 stage unit → nothing to verify
-        if getattr(run, "changes_json", None):
-            return True  # it wrote files → produced something
-        self._plans.set_unit_status(plan_id, seq, UNIT_BLOCKED)
+            return True
+        return bool(getattr(run, "changes_json", None))
+
+    def _handle_no_output(self, plan_id: str, seq: int) -> None:
+        """CAPCOM's re-run loop: a producing stage wrote nothing. Re-dispatch it (with an
+        escalated 'you MUST write the files' note) up to :data:`MAX_STAGE_ATTEMPTS`
+        total; if it still produces nothing, HOLD it (blocked) and surface it."""
+        unit = self._unit(plan_id, seq)
+        if unit is None or not getattr(unit, "stage_slug", None):
+            return
+        plan = self._plans.get_plan(plan_id)
+        target = plan.working_path if plan else None
+        if unit.attempts < MAX_STAGE_ATTEMPTS and _is_git_repo(target):
+            self._plans.upsert_requirement(
+                plan_id, f"{unit.stage_slug}:retry",
+                value=f"attempt {unit.attempts} produced no artifacts — CAPCOM re-running",
+                state=aidlc.REQ_OPEN)
+            self._dispatch(plan_id, target, unit)  # bumps attempts + appends the retry note
+        else:
+            self._hold(plan_id, unit)
+
+    def _hold(self, plan_id: str, unit) -> None:
+        """Block a stage that produced nothing after its retries — dependents are held
+        (never deployed onto missing inputs) and the gap is surfaced, not silently done."""
+        self._plans.set_unit_status(plan_id, unit.seq, UNIT_BLOCKED)
         self._plans.upsert_requirement(
             plan_id, f"{unit.stage_slug}:no-output",
-            value="stage produced no artifacts — held by CAPCOM; its dependents will "
-                  "not run until this stage's outputs are created",
+            value=f"stage produced no artifacts after {unit.attempts} attempt(s) — held "
+                  "by CAPCOM; its dependents will not run until its outputs are created",
             state=aidlc.REQ_OPEN)
         if self._docs_sync is not None:
             self._docs_sync(plan_id)
-        return False
 
     def _request_changes(self, plan_id: str, seq: int, feedback: Optional[str]) -> None:
         """Record a NO-GO'd stage's gate feedback as a 'request changes' — the v2
@@ -255,11 +290,13 @@ class PlanBuilder:
             elif (r := by_seq.get(unit.seq)) is not None and r.status in _SUCCESS:
                 # A successful run whose done-mark was lost (crash between the run and the
                 # status write): heal it — verify output, then mark done + push. A
-                # produced-nothing run is blocked here, not healed. Idempotent on re-entry.
-                if self._verify_output(plan_id, unit.seq, r):
+                # produced-nothing run is HELD here (crash-recovery is conservative — no
+                # retry), not healed. Idempotent on re-entry.
+                if self._produced(plan_id, unit.seq, r):
                     self._mark_unit_done(plan_id, unit.seq)
                     done.add(unit.seq)
                 else:
+                    self._hold(plan_id, unit)
                     blocked.add(unit.seq)
         # own run failed / dep dead / CAPCOM-held (incl. this pass) → dependents held too
         dead = self._dead_seqs(units, by_seq, extra_dead=blocked)
@@ -282,8 +319,12 @@ class PlanBuilder:
 
     def _dispatch(self, plan_id: str, target: str, unit) -> None:
         plan = self._plans.get_plan(plan_id)
+        # Count this dispatch (the re-run cap reads it); a retry (attempt > 1) carries an
+        # escalated note telling the worker its last attempt wrote nothing.
+        attempt = self._plans.bump_unit_attempts(plan_id, unit.seq)
+        prompt = _prompt_for(unit) + (_RETRY_NOTE if attempt > 1 else "")
         self._runs.launch(
-            target=target, task_type=unit.task_type, prompt=_prompt_for(unit),
+            target=target, task_type=unit.task_type, prompt=prompt,
             plan_id=plan_id, plan_unit_seq=unit.seq,
             workstream=plan.workstream if plan else None,
             allow_secrets=bool(plan.allow_secrets) if plan else False,

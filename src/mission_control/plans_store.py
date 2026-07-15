@@ -136,6 +136,10 @@ _DDL = (
     # and auto-applies (a design/doc stage). Default true = the historical behavior (a
     # side-effectful unit gates). Backward-compatible.
     "ALTER TABLE plan_units ADD COLUMN IF NOT EXISTS gated BOOLEAN NOT NULL DEFAULT true",
+    # How many times CAPCOM has dispatched this unit. Drives the bounded re-run loop:
+    # a stage that produces nothing is retried (with escalated instruction) up to a cap,
+    # then held. Not portable build state — resets on a fresh-host rebuild.
+    "ALTER TABLE plan_units ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0",
 )
 
 
@@ -214,6 +218,9 @@ class PlanUnit:
     # Whether a side-effectful unit halts for a human go/no-go (code stage) or writes +
     # auto-applies (design/doc stage). Defaulted (gates) for rows / mocks predating it.
     gated: bool = True
+    # How many times CAPCOM has dispatched this unit (the re-run counter). Defaulted for
+    # rows / mocks predating it.
+    attempts: int = 0
 
 
 # Columns whose non-None values narrow a list_plans() query.
@@ -455,7 +462,7 @@ class PlanStore:
                     status     = EXCLUDED.status,
                     stage_slug = EXCLUDED.stage_slug,
                     gated      = EXCLUDED.gated
-                RETURNING plan_id, seq, title, phase, task_type, depends_on, status, created_at, stage_slug, gated
+                RETURNING plan_id, seq, title, phase, task_type, depends_on, status, created_at, stage_slug, gated, attempts
                 """,
                 {
                     "pid": plan_id, "seq": seq, "title": title, "phase": phase_str,
@@ -483,6 +490,19 @@ class PlanStore:
                 "UPDATE plan_units SET status = %s WHERE plan_id = %s AND seq = %s",
                 (status, plan_id, seq),
             )
+
+    def bump_unit_attempts(self, plan_id: str, seq: int) -> int:
+        """Increment a unit's dispatch counter and return the new value (the CAPCOM
+        re-run loop uses it to cap retries). Atomic increment-and-return."""
+        with self._pool.connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE plan_units SET attempts = attempts + 1 "
+                "WHERE plan_id = %s AND seq = %s RETURNING attempts",
+                (plan_id, seq),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
 
     # -- cache reconciliation (git is authoritative; Postgres is a rebuildable cache) --
 

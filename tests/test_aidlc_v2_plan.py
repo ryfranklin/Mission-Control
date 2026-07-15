@@ -24,17 +24,23 @@ def catalog():
 # -- the plan-stage walk -----------------------------------------------------
 
 
-def test_plan_stages_are_the_plan_kind(catalog):
+def test_plan_stages_are_intent_gathering_only(catalog):
     stages = v2plan.plan_stages(catalog, mode=MODE)
     assert stages
-    assert all(s.kind == "plan" for s in stages)
-    # reverse-engineering is a brownfield-only plan stage → absent for greenfield.
-    assert "reverse-engineering" not in {s.slug for s in stages}
+    # the walk covers initialization + ideation (intent); inception onward is produced
+    # by CAPCOM at build, never walked (so a stage is never both a record and a unit).
+    assert {s.phase for s in stages} <= {"initialization", "ideation"}
+    walk = {s.slug for s in stages}
+    build = {u.stage_slug for u in v2plan.build_units(catalog, mode=MODE)}
+    assert walk.isdisjoint(build)                    # no stage duplicated across walk/build
 
 
-def test_plan_stages_include_reverse_engineering_for_brownfield(catalog):
-    stages = v2plan.plan_stages(catalog, mode="brownfield")
-    assert "reverse-engineering" in {s.slug for s in stages}
+def test_reverse_engineering_is_a_brownfield_build_unit(catalog):
+    # RE moved from the walk into the producing pipeline: a build unit, brownfield-only.
+    assert "reverse-engineering" not in {s.slug for s in v2plan.plan_stages(catalog, mode="brownfield")}
+    bf = {u.stage_slug for u in v2plan.build_units(catalog, mode="brownfield")}
+    gf = {u.stage_slug for u in v2plan.build_units(catalog, mode=MODE)}
+    assert "reverse-engineering" in bf and "reverse-engineering" not in gf
 
 
 # -- the work-list -----------------------------------------------------------
