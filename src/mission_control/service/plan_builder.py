@@ -42,14 +42,18 @@ from ..plans_store import (
     UNIT_BLOCKED,
     UNIT_DEFERRED,
     UNIT_DONE,
+    UNIT_PENDING,
     PlanStore,
 )
 from ..runs_store import (
     STATUS_APPLIED,
+    STATUS_AWAITING_GATE,
     STATUS_DONE as RUN_STATUS_DONE,
     STATUS_FAILED,
     STATUS_MERGE_CONFLICT,
     STATUS_PUSH_REJECTED,
+    STATUS_QUEUED,
+    STATUS_RUNNING,
     STATUS_SCRUBBED,
 )
 
@@ -59,6 +63,8 @@ from ..runs_store import (
 # unit would build off, so building on it would diverge (full conflict handling later).
 _SUCCESS = frozenset({RUN_STATUS_DONE, STATUS_APPLIED})
 _FAILED = frozenset({STATUS_SCRUBBED, STATUS_FAILED, STATUS_PUSH_REJECTED, STATUS_MERGE_CONFLICT})
+# A run still in progress (not terminal) — its unit is not (yet) re-dispatchable.
+_INFLIGHT = frozenset({STATUS_QUEUED, STATUS_RUNNING, STATUS_AWAITING_GATE})
 
 # CAPCOM's bounded re-run loop: a stage that produces nothing is re-dispatched (with
 # escalated instruction) up to this many total attempts, then held. Bounded so a stuck
@@ -207,38 +213,85 @@ class PlanBuilder:
         return bool(getattr(run, "changes_json", None))
 
     def _handle_no_output(self, plan_id: str, seq: int) -> None:
-        """CAPCOM's re-run loop: a producing stage wrote nothing. Diagnose WHICH consumed
-        inputs are missing on disk, and re-dispatch with that diagnosis (name the missing
-        inputs) up to :data:`MAX_STAGE_ATTEMPTS`; if it still produces nothing, HOLD it
-        (blocked) and surface the diagnosis."""
+        """CAPCOM's negotiation on a produced-nothing stage:
+
+        1. If a missing consumed input has a PRODUCER unit in this plan that can still
+           run, re-activate that producer (regenerate the upstream artifact) — the
+           consumer waits on it and re-runs once it exists. This is the back-and-forth:
+           CAPCOM fixes the cause upstream, not just nudges the consumer.
+        2. Otherwise re-run the consumer itself (with the input diagnosis) up to the cap.
+        3. When neither can make progress (cap reached / no producer), HOLD it + surface.
+        Bounded throughout by each unit's ``attempts`` cap, so it cannot churn forever."""
         unit = self._unit(plan_id, seq)
         if unit is None or not getattr(unit, "stage_slug", None):
             return
         plan = self._plans.get_plan(plan_id)
         target = plan.working_path if plan else None
+        if not _is_git_repo(target):
+            self._hold(plan_id, unit)
+            return
         missing = self._missing_inputs(target, unit.stage_slug)
-        if unit.attempts < MAX_STAGE_ATTEMPTS and _is_git_repo(target):
+        if unit.attempts >= MAX_STAGE_ATTEMPTS:
+            self._hold(plan_id, unit, missing)
+            return
+
+        producers = self._rerunnable_producers(target, plan_id, missing)
+        if producers:
+            # Regenerate the upstream artifacts: re-activate the producers (they re-run
+            # first); the consumer stays pending and re-runs once its inputs exist.
+            for p in producers:
+                self._plans.set_unit_status(plan_id, p.seq, UNIT_PENDING)
+            names = ", ".join(sorted({p.stage_slug for p in producers}))
+            self._plans.upsert_requirement(
+                plan_id, f"{unit.stage_slug}:awaiting-inputs",
+                value=f"missing {', '.join(missing)} — CAPCOM re-running producer(s): {names}",
+                state=aidlc.REQ_OPEN)
+            # consumer is left PENDING; _advance dispatches the producers, then it re-runs.
+        else:
+            # No upstream to regenerate → re-run the consumer itself (via _advance, which
+            # re-dispatches a pending unit whose last run is terminal, with the diagnosis).
             detail = ("re-running; inputs missing on disk: " + ", ".join(missing)) \
                 if missing else "re-running (attempt produced nothing)"
             self._plans.upsert_requirement(
                 plan_id, f"{unit.stage_slug}:retry", value=detail, state=aidlc.REQ_OPEN)
-            self._dispatch(plan_id, target, unit, note=_escalation_note(missing))
-        else:
-            self._hold(plan_id, unit, missing)
+            # consumer left PENDING with a terminal last run → _advance re-dispatches it.
 
     def _missing_inputs(self, target, stage_slug: str) -> list:
         """Which of the stage's consumed artifacts are absent from the target's
         aidlc-docs — CAPCOM's diagnosis. Empty when the target has no v2 catalog."""
-        if not target:
+        catalog = self._catalog(target)
+        if catalog is None:
             return []
+        from ..aidlc_v2 import plan as v2plan
+        return v2plan.missing_inputs(catalog, stage_slug, Path(target) / "aidlc-docs")
+
+    def _catalog(self, target):
+        """The target's v2 catalog, or None (probe is read-only)."""
+        if not target:
+            return None
         steering = aidlc.probe(Path(target))
         if steering is None or steering.flavor != aidlc.FLAVOR_AIDLC_V2 \
                 or steering.catalog_root is None:
-            return []
+            return None
         from ..aidlc_v2 import catalog as v2catalog
-        from ..aidlc_v2 import plan as v2plan
-        catalog = v2catalog.load_catalog(steering.catalog_root)
-        return v2plan.missing_inputs(catalog, stage_slug, Path(target) / "aidlc-docs")
+        return v2catalog.load_catalog(steering.catalog_root)
+
+    def _rerunnable_producers(self, target, plan_id: str, missing: list) -> list:
+        """The build units that PRODUCE a missing artifact and can still run (their last
+        run is terminal — done/blocked — and they're under their attempts cap). These are
+        the upstream stages CAPCOM re-runs to regenerate what a consumer needs."""
+        catalog = self._catalog(target)
+        if not missing or catalog is None:
+            return []
+        produced_by = {art: s.slug for s in catalog for art in s.produces}
+        want = {produced_by[a] for a in missing if a in produced_by}
+        out = []
+        for u in self._plans.list_units(plan_id):
+            if (getattr(u, "stage_slug", None) in want
+                    and u.status in (UNIT_DONE, UNIT_BLOCKED)
+                    and u.attempts < MAX_STAGE_ATTEMPTS):
+                out.append(u)
+        return out
 
     def _hold(self, plan_id: str, unit, missing=()) -> None:
         """Block a stage that produced nothing after its retries — dependents are held
@@ -304,56 +357,49 @@ class PlanBuilder:
             self._plans.set_status(plan_id, STATUS_DONE)
             return
 
-        # COMMITTED unit status is the authority for "done" (portable across machines);
-        # the in-session child runs only tell us what is already dispatched / has failed
-        # THIS session (so we don't re-dispatch an in-flight unit or one that will never
-        # finish). done_seqs comes from git-reconciled status, not from local runs.
+        # _advance is a PURE dispatcher: it never marks done / holds / verifies (that is
+        # on_run_terminal's job, run once per terminal run). Committed unit STATUS is the
+        # authority — ``done`` skips, ``blocked`` (CAPCOM-held) is dead, the rest dispatch
+        # when ready. The in-session child runs only tell us what is in-flight (don't
+        # re-dispatch a running unit) — the LATEST run per seq wins (child_runs is
+        # created_at-ordered), so a re-run's fresh in-flight run is what we see.
         by_seq = {r.plan_unit_seq: r for r in self._runs.child_runs(plan_id)}
-        # CAPCOM held these — ran but produced nothing. Treated like dead (dependents held,
-        # never dispatched, counts as resolved) and NEVER healed to done, even though its
-        # run "succeeded", because it failed the artifact check.
-        blocked = {u.seq for u in units if u.status == UNIT_BLOCKED}
-        done: set = set()
-        for unit in units:
-            if unit.status == UNIT_DONE:
-                done.add(unit.seq)
-            elif unit.seq in blocked:
-                continue  # produced nothing → not done, not healed
-            elif (r := by_seq.get(unit.seq)) is not None and r.status in _SUCCESS:
-                # A successful run whose done-mark was lost (crash between the run and the
-                # status write): heal it — verify output, then mark done + push. A
-                # produced-nothing run is HELD here (crash-recovery is conservative — no
-                # retry), not healed. Idempotent on re-entry.
-                if self._produced(plan_id, unit.seq, r):
-                    self._mark_unit_done(plan_id, unit.seq)
-                    done.add(unit.seq)
-                else:
-                    self._hold(plan_id, unit)
-                    blocked.add(unit.seq)
-        # own run failed / dep dead / CAPCOM-held (incl. this pass) → dependents held too
-        dead = self._dead_seqs(units, by_seq, extra_dead=blocked)
+        done = {u.seq for u in units if u.status == UNIT_DONE}
+        # own run failed / a held (produced-nothing) unit → dependents held too
+        dead = self._dead_seqs(units, by_seq)
         # Deferred units (AI-DLC v2 ``operation`` stages) are RECORDED in the plan but
         # never dispatched in v1 (they need cloud creds). They count as resolved so the
         # plan can still complete; they are never launched and never block a dependent.
         deferred = {u.seq for u in units if u.status == UNIT_DEFERRED}
 
         for unit in units:  # units come back in seq order
-            if unit.seq in done or unit.seq in by_seq or unit.seq in dead \
-                    or unit.seq in deferred:
-                continue  # done / dispatched / dead / held / deferred-never-dispatched
+            if unit.seq in done or unit.seq in dead or unit.seq in deferred:
+                continue  # done / dead / held / deferred-never-dispatched
+            r = by_seq.get(unit.seq)
+            if r is not None and r.status in _INFLIGHT:
+                continue  # currently running / at the gate → wait for it
+            if unit.status != UNIT_PENDING:
+                continue  # only PENDING units dispatch (a re-run resets status to pending)
             if not all(dep in done for dep in (unit.depends_on or [])):
                 continue  # a dependency isn't done yet → not (yet) dispatchable
+            # Dispatch a fresh unit OR re-dispatch a PENDING unit whose last run is
+            # terminal — the latter is CAPCOM's retry / upstream-regeneration re-run.
             self._dispatch(plan_id, target, unit)
             by_seq = {r.plan_unit_seq: r for r in self._runs.child_runs(plan_id)}
 
         if self._all_resolved(units, done | deferred, dead):
             self._plans.set_status(plan_id, STATUS_DONE)
 
-    def _dispatch(self, plan_id: str, target: str, unit, note: str = "") -> None:
+    def _dispatch(self, plan_id: str, target: str, unit) -> None:
         plan = self._plans.get_plan(plan_id)
-        # Count this dispatch (the re-run cap reads it). A retry passes CAPCOM's
-        # diagnostic ``note`` (which inputs were missing); the first dispatch passes none.
-        self._plans.bump_unit_attempts(plan_id, unit.seq)
+        # Count this dispatch (the re-run cap reads it). A RE-run (attempt > 1) carries
+        # CAPCOM's diagnostic note, computed from the unit's own state: if IT is missing
+        # inputs → name them; else (it has inputs but wrote nothing, incl. a regenerated
+        # producer) → "you MUST write your artifacts".
+        attempt = self._plans.bump_unit_attempts(plan_id, unit.seq)
+        note = ""
+        if attempt > 1 and getattr(unit, "stage_slug", None):
+            note = _escalation_note(self._missing_inputs(target, unit.stage_slug))
         prompt = _prompt_for(unit) + note
         self._runs.launch(
             target=target, task_type=unit.task_type, prompt=prompt,

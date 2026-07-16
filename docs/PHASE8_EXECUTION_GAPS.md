@@ -121,9 +121,21 @@ the missing inputs and tells the worker to proceed on what's present (and note w
 isn't). If the stage is ultimately held, the `<slug>:no-output` requirement records the
 diagnosed missing inputs, so *why* it's held is visible, not just *that* it is.
 
+## Upstream regeneration (closed)
+
+CAPCOM now fixes the cause, not just the symptom. When a stage produces nothing because a
+consumed input is absent, CAPCOM finds the PRODUCER unit that makes that artifact and
+**re-activates it** (reset to pending → re-dispatched with "you MUST write your
+artifacts"); the consumer waits on it and re-runs once the input exists. If no producer
+can make progress (none in the plan, or all at their attempts cap), CAPCOM falls back to
+re-running the consumer, then HOLDS it with the diagnosed reason. The whole negotiation is
+bounded by each unit's `attempts` cap — it converges or holds, never churns.
+
+The build scheduler was made re-run-capable for this: `_advance` is now a pure dispatcher
+(it dispatches any PENDING unit whose last run is terminal and deps are done), and
+`on_run_terminal` owns the outcome once (produced → done; nothing → regenerate/re-run/hold;
+NO-GO → request-changes).
+
 ## Remaining (smaller)
-- Presence is checked heuristically by filename stem (`unit-of-work` ⇒ `unit-of-work.md`);
-  a producer emitting an artifact under a different filename could read as missing.
-- A true multi-turn negotiation (CAPCOM ↔ the producing stage to regenerate a missing
-  upstream artifact automatically) is still future; today CAPCOM diagnoses + re-runs the
-  consumer, and holds with the reason if inputs truly can't be produced.
+- Artifact presence is checked heuristically by filename stem (`unit-of-work` ⇒
+  `unit-of-work.md`); a producer that names its file differently could read as missing.
