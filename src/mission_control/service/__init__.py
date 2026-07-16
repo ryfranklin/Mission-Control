@@ -6,8 +6,15 @@ orchestration logic. See :func:`create_app` and :class:`RunManager`.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
+
+# The SERVICE defaults its build worker to the strongest tier — a coarse CONSTRUCTION
+# unit needs the headroom to finish in-budget with quality output. Overridable per
+# service via MC_WORKER_MODEL. (The low-level sdk_worker.DEFAULT_MODEL stays cheap for
+# the eval harness, whose judge must remain a stronger tier than the worker.)
+SERVICE_WORKER_MODEL = "claude-opus-4-8"
 
 from ..graph import (
     DEFAULT_TELEMETRY_DIR,
@@ -54,7 +61,9 @@ def build_default_manager(
     if use_sdk:
         from ..sdk_worker import SdkWorker
 
-        worker_factory = lambda: SdkWorker()  # noqa: E731
+        # Service build worker defaults to Opus (MC_WORKER_MODEL overrides).
+        model = os.environ.get("MC_WORKER_MODEL") or SERVICE_WORKER_MODEL
+        worker_factory = lambda: SdkWorker(model=model)  # noqa: E731
     else:
         from ..worker import StubWorker
 

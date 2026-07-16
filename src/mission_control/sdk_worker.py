@@ -44,6 +44,9 @@ from .worker import WorkerResult
 # Cheapest current tier — verified against the Claude model catalog
 # (Haiku 4.5: $1/$5 per 1M tokens, 200K context). Configurable per worker, or via
 # MC_WORKER_MODEL for a whole service (a stronger model finishes a task in fewer turns).
+# NB: this is the LOW-LEVEL default (used by the eval harness, whose judge must stay a
+# STRONGER tier than the worker). The SERVICE defaults the build worker to Opus — see
+# SERVICE_WORKER_MODEL in mission_control.service.
 DEFAULT_MODEL = "claude-haiku-4-5"
 
 # Bound a single task so a runaway worker can't loop forever. 20 is fine for small

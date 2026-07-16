@@ -69,7 +69,7 @@ _INFLIGHT = frozenset({STATUS_QUEUED, STATUS_RUNNING, STATUS_AWAITING_GATE})
 # CAPCOM's bounded re-run loop: a stage that produces nothing is re-dispatched (with
 # escalated instruction) up to this many total attempts, then held. Bounded so a stuck
 # stage can't loop forever (the operator's "no unnecessary loops"). Overridable per run.
-MAX_STAGE_ATTEMPTS = int(os.environ.get("MC_STAGE_MAX_ATTEMPTS", "2"))
+MAX_STAGE_ATTEMPTS = int(os.environ.get("MC_STAGE_MAX_ATTEMPTS", "3"))
 
 # Appended to a retry's prompt when CAPCOM can't diagnose a specific missing input.
 _RETRY_NOTE = (

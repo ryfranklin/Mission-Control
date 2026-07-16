@@ -284,15 +284,16 @@ def test_capcom_reruns_a_no_output_stage_then_holds_it(plan_store_pg, target_rep
     builder._advance(pid)                                # attempt 1 → run-0-1
     assert runs.launched == [0]
 
-    runs.finish("run-0-1", changes_json=None)            # produced nothing
-    builder.on_run_terminal("run-0-1", pid)              # < cap → RE-RUN (attempt 2)
-    assert runs.launched == [0, 0]                       # re-dispatched, not blocked
-    assert store.list_units(pid)[0].status != ps.UNIT_BLOCKED
-    assert "functional-design:retry" in {r.key for r in store.list_requirements(pid)}
+    cap = ps_max_attempts()
+    for n in range(1, cap + 1):                          # each attempt produces nothing
+        runs.finish(f"run-0-{n}", changes_json=None)
+        builder.on_run_terminal(f"run-0-{n}", pid)
+        if n < cap:                                      # under the cap → RE-RUN, not held
+            assert store.list_units(pid)[0].status != ps.UNIT_BLOCKED
+            assert "functional-design:retry" in {r.key for r in store.list_requirements(pid)}
 
-    runs.finish("run-0-2", changes_json=None)            # still nothing (cap reached)
-    builder.on_run_terminal("run-0-2", pid)              # → HELD
-    assert store.list_units(pid)[0].status == ps.UNIT_BLOCKED
+    assert runs.launched == [0] * cap                    # re-dispatched, once per attempt
+    assert store.list_units(pid)[0].status == ps.UNIT_BLOCKED           # held at the cap
     assert "functional-design:no-output" in {r.key for r in store.list_requirements(pid)}
 
 
