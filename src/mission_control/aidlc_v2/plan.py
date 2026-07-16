@@ -17,7 +17,6 @@ mapping into MC's plan units / readiness lives here.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 from ..aidlc import ReadinessCriterion
 from ..roles import BURN, SIM
@@ -157,17 +156,39 @@ def readiness(
     return crits
 
 
-def missing_inputs(catalog, stage_slug: str, record_root) -> list[str]:
-    """The artifacts a stage ``consumes:`` that are NOT present on disk under
-    ``record_root`` (the target's ``aidlc-docs/``) — CAPCOM's diagnosis of *why* a stage
-    likely produced nothing. Presence is checked by filename stem (an artifact
-    ``unit-of-work`` is present iff some ``unit-of-work.md`` exists in the tree)."""
+def missing_inputs(catalog, stage_slug: str, *, producer_done, producer_files,
+                   on_disk) -> list[str]:
+    """The REQUIRED consumed artifacts of ``stage_slug`` that are NOT available — CAPCOM's
+    diagnosis of *why* a stage likely produced nothing. Presence is decided
+    authoritatively, not by a filename guess:
+
+    * **Layer 1 — producer outcome.** If the artifact is produced by a build UNIT (its
+      producing stage slug is a key of ``producer_done``), it is present only if that
+      producer is ``done``. A not-done producer ⇒ the artifact isn't there yet.
+    * **Layer 2 — producer manifest.** Even when the producer is done, the artifact is
+      present only if the producer actually WROTE a file for it (``producer_files`` maps
+      a producer slug → the stems of the files it committed). This catches a producer
+      that ran but omitted one of its declared artifacts.
+    * **Fallback.** For an artifact with no producer unit (walk-produced / external),
+      presence is the on-disk check (``on_disk`` = file stems present under aidlc-docs).
+
+    ``required: false`` inputs never count as missing — their absence is acceptable."""
     stage = next((s for s in catalog if s.slug == stage_slug), None)
     if stage is None:
         return []
-    root = Path(record_root)
-    present = {p.stem for p in root.rglob("*.md")} if root.is_dir() else set()
-    return [c.artifact for c in stage.consumes if c.artifact not in present]
+    produced_by = {art: s.slug for s in catalog for art in s.produces}
+    missing: list[str] = []
+    for c in stage.consumes:
+        if not c.required:
+            continue  # optional input — its absence never blocks or triggers a regen
+        art = c.artifact
+        prod = produced_by.get(art)
+        if prod is not None and prod in producer_done:            # produced by a build unit
+            if not producer_done[prod] or art not in producer_files.get(prod, set()):
+                missing.append(art)                               # not done, or done-but-omitted
+        elif art not in on_disk:                                  # no producer unit → disk check
+            missing.append(art)
+    return missing
 
 
 def stage_question(stage: StageSpec) -> str:

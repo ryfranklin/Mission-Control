@@ -136,6 +136,25 @@ The build scheduler was made re-run-capable for this: `_advance` is now a pure d
 `on_run_terminal` owns the outcome once (produced → done; nothing → regenerate/re-run/hold;
 NO-GO → request-changes).
 
-## Remaining (smaller)
-- Artifact presence is checked heuristically by filename stem (`unit-of-work` ⇒
-  `unit-of-work.md`); a producer that names its file differently could read as missing.
+## Authoritative artifact presence (closed)
+
+Presence is no longer a whole-tree filename guess. `missing_inputs` now decides each
+REQUIRED consumed artifact by:
+
+- **Layer 1 — producer outcome.** If a build unit produces it, present only if that
+  producer is `done`. (A not-done producer ⇒ not there yet.)
+- **Layer 2 — producer manifest.** Even when the producer is done, present only if it
+  actually WROTE a file for the artifact — read from the producer run's applied diff
+  (`changes_json`), the authoritative record of what it committed. Catches a producer
+  that ran but omitted one of its declared artifacts, and regenerates exactly that
+  producer.
+- **Fallback.** For an artifact with no producer unit (walk-produced / external), the
+  on-disk stem check.
+- **`required` honored.** Optional inputs never count as missing — no spurious hold/regen.
+
+This closes the false-"missing" gap: a producer that delivered its artifact (anywhere) is
+never falsely regenerated, and one that omitted a required artifact is caught precisely.
+
+## Nothing outstanding
+The produce → verify → diagnose → regenerate-upstream → hold loop is complete, with
+presence judged from authoritative build state + per-run manifests rather than heuristics.

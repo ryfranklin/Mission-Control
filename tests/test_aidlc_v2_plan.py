@@ -137,24 +137,82 @@ def test_readiness_needs_all_plan_stages_and_a_worklist(catalog):
     assert is_ready(r2)
 
 
-def test_missing_inputs_diagnoses_absent_consumed_artifacts(catalog, tmp_path):
-    """CAPCOM's diagnosis: which of a stage's consumed artifacts are absent on disk."""
-    record = tmp_path / "aidlc-docs"
-    (record / "inception").mkdir(parents=True)
-    # code-generation consumes requirements + unit-of-work (+ designs). Put SOME on disk.
-    (record / "inception" / "requirements.md").write_text("# reqs\n")
-    (record / "inception" / "unit-of-work.md").write_text("# units\n")
+def _required_consumes(catalog, slug):
+    return {c.artifact for c in next(s for s in catalog if s.slug == slug).consumes
+            if c.required}
 
-    missing = v2plan.missing_inputs(catalog, "code-generation", record)
-    # present ones are not reported; absent design artifacts are
-    assert "requirements" not in missing
-    assert "unit-of-work" not in missing
-    assert "business-logic-model" in missing        # not written yet → diagnosed missing
 
-    # with nothing on disk, every consumed artifact is missing
-    empty = v2plan.missing_inputs(catalog, "code-generation", tmp_path / "nope")
-    consumed = {c.artifact for c in next(s for s in catalog if s.slug == "code-generation").consumes}
-    assert set(empty) == consumed
+def test_missing_inputs_ignores_optional_consumes(catalog):
+    """Optional inputs never count as missing — their absence must not block/regenerate."""
+    slug = "code-generation"
+    required = _required_consumes(catalog, slug)
+    optional = {c.artifact for c in next(s for s in catalog if s.slug == slug).consumes
+                if not c.required}
+    assert optional                                      # this stage HAS optional inputs
+    # nothing available at all → only the REQUIRED inputs are reported
+    missing = v2plan.missing_inputs(catalog, slug, producer_done={}, producer_files={},
+                                    on_disk=set())
+    assert set(missing) == required
+    assert optional.isdisjoint(missing)
+
+
+def test_missing_inputs_layer1_producer_not_done(catalog):
+    """A required input whose producer UNIT isn't done is missing (outcome-based)."""
+    slug = "code-generation"
+    # unit-of-work's producer is units-generation. Mark it NOT done → unit-of-work missing.
+    missing = v2plan.missing_inputs(
+        catalog, slug,
+        producer_done={"units-generation": False, "requirements-analysis": True},
+        producer_files={"requirements-analysis": {"requirements"}},
+        on_disk=set())
+    assert "unit-of-work" in missing                     # producer not done
+    assert "requirements" not in missing                 # producer done + wrote it
+
+
+def test_missing_inputs_layer2_producer_done_but_omitted_artifact(catalog):
+    """Layer 2: a producer that is DONE but did not write the artifact → still missing
+    (this is the case a filename-only check on the whole tree could miss)."""
+    slug = "code-generation"
+    # units-generation is done but its written files DON'T include unit-of-work.
+    missing = v2plan.missing_inputs(
+        catalog, slug,
+        producer_done={"units-generation": True, "requirements-analysis": True},
+        producer_files={"units-generation": {"unit-of-work-story-map"},   # omitted unit-of-work
+                        "requirements-analysis": {"requirements"}},
+        on_disk=set())
+    assert "unit-of-work" in missing                     # done, but not written → missing
+    assert "requirements" not in missing                 # done + written → present
+
+
+def test_missing_inputs_present_when_producer_done_and_wrote_it(catalog):
+    """No false 'missing' (the original gap): producer done + wrote the file → present,
+    regardless of where else on disk it might or might not appear."""
+    slug = "code-generation"
+    req = _required_consumes(catalog, slug)
+    missing = v2plan.missing_inputs(
+        catalog, slug,
+        producer_done={a_producer: True for a_producer in
+                       {s.slug for s in catalog for art in s.produces if art in req}},
+        producer_files={s.slug: set(s.produces) for s in catalog},  # each producer wrote all
+        on_disk=set())
+    assert missing == []                                 # everything accounted for → no regen
+
+
+def test_missing_inputs_disk_fallback_for_no_producer_artifact(catalog, tmp_path):
+    """An artifact with NO producer unit (walk-produced/external) falls back to disk."""
+    # requirements-analysis (brownfield) requires business-overview etc.; use a stage whose
+    # required input has no producer unit here → only the on-disk set decides it.
+    slug = "code-generation"
+    req = _required_consumes(catalog, slug)
+    # no producer units at all → every required input decided by on_disk
+    on_disk = set(req)                                   # all present on disk
+    assert v2plan.missing_inputs(catalog, slug, producer_done={}, producer_files={},
+                                 on_disk=on_disk) == []
+    # drop one from disk → it's the only thing reported missing
+    one = sorted(req)[0]
+    partial = v2plan.missing_inputs(catalog, slug, producer_done={}, producer_files={},
+                                    on_disk=set(req) - {one})
+    assert set(partial) == {one}
 
 
 def test_readiness_flags_malformed_units(catalog):

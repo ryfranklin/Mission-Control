@@ -230,7 +230,7 @@ class PlanBuilder:
         if not _is_git_repo(target):
             self._hold(plan_id, unit)
             return
-        missing = self._missing_inputs(target, unit.stage_slug)
+        missing = self._missing_inputs(plan_id, target, unit.stage_slug)
         if unit.attempts >= MAX_STAGE_ATTEMPTS:
             self._hold(plan_id, unit, missing)
             return
@@ -256,14 +256,40 @@ class PlanBuilder:
                 plan_id, f"{unit.stage_slug}:retry", value=detail, state=aidlc.REQ_OPEN)
             # consumer left PENDING with a terminal last run → _advance re-dispatches it.
 
-    def _missing_inputs(self, target, stage_slug: str) -> list:
-        """Which of the stage's consumed artifacts are absent from the target's
-        aidlc-docs — CAPCOM's diagnosis. Empty when the target has no v2 catalog."""
+    def _missing_inputs(self, plan_id: str, target, stage_slug: str) -> list:
+        """CAPCOM's diagnosis: which REQUIRED consumed artifacts are missing, judged by
+        the PRODUCER's outcome + the files it actually wrote (not a filename guess), with
+        an on-disk fallback for artifacts no build unit produces. Empty for a non-v2
+        target."""
         catalog = self._catalog(target)
         if catalog is None:
             return []
         from ..aidlc_v2 import plan as v2plan
-        return v2plan.missing_inputs(catalog, stage_slug, Path(target) / "aidlc-docs")
+        # Only BUILD units (not the INCEPTION walk records) are artifact producers with
+        # runs; a producer's written files come from its latest run's applied diff.
+        build = [u for u in self._plans.list_units(plan_id)
+                 if getattr(u, "stage_slug", None) and u.phase != aidlc.Phase.INCEPTION.value]
+        runs_by_seq = {r.plan_unit_seq: r for r in self._runs.child_runs(plan_id)}
+        producer_done = {u.stage_slug: (u.status == UNIT_DONE) for u in build}
+        producer_files = {u.stage_slug: self._written_stems(runs_by_seq.get(u.seq))
+                          for u in build}
+        record_root = Path(target) / "aidlc-docs"
+        on_disk = {p.stem for p in record_root.rglob("*.md")} if record_root.is_dir() else set()
+        return v2plan.missing_inputs(
+            catalog, stage_slug, producer_done=producer_done,
+            producer_files=producer_files, on_disk=on_disk)
+
+    @staticmethod
+    def _written_stems(run) -> set:
+        """The filename stems a run committed — its produced-artifact manifest, read from
+        the applied diff (``changes_json``)."""
+        cj = getattr(run, "changes_json", None) or {}
+        out = set()
+        for f in (cj.get("files") or []):
+            path = f.get("path") if isinstance(f, dict) else f
+            if path:
+                out.add(Path(path).stem)
+        return out
 
     def _catalog(self, target):
         """The target's v2 catalog, or None (probe is read-only)."""
@@ -399,7 +425,7 @@ class PlanBuilder:
         attempt = self._plans.bump_unit_attempts(plan_id, unit.seq)
         note = ""
         if attempt > 1 and getattr(unit, "stage_slug", None):
-            note = _escalation_note(self._missing_inputs(target, unit.stage_slug))
+            note = _escalation_note(self._missing_inputs(plan_id, target, unit.stage_slug))
         prompt = _prompt_for(unit) + note
         self._runs.launch(
             target=target, task_type=unit.task_type, prompt=prompt,

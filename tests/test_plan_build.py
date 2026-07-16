@@ -313,30 +313,77 @@ def test_capcom_rerun_that_produces_marks_done(plan_store_pg, target_repo, tmp_p
     assert store.list_units(pid)[0].status == ps.UNIT_DONE
 
 
-def test_capcom_regenerates_a_missing_upstream_artifact(plan_store_pg, target_repo, tmp_path):
-    """The negotiation: a consumer that produces nothing because an upstream artifact is
-    missing causes CAPCOM to RE-ACTIVATE the producer that makes it (reset to pending +
-    re-dispatched), rather than just re-running or holding the consumer."""
+def _changes(*paths):
+    return {"files": [{"path": p, "status": "?"} for p in paths]}
+
+
+def _codegen_plan(store, target):
+    """units-generation + requirements-analysis (both done producers) → code-generation."""
+    return _open_building(store, target, [
+        (0, "inception", roles.BURN, ps.UNIT_DONE, "units-generation", []),
+        (1, "inception", roles.BURN, ps.UNIT_DONE, "requirements-analysis", []),
+        (2, "construction", roles.BURN, ps.UNIT_PENDING, "code-generation", [0, 1]),
+    ])
+
+
+def test_capcom_regenerates_a_producer_that_omitted_its_artifact(plan_store_pg,
+                                                                 target_repo, tmp_path):
+    """Layer 2: a producer that is DONE but did NOT write a required artifact is
+    RE-ACTIVATED — CAPCOM regenerates the exact upstream that omitted the input, not the
+    one that delivered it."""
     from mission_control.aidlc_v2 import install as install_v2
-    install_v2(target_repo)                              # target carries the v2 catalog
+    install_v2(target_repo)
     store = plan_store_pg
     runs = _RetryRuns()
     builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
                           cache_root=tmp_path / "cache", docs_sync=None)
-    # units-generation (done, produces unit-of-work) → code-generation (consumes it).
-    pid = _open_building(store, target_repo, [
-        (0, "inception", roles.BURN, ps.UNIT_DONE, "units-generation", []),
-        (1, "construction", roles.BURN, ps.UNIT_PENDING, "code-generation", [0]),
-    ])
-    # code-generation ran but wrote nothing; its input unit-of-work is absent on disk.
+    pid = _codegen_plan(store, target_repo)
+    # units-generation is done but wrote only the story-map, NOT unit-of-work (omitted).
+    # requirements-analysis is done and DID write requirements.
+    runs._runs["run-0-1"] = SimpleNamespace(run_id="run-0-1", plan_unit_seq=0,
+        status=STATUS_APPLIED, changes_json=_changes("a/unit-of-work-story-map.md"))
     runs._runs["run-1-1"] = SimpleNamespace(run_id="run-1-1", plan_unit_seq=1,
-                                            status=STATUS_APPLIED, changes_json=None)
-    builder.on_run_terminal("run-1-1", pid)
+        status=STATUS_APPLIED, changes_json=_changes("a/requirements.md"))
+    runs._runs["run-2-1"] = SimpleNamespace(run_id="run-2-1", plan_unit_seq=2,
+        status=STATUS_APPLIED, changes_json=None)            # code-gen produced nothing
+    builder.on_run_terminal("run-2-1", pid)
 
-    by_seq = {u.seq: u for u in store.list_units(pid)}
-    assert by_seq[0].status == ps.UNIT_PENDING           # producer RE-ACTIVATED to regenerate
-    assert 0 in runs.launched                            # ...and re-dispatched
+    by = {u.seq: u for u in store.list_units(pid)}
+    assert by[0].status == ps.UNIT_PENDING                   # omitted unit-of-work → regenerated
+    assert by[1].status == ps.UNIT_DONE                      # delivered requirements → untouched
+    assert 0 in runs.launched                                # producer re-dispatched
     assert "code-generation:awaiting-inputs" in {r.key for r in store.list_requirements(pid)}
+
+
+def test_capcom_no_false_regen_when_producers_wrote_their_artifacts(plan_store_pg,
+                                                                    target_repo, tmp_path):
+    """Closes the original gap: when producers are done AND wrote their required artifacts
+    (even under sub-paths), CAPCOM does NOT falsely regenerate them — it just re-runs the
+    consumer itself."""
+    from mission_control.aidlc_v2 import install as install_v2
+    install_v2(target_repo)
+    store = plan_store_pg
+    runs = _RetryRuns()
+    builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
+                          cache_root=tmp_path / "cache", docs_sync=None)
+    pid = _codegen_plan(store, target_repo)
+    # both producers wrote their required artifacts (unit-of-work, requirements)
+    runs._runs["run-0-1"] = SimpleNamespace(run_id="run-0-1", plan_unit_seq=0,
+        status=STATUS_APPLIED,
+        changes_json=_changes("x/unit-of-work.md", "x/unit-of-work-story-map.md"))
+    runs._runs["run-1-1"] = SimpleNamespace(run_id="run-1-1", plan_unit_seq=1,
+        status=STATUS_APPLIED, changes_json=_changes("y/requirements.md"))
+    runs._runs["run-2-1"] = SimpleNamespace(run_id="run-2-1", plan_unit_seq=2,
+        status=STATUS_APPLIED, changes_json=None)
+    builder.on_run_terminal("run-2-1", pid)
+
+    by = {u.seq: u for u in store.list_units(pid)}
+    assert by[0].status == ps.UNIT_DONE                      # NOT regenerated (it delivered)
+    assert by[1].status == ps.UNIT_DONE                      # NOT regenerated (it delivered)
+    reqs = {r.key for r in store.list_requirements(pid)}
+    assert "code-generation:awaiting-inputs" not in reqs     # no false regeneration
+    assert "code-generation:retry" in reqs                   # consumer re-run instead
+    assert 2 in runs.launched                                # ...and it was the consumer
 
 
 def test_capcom_holds_dependents_when_a_stage_never_produces(plan_store_pg,
