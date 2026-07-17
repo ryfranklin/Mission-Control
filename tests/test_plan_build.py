@@ -22,7 +22,12 @@ from mission_control.graph import (
     postgres_checkpointer,
 )
 from mission_control import plans_store as ps
-from mission_control.runs_store import STATUS_APPLIED, STATUS_DONE, STATUS_SCRUBBED
+from mission_control.runs_store import (
+    STATUS_APPLIED,
+    STATUS_DONE,
+    STATUS_FAILED,
+    STATUS_SCRUBBED,
+)
 from mission_control.service import PlanBuilder, PlanManager, RunManager, create_app
 
 STUB_BURN_FILE = "STUB_BURN.txt"
@@ -270,6 +275,13 @@ class _RetryRuns:
         r.status = STATUS_APPLIED
         r.changes_json = changes_json
 
+    def fail(self, rid):
+        """Model a HARD worker error on a dispatch (a transient API 5xx / SDK crash):
+        the run reaches a terminal ``failed`` status having written nothing."""
+        r = self._runs[rid]
+        r.status = STATUS_FAILED
+        r.changes_json = None
+
 
 def test_capcom_reruns_a_no_output_stage_then_holds_it(plan_store_pg, target_repo, tmp_path):
     """CAPCOM's bounded re-run loop: a producing stage that writes nothing is RE-RUN
@@ -312,6 +324,71 @@ def test_capcom_rerun_that_produces_marks_done(plan_store_pg, target_repo, tmp_p
     runs.finish("run-0-2", changes_json={"files": ["business-logic-model.md"]})  # attempt 2: wrote it
     builder.on_run_terminal("run-0-2", pid)
     assert store.list_units(pid)[0].status == ps.UNIT_DONE
+
+
+def test_capcom_retries_a_hard_worker_error_then_holds_it(plan_store_pg, target_repo, tmp_path):
+    """A HARD worker error (transient API 5xx) is RETRIED — bounded by the same attempts
+    cap — not treated as permanently dead. Only after the cap is spent is it HELD."""
+    store = plan_store_pg
+    runs = _RetryRuns()
+    builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
+                          cache_root=tmp_path / "cache", docs_sync=None)
+    pid = _open_building(store, target_repo, [
+        (0, "construction", roles.BURN, ps.UNIT_PENDING, "infrastructure-design", []),
+    ])
+    builder._advance(pid)                                # attempt 1 → run-0-1
+    assert runs.launched == [0]
+
+    cap = ps_max_attempts()
+    for n in range(1, cap + 1):                          # each attempt hard-errors
+        runs.fail(f"run-0-{n}")
+        builder.on_run_terminal(f"run-0-{n}", pid)
+        if n < cap:                                      # under the cap → RE-RUN, not dead
+            assert store.list_units(pid)[0].status == ps.UNIT_PENDING
+            assert "infrastructure-design:retry" in {r.key for r in store.list_requirements(pid)}
+
+    assert runs.launched == [0] * cap                    # re-dispatched once per attempt
+    assert store.list_units(pid)[0].status == ps.UNIT_BLOCKED           # held at the cap
+    assert "infrastructure-design:failed" in {r.key for r in store.list_requirements(pid)}
+
+
+def test_capcom_retry_after_error_that_succeeds_marks_done(plan_store_pg, target_repo, tmp_path):
+    """A transient error that clears on retry completes normally — the blip is absorbed."""
+    store = plan_store_pg
+    runs = _RetryRuns()
+    builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
+                          cache_root=tmp_path / "cache", docs_sync=None)
+    pid = _open_building(store, target_repo, [
+        (0, "construction", roles.BURN, ps.UNIT_PENDING, "infrastructure-design", []),
+    ])
+    builder._advance(pid)
+    runs.fail("run-0-1")                                 # attempt 1: transient 5xx
+    builder.on_run_terminal("run-0-1", pid)              # → retry
+    runs.finish("run-0-2", changes_json={"files": ["deployment-model.md"]})  # attempt 2 ok
+    builder.on_run_terminal("run-0-2", pid)
+    assert store.list_units(pid)[0].status == ps.UNIT_DONE
+
+
+def test_hard_error_under_cap_does_not_kill_dependents(plan_store_pg, target_repo, tmp_path):
+    """A retryable (under-cap) failure must NOT poison its dependents — they wait, they
+    are not marked dead. Contrast a human NO-GO (scrubbed), which does kill dependents."""
+    store = plan_store_pg
+    runs = _RetryRuns()
+    builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
+                          cache_root=tmp_path / "cache", docs_sync=None)
+    pid = _open_building(store, target_repo, [
+        (0, "construction", roles.BURN, ps.UNIT_PENDING, "infrastructure-design", []),
+        (1, "construction", roles.BURN, ps.UNIT_PENDING, "code-generation", [0]),
+    ])
+    builder._advance(pid)                                # dispatches seq0 (root)
+    runs.fail("run-0-1")                                 # seq0 hard-errors, attempt 1/cap
+    builder.on_run_terminal("run-0-1", pid)
+    units = {u.seq: u for u in store.list_units(pid)}
+    assert units[0].status == ps.UNIT_PENDING            # seq0 retried, not dead
+    assert units[1].status == ps.UNIT_PENDING            # dependent still alive (waiting)
+    # seq0 was re-dispatched; seq1 still gated behind it (not done yet), never scrubbed.
+    assert runs.launched == [0, 0]
+    assert 1 not in runs.launched
 
 
 def _changes(*paths):

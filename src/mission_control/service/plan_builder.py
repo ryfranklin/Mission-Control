@@ -183,8 +183,10 @@ class PlanBuilder:
         applied on a GO), mark its unit ``done`` and push that to git (the portable
         progress record) BEFORE dispatching more. On a NO-GO scrub, record the stage's
         'request changes' — the unit stays not-done (its stage stays incomplete) and
-        only that unit is scrubbed; the plan is not failed. Then dispatch newly-unblocked
-        units and roll the plan up. Registered as the run observer."""
+        only that unit is scrubbed; the plan is not failed. On a HARD worker error (a
+        transient API 5xx / network blip), retry the stage — bounded by the same attempts
+        cap — rather than killing it dead. Then dispatch newly-unblocked units and roll
+        the plan up. Registered as the run observer."""
         run = self._runs.get_run(run_id)
         if run is not None and run.plan_unit_seq is not None:
             if run.status in _SUCCESS:
@@ -198,6 +200,8 @@ class PlanBuilder:
             elif run.status == STATUS_SCRUBBED:  # a NO-GO at the gate
                 self._request_changes(plan_id, run.plan_unit_seq,
                                       getattr(run, "detail", None))
+            elif run.status == STATUS_FAILED:  # a hard worker error, not a rejection
+                self._handle_failure(plan_id, run.plan_unit_seq)
         self._advance(plan_id)
 
     def _unit(self, plan_id: str, seq: int):
@@ -255,6 +259,41 @@ class PlanBuilder:
             self._plans.upsert_requirement(
                 plan_id, f"{unit.stage_slug}:retry", value=detail, state=aidlc.REQ_OPEN)
             # consumer left PENDING with a terminal last run → _advance re-dispatches it.
+
+    def _handle_failure(self, plan_id: str, seq: int) -> None:
+        """A stage's worker HARD-ERRORED (a transient API 5xx / network blip / SDK crash),
+        distinct from a stage that ran cleanly but produced nothing. Retry it, bounded by
+        the SAME attempts cap, and HOLD only once the cap is spent. A transient error must
+        not permanently kill a stage — and everything downstream — while attempts remain;
+        that is the difference between a blip and a real dead-end. Left PENDING under the
+        cap, so ``_advance`` re-dispatches it (an under-cap failure is no longer treated as
+        dead by :meth:`_dead_seqs`)."""
+        unit = self._unit(plan_id, seq)
+        if unit is None:
+            return
+        if unit.attempts >= MAX_STAGE_ATTEMPTS:
+            self._hold_failed(plan_id, unit)
+            return
+        key = getattr(unit, "stage_slug", None) or f"unit-{seq}"
+        self._plans.upsert_requirement(
+            plan_id, f"{key}:retry",
+            value=f"worker errored (attempt {unit.attempts}/{MAX_STAGE_ATTEMPTS}) — "
+                  "CAPCOM re-running",
+            state=aidlc.REQ_OPEN)
+
+    def _hold_failed(self, plan_id: str, unit) -> None:
+        """Block a stage whose worker kept hard-erroring through its attempts cap — its
+        dependents are held (never deployed onto a stage that never ran) and the failure
+        is surfaced, not silently dead."""
+        key = getattr(unit, "stage_slug", None) or f"unit-{unit.seq}"
+        self._plans.set_unit_status(plan_id, unit.seq, UNIT_BLOCKED)
+        self._plans.upsert_requirement(
+            plan_id, f"{key}:failed",
+            value=f"worker errored on every attempt ({unit.attempts}/{MAX_STAGE_ATTEMPTS}) — "
+                  "held by CAPCOM; its dependents will not run until it succeeds",
+            state=aidlc.REQ_OPEN)
+        if self._docs_sync is not None:
+            self._docs_sync(plan_id)
 
     def _missing_inputs(self, plan_id: str, target, stage_slug: str) -> list:
         """CAPCOM's diagnosis: which REQUIRED consumed artifacts are missing, judged by
@@ -455,14 +494,21 @@ class PlanBuilder:
     @staticmethod
     def _dead_seqs(units, by_seq, extra_dead=frozenset()) -> set:
         """Units that will never reach ``done``: seeded by a unit whose OWN run failed
-        this session (a no-go/scrubbed/failed/push-rejected run), a unit CAPCOM blocked
-        for producing nothing (committed ``blocked`` status, or freshly blocked this pass
-        via ``extra_dead``), then propagated to every dependent. (A committed-``done``
-        unit is never dead — its run succeeded and produced.)"""
+        this session (a no-go/scrubbed/push-rejected run), a unit CAPCOM blocked for
+        producing nothing (committed ``blocked`` status, or freshly blocked this pass via
+        ``extra_dead``), then propagated to every dependent. (A committed-``done`` unit is
+        never dead — its run succeeded and produced.)
+
+        A HARD worker error (``failed``) is the one terminal that is NOT automatically
+        dead: while the unit is under its attempts cap it is a RETRY candidate (a transient
+        API 5xx must not kill the stage), so ``_advance`` re-dispatches it. It only counts
+        as dead once its attempts are spent (by then CAPCOM has held it ``blocked``)."""
         dead: set = set(extra_dead) | {
             u.seq for u in units
             if u.status == UNIT_BLOCKED
-            or ((r := by_seq.get(u.seq)) is not None and r.status in _FAILED)
+            or ((r := by_seq.get(u.seq)) is not None
+                and r.status in _FAILED
+                and not (r.status == STATUS_FAILED and u.attempts < MAX_STAGE_ATTEMPTS))
         }
         changed = True
         while changed:
