@@ -70,6 +70,33 @@ def test_scan_passes_clean_spec_prose(text):
     assert content_guard.scan_text(text, file="f") == []
 
 
+@pytest.mark.parametrize("text", [
+    "const secret = process.env.JWT_SECRET",              # env read (the secure pattern)
+    "  clientSecret: config.get('client_secret'),",       # config read + call
+    "  password: string;",                                # a TS type annotation, not a value
+    "const secret = deriveKey(salt, iterations)",         # a computed value (call), not a literal
+    "DATABASE_URL=postgres://strata:strata@localhost:5432/strata",   # local DSN, pw == user
+    'url = "postgres://user:password@db:5432/app"',       # dummy password + container host
+    "redis://user:pass@127.0.0.1:6379",                   # loopback dev DSN
+])
+def test_scan_skips_generated_code_false_positives(text):
+    """The tuned guard does not flag real application source: secrets read from env/config,
+    type annotations, computed values, or local/dev/example connection strings."""
+    assert content_guard.scan_text(text, file="f") == []
+
+
+@pytest.mark.parametrize("text,rule", [
+    ('const KEY = "sk-live-abcdef123456"', "secret-assignment"),          # hardcoded literal
+    ("db = postgres://admin:Xk9zP2qW@prod-db.corp.net:5432/app",          # real remote DSN
+     "connection-string-password"),
+])
+def test_scan_still_flags_real_hardcoded_secrets(text, rule):
+    """Tuning must not blind the guard: a hardcoded credential literal or a real remote
+    connection string is still caught."""
+    findings = content_guard.scan_text(text, file="f")
+    assert any(f.rule == rule for f in findings), [f.rule for f in findings]
+
+
 # -- burn output blocked at the commit boundary (distinct terminal state) ---
 
 class _SecretWorker:

@@ -24,6 +24,7 @@ from mission_control.graph import (
 from mission_control import plans_store as ps
 from mission_control.runs_store import (
     STATUS_APPLIED,
+    STATUS_BLOCKED_SECRETS,
     STATUS_DONE,
     STATUS_FAILED,
     STATUS_SCRUBBED,
@@ -254,6 +255,7 @@ class _RetryRuns:
 
     def __init__(self):
         self.launched = []            # seq per dispatch (len grows on each retry)
+        self.prompts = []             # the prompt each dispatch carried (for diagnosis asserts)
         self._runs = {}               # run_id -> namespace (insertion order = dispatch order)
 
     def child_runs(self, plan_id):
@@ -264,10 +266,11 @@ class _RetryRuns:
 
     def launch(self, *, plan_unit_seq, **kwargs):
         self.launched.append(plan_unit_seq)
+        self.prompts.append(kwargs.get("prompt", ""))
         n = sum(1 for s in self.launched if s == plan_unit_seq)
         rid = f"run-{plan_unit_seq}-{n}"
         self._runs[rid] = SimpleNamespace(run_id=rid, plan_unit_seq=plan_unit_seq,
-                                          status="running", changes_json=None)
+                                          status="running", changes_json=None, detail=None)
         return rid
 
     def finish(self, rid, *, changes_json=None):
@@ -281,6 +284,15 @@ class _RetryRuns:
         r = self._runs[rid]
         r.status = STATUS_FAILED
         r.changes_json = None
+
+    def block_secrets(self, rid, detail="content guard blocked egress — src/config.ts:15 "
+                                        "[secret-assignment]"):
+        """Model the egress guard blocking a dispatch's output: terminal ``blocked_secrets``,
+        nothing applied, findings carried on ``detail``."""
+        r = self._runs[rid]
+        r.status = STATUS_BLOCKED_SECRETS
+        r.changes_json = None
+        r.detail = detail
 
 
 def test_capcom_reruns_a_no_output_stage_then_holds_it(plan_store_pg, target_repo, tmp_path):
@@ -389,6 +401,34 @@ def test_hard_error_under_cap_does_not_kill_dependents(plan_store_pg, target_rep
     # seq0 was re-dispatched; seq1 still gated behind it (not done yet), never scrubbed.
     assert runs.launched == [0, 0]
     assert 1 not in runs.launched
+
+
+def test_capcom_retries_blocked_secrets_with_diagnosis_then_holds(plan_store_pg, target_repo,
+                                                                  tmp_path):
+    """A secrets-block is RETRIED (bounded) — and the re-run carries the guard's findings
+    back to the worker (placeholder/env directive), not a blind nudge — then HELD at the
+    cap. Previously blocked_secrets re-dispatched blindly AND without bound."""
+    store = plan_store_pg
+    runs = _RetryRuns()
+    builder = PlanBuilder(store, runs, workspaces_dir=tmp_path / "ws",
+                          cache_root=tmp_path / "cache", docs_sync=None)
+    pid = _open_building(store, target_repo, [
+        (0, "construction", roles.BURN, ps.UNIT_PENDING, "code-generation", []),
+    ])
+    builder._advance(pid)                                # attempt 1 → run-0-1
+    cap = ps_max_attempts()
+    for n in range(1, cap + 1):                          # each attempt trips the guard
+        runs.block_secrets(f"run-0-{n}")
+        builder.on_run_terminal(f"run-0-{n}", pid)
+        if n < cap:                                      # under cap → RE-RUN, not dead/held
+            assert store.list_units(pid)[0].status == ps.UNIT_PENDING
+            assert "code-generation:secrets" in {r.key for r in store.list_requirements(pid)}
+            # the re-dispatch fed the guard findings back to the worker
+            assert "egress secret guard" in runs.prompts[-1]
+
+    assert runs.launched == [0] * cap                    # bounded: one dispatch per attempt
+    assert store.list_units(pid)[0].status == ps.UNIT_BLOCKED           # held at the cap
+    assert "code-generation:secrets-blocked" in {r.key for r in store.list_requirements(pid)}
 
 
 def _changes(*paths):

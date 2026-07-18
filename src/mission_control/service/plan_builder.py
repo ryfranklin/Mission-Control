@@ -48,6 +48,7 @@ from ..plans_store import (
 from ..runs_store import (
     STATUS_APPLIED,
     STATUS_AWAITING_GATE,
+    STATUS_BLOCKED_SECRETS,
     STATUS_DONE as RUN_STATUS_DONE,
     STATUS_FAILED,
     STATUS_MERGE_CONFLICT,
@@ -92,6 +93,22 @@ def _escalation_note(missing: list) -> str:
         "inputs that ARE available and produce your artifacts from those. If a missing "
         "input is strictly required, still write your best-effort output and note exactly "
         "what was missing at the top of the file. You MUST write your files this time."
+    )
+
+
+def _secrets_note(detail: str) -> str:
+    """Feed the egress guard's findings back to the worker so its re-run fixes the CAUSE:
+    name what tripped the guard and require placeholders / env references — never real or
+    realistic secret values. (The previous attempt was blocked; nothing was applied.)"""
+    findings = detail.split("egress —", 1)[-1].strip() if "egress" in (detail or "") else ""
+    where = f" It flagged: {findings}." if findings else ""
+    return (
+        "\n\nCAPCOM DIAGNOSIS — your previous attempt was BLOCKED by the egress secret "
+        "guard and NOTHING was applied." + where + " Do NOT commit real or realistic "
+        "credentials, connection strings with real passwords, or hardcoded "
+        "`secret = \"...\"` string literals. Read secrets from environment variables "
+        "(e.g. process.env.X / os.environ); keep .env.example and README values as obvious "
+        "placeholders (CHANGEME); point example connection strings at localhost."
     )
 
 
@@ -202,6 +219,8 @@ class PlanBuilder:
                                       getattr(run, "detail", None))
             elif run.status == STATUS_FAILED:  # a hard worker error, not a rejection
                 self._handle_failure(plan_id, run.plan_unit_seq)
+            elif run.status == STATUS_BLOCKED_SECRETS:  # egress guard blocked the output
+                self._handle_blocked_secrets(plan_id, run.plan_unit_seq)
         self._advance(plan_id)
 
     def _unit(self, plan_id: str, seq: int):
@@ -294,6 +313,48 @@ class PlanBuilder:
             state=aidlc.REQ_OPEN)
         if self._docs_sync is not None:
             self._docs_sync(plan_id)
+
+    def _handle_blocked_secrets(self, plan_id: str, seq: int) -> None:
+        """The egress guard BLOCKED this stage's output (it staged secret-shaped content),
+        so NOTHING was applied. Retry it — bounded by the SAME attempts cap — and on the
+        re-run feed the guard's findings back to the worker (see :func:`_secrets_note`) so
+        it fixes the cause (placeholders / env references) rather than reproducing them.
+        HOLD (blocked + surfaced) once the cap is spent, so a stage that keeps emitting
+        secrets cannot churn forever (unbounded, blind re-dispatch was the bug)."""
+        unit = self._unit(plan_id, seq)
+        if unit is None:
+            return
+        if unit.attempts >= MAX_STAGE_ATTEMPTS:
+            self._hold_secrets(plan_id, unit)
+            return
+        key = getattr(unit, "stage_slug", None) or f"unit-{seq}"
+        self._plans.upsert_requirement(
+            plan_id, f"{key}:secrets",
+            value=f"egress guard blocked secret-shaped content "
+                  f"(attempt {unit.attempts}/{MAX_STAGE_ATTEMPTS}) — CAPCOM re-running with "
+                  "a placeholder / env-var directive",
+            state=aidlc.REQ_OPEN)
+        # unit left PENDING → _advance re-dispatches it, with the secrets diagnosis in the
+        # prompt (see _dispatch); an under-cap blocked_secrets is not treated as dead.
+
+    def _hold_secrets(self, plan_id: str, unit) -> None:
+        """Block a stage whose output kept tripping the egress guard through its attempts
+        cap — dependents are held and the gap is surfaced, not silently churned."""
+        key = getattr(unit, "stage_slug", None) or f"unit-{unit.seq}"
+        self._plans.set_unit_status(plan_id, unit.seq, UNIT_BLOCKED)
+        self._plans.upsert_requirement(
+            plan_id, f"{key}:secrets-blocked",
+            value=f"egress guard blocked secret-shaped content on every attempt "
+                  f"({unit.attempts}/{MAX_STAGE_ATTEMPTS}) — held by CAPCOM; remove the "
+                  "secret-shaped values (placeholders / env vars) before re-running",
+            state=aidlc.REQ_OPEN)
+        if self._docs_sync is not None:
+            self._docs_sync(plan_id)
+
+    def _latest_run(self, plan_id: str, seq: int):
+        """The most recent run for a unit (child_runs is created_at-ordered → last wins)."""
+        runs = [r for r in self._runs.child_runs(plan_id) if r.plan_unit_seq == seq]
+        return runs[-1] if runs else None
 
     def _missing_inputs(self, plan_id: str, target, stage_slug: str) -> list:
         """CAPCOM's diagnosis: which REQUIRED consumed artifacts are missing, judged by
@@ -461,10 +522,16 @@ class PlanBuilder:
         # CAPCOM's diagnostic note, computed from the unit's own state: if IT is missing
         # inputs → name them; else (it has inputs but wrote nothing, incl. a regenerated
         # producer) → "you MUST write your artifacts".
+        last = self._latest_run(plan_id, unit.seq)  # the terminal run this re-run follows
         attempt = self._plans.bump_unit_attempts(plan_id, unit.seq)
         note = ""
         if attempt > 1 and getattr(unit, "stage_slug", None):
-            note = _escalation_note(self._missing_inputs(plan_id, target, unit.stage_slug))
+            if last is not None and getattr(last, "status", None) == STATUS_BLOCKED_SECRETS:
+                # The egress guard blocked the last attempt → tell the worker WHAT tripped
+                # it and to use placeholders / env refs, not "write more artifacts".
+                note = _secrets_note(getattr(last, "detail", "") or "")
+            else:
+                note = _escalation_note(self._missing_inputs(plan_id, target, unit.stage_slug))
         prompt = _prompt_for(unit) + note
         self._runs.launch(
             target=target, task_type=unit.task_type, prompt=prompt,

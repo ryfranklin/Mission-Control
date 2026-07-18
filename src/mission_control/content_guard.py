@@ -56,11 +56,16 @@ _RULES: tuple[tuple[str, re.Pattern], ...] = (
     ("bearer-token", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{20,}")),
     # scheme://user:password@host — a connection string with an embedded password.
     ("connection-string-password",
-     re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@]+:[^\s:/@]{3,}@[^\s/]+")),
-    # .env-style assignment of a sensitive key to a non-trivial value.
+     re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://(?P<usr>[^\s:/@]+):(?P<pw>[^\s:/@]{3,})"
+                r"@(?P<host>[^\s/:]+)")),
+    # A sensitive key assigned a non-trivial value. Catches a real hardcoded credential
+    # (``PASSWORD=hunter2secret``, ``api_key: sk-...``) but the value is post-filtered
+    # (see scan_text) to skip a CODE EXPRESSION rather than a literal: an env/config read
+    # (``= process.env.X``), a type annotation (``: string``), or a call/member access
+    # (``= derive()``) is secure or benign, not a leaked secret.
     ("secret-assignment",
      re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|"
-                r"private[_-]?key|client[_-]?secret)\b\s*[:=]\s*['\"]?[^\s'\"]{6,}")),
+                r"private[_-]?key|client[_-]?secret)\b\s*[:=]\s*['\"]?(?P<val>[^\s'\"]{6,})")),
     # Obvious PII: US SSN. (Kept deliberately narrow — precision over recall.)
     ("pii-ssn", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
 )
@@ -69,6 +74,26 @@ _RULES: tuple[tuple[str, re.Pattern], ...] = (
 # our own remote helpers never write URLs into content. This keeps precision high without
 # tying to any account/host.
 _PLACEHOLDER = re.compile(r"(?i)\b(?:example|changeme|your[_-]?|placeholder|xx+|redacted|dummy)")
+
+# A secret-key assignment whose VALUE is a code expression, not a literal credential, is
+# benign — skip it. Three shapes cover the real-source false positives:
+#   * an env/config READ (the SECURE pattern):     const s = process.env.X
+#   * a TYPE annotation (a field, not a value):     password: string
+#   * a call / member access (a computed value):    secret = derive(salt) / cfg.get(k)
+_ENV_READ = re.compile(r"(?i)process\.env|import\.meta\.env|os\.environ|os\.getenv|"
+                       r"\bgetenv\b|System\.getenv|\bENV\[|\bconfig\.")
+_TYPE_TOKEN = re.compile(r"(?i)^(?:string|number|boolean|bigint|symbol|object|unknown|"
+                         r"any|void|null|undefined|true|false|buffer|date|promise|record|"
+                         r"array|map|set)(?:<[^>]*>)?(?:\[\])?;?$")
+_CODE_EXPR = re.compile(r"[()]|\.\w")  # a function call or member access → not a literal
+
+# A connection string pointing at a local / dev / container / example host, or using a
+# dummy password, is not a production credential leak. A real remote DSN still fires.
+_LOCAL_HOST = re.compile(r"(?i)^(?:localhost|127\.0\.0\.1|::1|0\.0\.0\.0|db|database|"
+                         r"postgres\w*|mysql|mariadb|redis|mongo\w*|host\.docker\.internal|"
+                         r"[a-z0-9-]+\.local|example\.[a-z]+)$")
+_DUMMY_PW = frozenset({"password", "passwd", "pass", "pwd", "secret", "changeme",
+                       "postgres", "root", "admin", "user", "test", "example", "db"})
 
 
 def _looks_binary(text: str) -> bool:
@@ -95,8 +120,18 @@ def scan_text(content: str, *, file: str = "") -> list:
             m = pattern.search(line)
             if not m:
                 continue
-            if rule == "connection-string-password" and _PLACEHOLDER.search(m.group(0)):
-                continue  # obvious placeholder, not a real credential
+            if rule == "connection-string-password":
+                pw = m.group("pw")
+                if (_PLACEHOLDER.search(m.group(0))
+                        or pw.lower() in _DUMMY_PW
+                        or pw == m.group("usr")
+                        or _LOCAL_HOST.match(m.group("host"))):
+                    continue  # placeholder / dummy / local-dev DSN — not a real credential
+            if rule == "secret-assignment":
+                val = m.group("val")
+                if (_PLACEHOLDER.search(val) or _ENV_READ.search(val)
+                        or _TYPE_TOKEN.match(val) or _CODE_EXPR.search(val)):
+                    continue  # placeholder / env read / type annotation / computed value
             findings.append(Finding(file=file, rule=rule, line=lineno,
                                     excerpt=_excerpt(rule, line, m)))
     return findings
