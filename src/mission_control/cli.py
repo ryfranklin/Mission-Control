@@ -91,6 +91,8 @@ def cmd_launch(client: httpx.Client, args: argparse.Namespace) -> int:
     body = {"target": args.target, "task_type": args.type}
     if args.prompt:
         body["prompt"] = args.prompt
+    if args.slack_profile:
+        body["slack_profile"] = args.slack_profile
     try:
         resp = client.post("/runs", json=body)
         resp.raise_for_status()
@@ -266,6 +268,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"'{roles.SIM}' (read-only) or '{roles.BURN}' (side-effectful); default {roles.SIM}",
     )
     p_launch.add_argument("--prompt", "-p", default=None, help="instruction for the worker")
+    p_launch.add_argument(
+        "--slack-profile", default=None,
+        help="Slack profile to route this run's notifications to (see `GET /slack/profiles`); "
+             "omit to inherit the service default (MC_DEFAULT_SLACK_PROFILE) or stay silent",
+    )
     p_launch.add_argument("--watch", "-w", action="store_true", help="follow the live feed after launch")
     p_launch.set_defaults(func=cmd_launch)
 

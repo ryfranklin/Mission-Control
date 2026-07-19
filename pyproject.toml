@@ -16,6 +16,8 @@ dependencies = [
     "httpx>=0.27",  # the CLI drives the runtime as a client of the service API
     "jinja2>=3.1",  # server-rendered web UI templates (Phase 5b)
     "python-multipart>=0.0.9",  # HTML form parsing for the UI launch form
+    "slack-bolt>=1.18",  # Socket Mode bridge: outbound WebSocket, no public endpoint (Phase 5c)
+    "slack-sdk>=3.27",  # Slack Web API client (posting) + Socket Mode client
 ]
 
 [project.optional-dependencies]
@@ -26,6 +28,7 @@ dev = [
 [project.scripts]
 eval-gate = "mission_control.eval_gate:main"
 mission-control = "mission_control.cli:main"
+mission-control-slack = "mission_control.slack.bridge:main"
 
 [build-system]
 requires = ["hatchling"]

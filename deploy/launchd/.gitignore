@@ -1,0 +1,7 @@
+# Only the *.example templates are tracked. The REALIZED copies carry real paths and
+# (in the env file) secrets — never commit them.
+wrapper.sh
+mc.env
+*.plist
+logs/
+!*.example

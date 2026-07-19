@@ -1,0 +1,77 @@
+#!/bin/bash
+# Mission Control — launchd/systemd process wrapper (TEMPLATE).
+#
+# Copy to wrapper.sh, replace the __PLACEHOLDERS__, chmod +x. Both the service and the
+# Slack bridge plists exec THIS script with their entrypoint as arguments, so all the
+# environment fix-ups live in one place.
+#
+# It does four things, in order:
+#   1. sources the env file (the single source of MC_* config + Slack token vars),
+#   2. makes the Homebrew toolchain + libpq visible (PATH + DYLD_FALLBACK_LIBRARY_PATH),
+#   3. waits for its dependency (Postgres for the service; the service for the bridge),
+#   4. exec's the entrypoint passed as "$@".
+#
+# Nothing here is account- or workspace-specific: every real value comes from the env
+# file or the placeholders, per the repo's repo-agnostic rule. No secrets in this file.
+set -euo pipefail
+
+# --- placeholders (replace at install time) --------------------------------
+ENV_FILE="__ENV_FILE__"                 # e.g. ~/.mission-control/mc.env  (KEY=VALUE lines)
+HOMEBREW_PREFIX="__HOMEBREW_PREFIX__"   # `brew --prefix`  (/opt/homebrew on Apple silicon,
+                                        #                   /usr/local on Intel)
+
+# --- 1. env file -----------------------------------------------------------
+# The env file is the ONLY place MC_* config and Slack token vars are defined. Export
+# every KEY=VALUE it declares. Keep it chmod 600 and OUTSIDE the repo (it holds secrets).
+if [[ -f "$ENV_FILE" ]]; then
+  set -a            # auto-export everything sourced below
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+else
+  echo "wrapper: env file not found: $ENV_FILE" >&2
+  exit 78           # EX_CONFIG
+fi
+
+# --- 2. Homebrew toolchain + libpq -----------------------------------------
+# psycopg (the Postgres driver) links against libpq at RUNTIME. On macOS, Homebrew's
+# libpq is keg-only — it is NOT on the default linker path — so a launchd job (which
+# does not inherit your interactive shell) fails to import psycopg with a dyld error
+# unless we point DYLD_FALLBACK_LIBRARY_PATH at it. `pg_config` (same keg) must also be
+# on PATH for any build/inspection step. Prepend the Homebrew bin + libpq lib dirs.
+#
+# NOTE (macOS SIP): DYLD_* env vars are STRIPPED when spawning SIP-protected *system*
+# binaries (/bin/sh, /usr/bin/env, …). That's why the entrypoint below is exec'd
+# DIRECTLY as `<homebrew-python> -m <module>` — a non-protected binary that DOES inherit
+# DYLD_FALLBACK_LIBRARY_PATH. Do not wrap it in `/bin/sh -c`, or libpq goes missing again.
+export PATH="${HOMEBREW_PREFIX}/bin:${HOMEBREW_PREFIX}/opt/libpq/bin:${PATH}"
+export DYLD_FALLBACK_LIBRARY_PATH="${HOMEBREW_PREFIX}/opt/libpq/lib:${HOMEBREW_PREFIX}/lib:${DYLD_FALLBACK_LIBRARY_PATH:-/usr/local/lib:/usr/lib}"
+
+# --- 3. wait for the dependency --------------------------------------------
+# Env-driven so the SAME wrapper serves both jobs:
+#   * service → set MC_WAIT_TCP=host:port  (its Postgres; from docker-compose)
+#   * bridge  → set MC_WAIT_HTTP=<url>     (the service seam, e.g. $MC_SERVICE_URL/targets)
+# Neither is required; unset means "don't wait". Bounded so a permanently-down dependency
+# surfaces as a job failure launchd/systemd will retry, not an infinite hang.
+_wait_deadline=$(( $(date +%s) + ${MC_WAIT_TIMEOUT:-120} ))
+
+if [[ -n "${MC_WAIT_TCP:-}" ]]; then
+  host="${MC_WAIT_TCP%%:*}"; port="${MC_WAIT_TCP##*:}"
+  echo "wrapper: waiting for tcp ${host}:${port} ..." >&2
+  until /usr/bin/nc -z "$host" "$port" 2>/dev/null; do
+    [[ $(date +%s) -ge $_wait_deadline ]] && { echo "wrapper: timed out waiting for ${host}:${port}" >&2; exit 75; }  # EX_TEMPFAIL
+    sleep 2
+  done
+fi
+
+if [[ -n "${MC_WAIT_HTTP:-}" ]]; then
+  echo "wrapper: waiting for http ${MC_WAIT_HTTP} ..." >&2
+  until /usr/bin/curl -fsS -o /dev/null "${MC_WAIT_HTTP}" 2>/dev/null; do
+    [[ $(date +%s) -ge $_wait_deadline ]] && { echo "wrapper: timed out waiting for ${MC_WAIT_HTTP}" >&2; exit 75; }
+    sleep 2
+  done
+fi
+
+# --- 4. exec the entrypoint ------------------------------------------------
+# e.g.  wrapper.sh __PYTHON__ -m mission_control.service
+exec "$@"

@@ -44,6 +44,26 @@ TERMINAL_STATUSES = frozenset(
      STATUS_SCRUBBED, STATUS_FAILED, STATUS_DONE}
 )
 
+# -- notification kinds (run-lifecycle milestones; functional labels) ----------
+# NOTIFICATION-GRAIN events the RunManager appends to the ``notifications`` outbox at
+# each run-lifecycle milestone — NOT the per-node firehose. A fleet-wide bridge tails
+# this to learn "something happened somewhere" without following every run's SSE.
+NOTIFY_RUN_LAUNCHED = "run_launched"
+NOTIFY_GATE_AWAITING = "gate_awaiting"
+NOTIFY_RUN_TERMINAL = "run_terminal"
+# Alert kinds — reserved, populated in S5 (cost threshold breach / quality regression).
+NOTIFY_COST_THRESHOLD = "cost_threshold"
+NOTIFY_REGRESSION = "regression"
+
+# Kinds that fire at most once per run — deduped by (run_id, kind). Milestones so a
+# kill→restart→resume at the same node boundary can't double-append; alerts so a run
+# raises at most one cost/quality alert (quiet — a threshold, not per-node spam) and a
+# re-run/retry can't double-fire it.
+_ONCE_ONLY_KINDS = frozenset(
+    {NOTIFY_RUN_LAUNCHED, NOTIFY_GATE_AWAITING, NOTIFY_RUN_TERMINAL,
+     NOTIFY_COST_THRESHOLD, NOTIFY_REGRESSION}
+)
+
 # One statement per entry: the autocommit pool prepares statements, which forbids
 # multiple commands in a single execute().
 _DDL = (
@@ -80,6 +100,10 @@ _DDL = (
     # so the UI can show what a run is doing while it dispatches — before any worker
     # output or terminal summary. Nullable: standalone/legacy runs may not carry one.
     "ALTER TABLE runs ADD COLUMN IF NOT EXISTS subject TEXT",
+    # The per-run Slack profile (the selector), validated against the non-secret
+    # registry at launch. Nullable: NULL = opt-out (a silent run, no Slack). Stored so
+    # every milestone this run emits carries the profile the bridge routes on.
+    "ALTER TABLE runs ADD COLUMN IF NOT EXISTS slack_profile TEXT",
     "CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (status)",
     "CREATE INDEX IF NOT EXISTS runs_created_at_idx ON runs (created_at DESC)",
     "CREATE INDEX IF NOT EXISTS runs_plan_idx ON runs (plan_id)",
@@ -98,6 +122,29 @@ _DDL = (
         PRIMARY KEY (run_id, seq)
     )
     """,
+    # The fleet-wide NOTIFICATION outbox: one durable row per run-lifecycle milestone
+    # (NOT the per-node firehose — that's run_events). A fleet bridge tails this to
+    # learn "something happened somewhere" without following every run's SSE. ``seq``
+    # is a GLOBAL monotonic cursor (across all runs), so a consumer advances one durable
+    # position; gaps from deduped conflicts are fine (seq is monotonic, not gapless).
+    # ``payload`` is metadata-only by construction (see NotificationPayload) — never
+    # prompt/code/diff/target contents. ``slack_profile`` is the run's profile (nullable)
+    # so the bridge filters/routes without a second lookup.
+    """
+    CREATE TABLE IF NOT EXISTS notifications (
+        seq           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        run_id        TEXT NOT NULL,
+        slack_profile TEXT,
+        kind          TEXT NOT NULL,
+        payload       JSONB NOT NULL,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    # Once-only milestones dedupe on (run_id, kind): a resume that re-crosses the same
+    # node boundary re-appends the same (run_id, kind) → ON CONFLICT DO NOTHING, so no
+    # double-emit. Same discipline as the runs ledger and run_events.
+    "CREATE UNIQUE INDEX IF NOT EXISTS notifications_run_kind_idx "
+    "ON notifications (run_id, kind)",
 )
 
 
@@ -131,6 +178,9 @@ class RunRow:
     # so the UI has a subject to show while the run dispatches. Defaulted for rows /
     # mock stores created before this column.
     subject: Optional[str] = None
+    # The per-run Slack profile (the selector), validated at launch against the
+    # non-secret registry. None = opt-out (silent run). Defaulted for pre-column rows.
+    slack_profile: Optional[str] = None
 
 
 # Columns whose non-None values narrow a list_runs() query.
@@ -167,6 +217,7 @@ class RunStore:
         plan_id: Optional[str] = None,
         plan_unit_seq: Optional[int] = None,
         subject: Optional[str] = None,
+        slack_profile: Optional[str] = None,
     ) -> None:
         """Record a newly submitted run as ``queued``. A no-op if the row already
         exists (so re-submitting or resuming never resets an in-flight run). A run
@@ -174,19 +225,23 @@ class RunStore:
         ``target`` is the portable ref; ``local_path`` the derived working dir.
         ``subject`` is a short human description of the task (e.g. the plan unit's
         title), set at launch so the UI has something to show while the run dispatches —
-        before any worker output or terminal summary exists."""
+        before any worker output or terminal summary exists. ``slack_profile`` is the
+        validated per-run Slack selector (None = silent run)."""
         with self._pool.connection() as conn:
             conn.execute(
                 """
                 INSERT INTO runs (run_id, thread_id, task_type, target, local_path, status,
-                                  cost_usd, created_at, plan_id, plan_unit_seq, subject)
+                                  cost_usd, created_at, plan_id, plan_unit_seq, subject,
+                                  slack_profile)
                 VALUES (%(run_id)s, %(run_id)s, %(task_type)s, %(target)s, %(local_path)s,
-                        %(status)s, 0, now(), %(plan_id)s, %(unit_seq)s, %(subject)s)
+                        %(status)s, 0, now(), %(plan_id)s, %(unit_seq)s, %(subject)s,
+                        %(slack_profile)s)
                 ON CONFLICT (run_id) DO NOTHING
                 """,
                 {"run_id": run_id, "task_type": task_type, "target": target,
                  "local_path": local_path, "status": STATUS_QUEUED,
-                 "plan_id": plan_id, "unit_seq": plan_unit_seq, "subject": subject},
+                 "plan_id": plan_id, "unit_seq": plan_unit_seq, "subject": subject,
+                 "slack_profile": slack_profile},
             )
 
     def plan_runs(self, plan_id: str) -> list[RunRow]:
@@ -446,6 +501,45 @@ class RunStore:
             ],
         }
 
+    def profile_digest(
+        self, slack_profile: str, *, created_from: Optional[datetime] = None, top_n: int = 5
+    ) -> dict:
+        """A metadata-only fleet digest scoped to ONE Slack profile: the runs that named
+        it (a run with no profile appears in no digest). Returns total runs + reconciled
+        cost, the status breakdown (applied/scrubbed/failed/…), and the top targets by
+        cost. ``created_from`` bounds the window (e.g. the last day)."""
+        clause = "slack_profile = %(profile)s"
+        params: dict = {"profile": slack_profile, "top_n": top_n}
+        if created_from is not None:
+            clause += " AND created_at >= %(from)s"
+            params["from"] = created_from
+        with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute(
+                f"SELECT count(*) AS runs, COALESCE(sum(cost_usd), 0) AS cost_usd "
+                f"FROM runs WHERE {clause}", params)
+            total = cur.fetchone()
+            cur.execute(
+                f"SELECT status, count(*) AS runs FROM runs WHERE {clause} "
+                f"GROUP BY status", params)
+            by_status = {r["status"]: int(r["runs"]) for r in cur.fetchall()}
+            cur.execute(
+                f"SELECT target, count(*) AS runs, COALESCE(sum(cost_usd), 0) AS cost_usd "
+                f"FROM runs WHERE {clause} AND target IS NOT NULL "
+                f"GROUP BY target ORDER BY cost_usd DESC, target LIMIT %(top_n)s", params)
+            top_targets = cur.fetchall()
+        return {
+            "profile": slack_profile,
+            "runs": int(total["runs"]),
+            "cost_usd": round(float(total["cost_usd"]), 8),
+            "by_status": by_status,
+            "top_targets": [
+                {"target": r["target"], "runs": int(r["runs"]),
+                 "cost_usd": round(float(r["cost_usd"]), 8)}
+                for r in top_targets
+            ],
+        }
+
     def list_targets(self) -> list[str]:
         """Distinct non-null targets the registry has seen, alphabetical — the
         set the UI's launch selector offers."""
@@ -495,3 +589,65 @@ class RunStore:
             cur.execute("SELECT max(seq) FROM run_events WHERE run_id = %s", (run_id,))
             value = cur.fetchone()[0]
         return -1 if value is None else int(value)
+
+    # -- notification outbox (the fleet-wide milestone feed) ---------------
+
+    def append_notification(
+        self,
+        run_id: str,
+        kind: str,
+        *,
+        slack_profile: Optional[str] = None,
+        payload: dict,
+    ) -> bool:
+        """Append one NOTIFICATION-GRAIN milestone to the outbox, assigning the next
+        GLOBAL ``seq``. Once-only milestones (launch/gate/terminal) dedupe on
+        (run_id, kind): a resume that re-crosses the boundary is a no-op, so a
+        kill→restart→resume never double-emits. ``payload`` must be metadata-only.
+
+        Returns ``True`` when a row was inserted, ``False`` when a once-only milestone
+        was deduped away."""
+        with self._pool.connection() as conn:
+            conflict = (
+                "ON CONFLICT (run_id, kind) DO NOTHING"
+                if kind in _ONCE_ONLY_KINDS else ""
+            )
+            cur = conn.execute(
+                f"""
+                INSERT INTO notifications (run_id, slack_profile, kind, payload)
+                VALUES (%s, %s, %s, %s)
+                {conflict}
+                """,
+                (run_id, slack_profile, kind, Jsonb(payload)),
+            )
+            return cur.rowcount > 0
+
+    def read_notifications(
+        self, *, after_seq: int = 0, limit: int = 100
+    ) -> list[dict]:
+        """The outbox tail with ``seq > after_seq``, oldest-first (ascending seq) so a
+        bridge processes milestones in order and advances its durable cursor to the
+        last seq it saw. ``limit`` bounds one pull."""
+        with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute(
+                """
+                SELECT seq, run_id, slack_profile, kind, payload, created_at
+                FROM notifications WHERE seq > %(after)s
+                ORDER BY seq ASC LIMIT %(limit)s
+                """,
+                {"after": after_seq, "limit": limit},
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def notifications_summary(self) -> dict:
+        """The outbox's total row count + highest global ``seq`` (0 if empty) — so a
+        consumer knows how far behind its cursor is and how far it can advance."""
+        with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute(
+                "SELECT count(*) AS total, COALESCE(max(seq), 0) AS last_seq "
+                "FROM notifications"
+            )
+            row = cur.fetchone()
+        return {"total": int(row["total"]), "last_seq": int(row["last_seq"])}

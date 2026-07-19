@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -36,6 +37,11 @@ from .. import project_ref, roles, worktree
 from ..graph import build_run_graph, initial_state, run_tracked, worker_cost_usd
 from ..live import GateWaiting, NodeTransition, StepMetric, stream_run_sync
 from ..runs_store import (
+    NOTIFY_COST_THRESHOLD,
+    NOTIFY_GATE_AWAITING,
+    NOTIFY_REGRESSION,
+    NOTIFY_RUN_LAUNCHED,
+    NOTIFY_RUN_TERMINAL,
     STATUS_AWAITING_GATE,
     STATUS_QUEUED,
     STATUS_RUNNING,
@@ -43,6 +49,13 @@ from ..runs_store import (
     TERMINAL_STATUSES,
     RunRow,
     RunStore,
+)
+from ..slack_registry import SlackRegistry
+from .alerts import (
+    REASON_PER_RUN,
+    REASON_WINDOW,
+    CostAlertConfig,
+    regressed_axes,
 )
 
 # Statuses that mean a run is still in flight (for the header's live count).
@@ -161,11 +174,28 @@ class RunManager:
         runs_store: RunStore,
         worker_factory=None,
         telemetry_dir: Optional[Path] = None,
+        slack_registry: Optional[SlackRegistry] = None,
+        cost_alerts: Optional[CostAlertConfig] = None,
+        default_slack_profile: Optional[str] = None,
     ) -> None:
         self._checkpointer = checkpointer
         self._store = runs_store
         self._worker_factory = worker_factory or (lambda: StubWorker())
         self._telemetry_dir = Path(telemetry_dir) if telemetry_dir else None
+        # The NON-SECRET Slack profile registry — the launch selector is validated
+        # against it (None = opt-out). Defaults to the env-configured registry; empty
+        # when MC_SLACK_REGISTRY is unset, so a non-null profile is rejected.
+        self._slack_registry = slack_registry or SlackRegistry.from_env()
+        # Fleet default Slack profile: a launch that doesn't name one inherits this (from
+        # MC_DEFAULT_SLACK_PROFILE). Unset ⇒ None ⇒ runs stay silent (opt-in preserved).
+        # The name comes only from env — never hardcoded, so the repo stays workspace-agnostic.
+        self._default_slack_profile = (
+            default_slack_profile if default_slack_profile is not None
+            else os.environ.get("MC_DEFAULT_SLACK_PROFILE") or None
+        )
+        # Cost/budget alert thresholds (env-configured; default OFF). A run crossing a
+        # threshold emits a cost_threshold notification at terminal — routed to its profile.
+        self._cost_alerts = cost_alerts or CostAlertConfig.from_env()
         self._graphs: dict[str, object] = {}       # per-target compiled graph (shared cp/store)
         self._channels: dict[str, _Channel] = {}    # per-run live fan-out
         self._cancels: dict[str, threading.Event] = {}  # per-run cooperative cancel flag
@@ -222,6 +252,7 @@ class RunManager:
         stage_slug: Optional[str] = None,
         subject: Optional[str] = None,
         gated: bool = True,
+        slack_profile: Optional[str] = None,
     ) -> str:
         """Register a queued run and kick off the graph in the background, keyed by
         its thread_id (== run_id). Returns the run_id immediately. When built from a
@@ -231,11 +262,23 @@ class RunManager:
         dispatches; when omitted (a direct launch), it falls back to the first line of
         the prompt so a run is never a blank card.
 
+        ``slack_profile`` is the per-run Slack selector (opt-in). ``None`` = a silent
+        run (no Slack). A non-null name is VALIDATED against the non-secret registry
+        here — an unknown profile raises :class:`~..slack_registry.UnknownSlackProfile`
+        before any run row is written.
+
         ``target`` may be a local path OR a remote URL. Its PORTABLE identity (a
         normalized remote ref) is stored as the run's ``target``; the derived
         machine-local working dir is stored separately as ``local_path`` and is what
         the run executes in. No clone is done in this slice, so a URL with no local
         checkout is rejected below."""
+        # Resolve the Slack selector: an explicit profile wins; otherwise inherit the
+        # fleet default (MC_DEFAULT_SLACK_PROFILE), which is None when unset (silent).
+        # Validate FIRST — an unknown profile must fail before any run row / worktree
+        # exists (fail early, no side effects). None is accepted.
+        if slack_profile is None:
+            slack_profile = self._default_slack_profile
+        self._slack_registry.validate(slack_profile)
         ref, local_path = project_ref.resolve_target(target)
         target_path = local_path if local_path is not None else Path(target).expanduser()
         if not target_path.is_dir():
@@ -255,7 +298,11 @@ class RunManager:
         self._store.launch(run_id, task_type=task_type, target=ref,
                            local_path=str(target_path.resolve()),
                            plan_id=plan_id, plan_unit_seq=plan_unit_seq,
-                           subject=(subject or _subject_from_prompt(prompt)))
+                           subject=(subject or _subject_from_prompt(prompt)),
+                           slack_profile=slack_profile)
+        # Milestone: the run entered the fleet. Emitted for ALL runs (profile or not);
+        # the bridge filters/routes by the carried profile.
+        self._notify(run_id, NOTIFY_RUN_LAUNCHED, node="launch")
 
         self._channel_for(run_id)
         self._spawn(self._drive(run_id, target_path, initial_state(task, run_id=run_id)))
@@ -444,7 +491,11 @@ class RunManager:
         row = self._store.get_run(run_id)
         if row is not None and row.status in TERMINAL_STATUSES:
             await self._finalize(run_id, channel)  # explicit terminal event, then close
-        # else: paused at the gate — leave the feed open for the resume leg.
+        else:
+            # Paused at the gate — leave the feed open for the resume leg, and emit the
+            # gate milestone to the outbox (once-only; a resume won't re-cross here).
+            if row is not None and row.status == STATUS_AWAITING_GATE:
+                await asyncio.to_thread(self._notify, run_id, NOTIFY_GATE_AWAITING, node="gate")
 
     def _persist_and_push(self, run_id: str, channel: _Channel, loop, event) -> None:
         """(pump thread) assign a global seq, persist to the durable log, tail live."""
@@ -460,6 +511,118 @@ class RunManager:
         await asyncio.to_thread(self._store.append_event, run_id, seq, event_name, data)
         await channel.push({"seq": seq, "event": event_name, "data": data})
 
+    # -- notification outbox (fleet-wide milestones) -----------------------
+
+    @staticmethod
+    def _notification_payload(row: RunRow, node: Optional[str]) -> dict:
+        """A METADATA-ONLY milestone payload, built field-by-field from the run row —
+        there is deliberately no field for prompt/code/diff/target contents, so the
+        outbox can never leak run content by construction. ``target`` is the portable
+        ref (a name), which is metadata, not target data."""
+        def _iso(dt):
+            return dt.isoformat() if dt is not None else None
+
+        return {
+            "target": row.target,
+            "task_type": row.task_type,   # "sim"/"burn" (metaphor via the enum)
+            "status": row.status,
+            "cost_usd": row.cost_usd,
+            "node": node,
+            "created_at": _iso(row.created_at),
+            "started_at": _iso(row.started_at),
+            "ended_at": _iso(row.ended_at),
+        }
+
+    def _notify(self, run_id: str, kind: str, *, node: Optional[str] = None) -> None:
+        """(sync) append one milestone to the durable outbox, carrying the run's Slack
+        profile, idempotently (dedupe on (run_id, kind) for once-only milestones).
+        Best-effort: an outbox write must never break a run."""
+        row = self._store.get_run(run_id)
+        if row is None:
+            return
+        try:
+            self._store.append_notification(
+                run_id, kind, slack_profile=row.slack_profile,
+                payload=self._notification_payload(row, node),
+            )
+        except Exception:  # noqa: BLE001 — the outbox is an aid, never load-bearing
+            pass
+
+    # -- alert-class notifications (metadata-only, routed to the run's profile) --
+
+    def _emit_cost_alert(self, row: Optional[RunRow]) -> None:
+        """(sync) A run that crossed a cost threshold raises ONE cost_threshold alert.
+        A null-profile run raises nothing (opt-out). Checks the per-run threshold first,
+        then the target's rolling-window budget crossing — at most one alert per run."""
+        cfg = self._cost_alerts
+        if row is None or row.slack_profile is None or not cfg.enabled:
+            return
+        payload: Optional[dict] = None
+        if cfg.per_run is not None and (row.cost_usd or 0) >= cfg.per_run:
+            payload = self._notification_payload(row, node="cost_alert")
+            payload.update({"reason": REASON_PER_RUN, "threshold": cfg.per_run})
+        elif cfg.budget is not None:
+            window_total = self._window_budget_crossing(row, cfg)
+            if window_total is not None:
+                payload = self._notification_payload(row, node="cost_alert")
+                payload.update({"reason": REASON_WINDOW, "budget": cfg.budget,
+                                "window_total": window_total, "window_hours": cfg.window_hours})
+        if payload is None:
+            return
+        try:
+            self._store.append_notification(
+                row.run_id, NOTIFY_COST_THRESHOLD,
+                slack_profile=row.slack_profile, payload=payload)
+        except Exception:  # noqa: BLE001 — an alert must never break a run
+            pass
+
+    def _window_budget_crossing(self, row: RunRow, cfg: CostAlertConfig) -> Optional[float]:
+        """The scoped rolling-window total for the run's target if THIS run's reconciled
+        cost is what tipped it OVER the budget (under→over transition); else ``None``, so
+        the alert fires exactly once — on the crossing run, not every run after."""
+        from datetime import timedelta
+
+        anchor = row.ended_at or row.created_at
+        if anchor is None:
+            return None
+        window_start = anchor - timedelta(hours=cfg.window_hours)
+        summary = self._store.cost_summary({"target": row.target}, created_from=window_start)
+        total_after = float(summary.get("cost_usd", 0) or 0)
+        total_before = total_after - (row.cost_usd or 0)
+        if total_before < cfg.budget <= total_after:
+            return round(total_after, 8)
+        return None
+
+    def record_regression(self, run_id: str, gate_result: dict) -> bool:
+        """Emit a regression alert from an EXISTING Phase-3 eval-gate result (a client of
+        the gate, not a new eval path). Carries only the regressed axes' metadata (which
+        metric, baseline band vs observed) — never eval content. A no-op when the run is
+        unknown, opted out (null profile), or the gate passed. Returns whether emitted."""
+        row = self._store.get_run(run_id)
+        if row is None or row.slack_profile is None:
+            return False
+        axes = regressed_axes(gate_result)
+        if not axes:
+            return False  # gate passed / nothing regressed
+        payload = self._notification_payload(row, node="regression")
+        payload["axes"] = axes
+        for key in ("k", "n"):
+            if isinstance(gate_result, dict) and key in gate_result:
+                payload[key] = gate_result[key]
+        return bool(self._store.append_notification(
+            run_id, NOTIFY_REGRESSION, slack_profile=row.slack_profile, payload=payload))
+
+    def profile_digest(self, profile: str, *, window_hours: Optional[float] = None) -> dict:
+        """A metadata-only fleet digest for ONE Slack profile: the runs that named it,
+        counted by status, with total cost + top targets. ``window_hours`` bounds the
+        window (None = all time)."""
+        created_from = None
+        if window_hours is not None:
+            from datetime import timedelta, timezone
+
+            created_from = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+        return self._store.profile_digest(profile, created_from=created_from)
+
     async def _finalize(self, run_id: str, channel: _Channel) -> None:
         """Emit the explicit terminal event with the run's final status + cost, then
         close the feed so clients learn the outcome from the stream itself. This is the
@@ -469,6 +632,12 @@ class RunManager:
         if row is not None:
             await self._emit(run_id, channel, EVENT_TERMINAL,
                              {"status": row.status, "cost_usd": row.cost_usd})
+            # Milestone: the run reached a terminal state (final status + cost). Once-only
+            # per run, so a kill→restart→resume that re-finalizes won't double-append.
+            await asyncio.to_thread(self._notify, run_id, NOTIFY_RUN_TERMINAL, node="terminal")
+            # Cost/budget alert: reconciled cost is known now, so this is where a run
+            # that crossed a threshold raises its (quiet, once-per-run) cost alert.
+            await asyncio.to_thread(self._emit_cost_alert, row)
         await channel.close()
         if self._run_observer is not None and row is not None and row.plan_id is not None:
             self._run_observer(run_id, row.plan_id)  # advance the owning plan's build
@@ -547,6 +716,22 @@ class RunManager:
     def list_targets(self) -> list[str]:
         """Targets the registry knows about (for the UI launch selector)."""
         return self._store.list_targets()
+
+    # -- Slack profiles + notification outbox (fleet-wide feed) ------------
+
+    def slack_profiles(self) -> list[dict]:
+        """The NON-SECRET Slack profiles a run may select — names + channel, no tokens
+        (for CLI validate/tab-complete and the UI dropdown)."""
+        return self._slack_registry.public_profiles()
+
+    def read_notifications(self, *, after_seq: int = 0, limit: int = 100) -> dict:
+        """The bridge's at-least-once pull feed: the outbox tail past ``after_seq``
+        (oldest-first), plus ``total``/``last_seq`` so a consumer can advance a durable
+        cursor and know how far behind it is."""
+        rows = self._store.read_notifications(after_seq=after_seq, limit=limit)
+        summary = self._store.notifications_summary()
+        return {"notifications": rows, "total": summary["total"],
+                "last_seq": summary["last_seq"]}
 
     def active_count(self) -> int:
         """Runs still in flight (queued/running/awaiting_gate) — the header count."""

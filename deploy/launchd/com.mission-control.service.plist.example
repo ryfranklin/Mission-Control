@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Mission Control — the HTTP service (launchd user agent, TEMPLATE).
+
+  The service binds 127.0.0.1:8000 (loopback only, v1 no-auth boundary) and needs
+  Postgres up first. Copy to ~/Library/LaunchAgents/com.mission-control.service.plist,
+  replace every __PLACEHOLDER__, then `launchctl bootstrap gui/$(id -u) <plist>`.
+
+  Placeholders:
+    __REPO__            absolute path to this checkout        (e.g. ~/repos/Mission-Control)
+    __PYTHON__          the venv python                       (e.g. __REPO__/.venv/bin/python)
+    __ENV_FILE__        env file with MC_* config             (referenced by wrapper.sh)
+    __HOMEBREW_PREFIX__ `brew --prefix`                       (/opt/homebrew or /usr/local)
+
+  No secrets live here — all real config comes from the env file via wrapper.sh.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mission-control.service</string>
+
+  <!-- wrapper.sh sources the env file, fixes PATH/libpq, waits for Postgres, then execs -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO__/deploy/launchd/wrapper.sh</string>
+    <string>__PYTHON__</string>
+    <string>-m</string>
+    <string>mission_control.service</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+
+  <!-- Minimal env: point the wrapper at the dependency to wait for. Everything else
+       (MC_POSTGRES_URL, MC_SLACK_REGISTRY, MC_DEFAULT_SLACK_PROFILE, MC_SERVICE_SDK, …)
+       comes from __ENV_FILE__. Match host:port to the Postgres in docker-compose. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MC_WAIT_TCP</key>
+    <string>127.0.0.1:5432</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- Back off between crash restarts so a down dependency doesn't hot-loop. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__REPO__/deploy/launchd/logs/service.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO__/deploy/launchd/logs/service.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>

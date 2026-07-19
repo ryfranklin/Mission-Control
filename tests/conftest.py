@@ -21,7 +21,20 @@ def pytest_configure(config) -> None:
     and point the session's ``MC_POSTGRES_URL`` at it — every store the tests build
     (via ``postgres_checkpointer``) then lands there. Honor an explicit
     ``MC_TEST_POSTGRES_URL`` override. A no-op if Postgres is unreachable (those tests
-    skip anyway)."""
+    skip anyway).
+
+    Also make the suite HERMETIC: the runtime reads deployment config from ``MC_*`` env
+    (``MC_API_TOKEN`` gating the mutating endpoints, ``MC_SLACK_REGISTRY`` /
+    ``MC_DEFAULT_SLACK_PROFILE`` / ``MC_COST_ALERT_*``, …) via ``*.from_env()``. A
+    developer running an operator box has these set in their shell, which would leak into
+    the tests — e.g. an ambient ``MC_API_TOKEN`` makes every unauthenticated ``approve``
+    a 401, so a gated run never resumes and its SSE feed tails forever (a hang, not a
+    failure). Clear every ``MC_*`` var except the Postgres URLs this isolation needs, so
+    the suite builds clean services regardless of shell. Tests that WANT config inject it
+    explicitly (``create_app(auth_token=…)``, ``RunManager(slack_registry=…)``)."""
+    _keep = {"MC_POSTGRES_URL", "MC_TEST_POSTGRES_URL"}
+    for var in [k for k in os.environ if k.startswith("MC_") and k not in _keep]:
+        del os.environ[var]
     if os.environ.get("MC_TEST_POSTGRES_URL"):
         os.environ["MC_POSTGRES_URL"] = os.environ["MC_TEST_POSTGRES_URL"]
         return
@@ -111,6 +124,10 @@ class InMemoryRunStore:
     def __init__(self) -> None:
         self._rows: dict[str, dict] = {}
         self._events: dict[str, list[dict]] = {}
+        # The fleet-wide notification outbox: a global monotonic seq across ALL runs,
+        # deduped on (run_id, kind) for once-only milestones — mirrors the pg table.
+        self._notifications: list[dict] = []
+        self._notify_seq = 0
         self._lock = threading.Lock()
 
     @staticmethod
@@ -123,12 +140,12 @@ class InMemoryRunStore:
             "task_type": None, "status": "queued", "cost_usd": 0.0,
             "created_at": self._now(), "started_at": None, "ended_at": None,
             "detail": None, "plan_id": None, "plan_unit_seq": None,
-            "changes_json": None,
+            "changes_json": None, "slack_profile": None,
         })
 
     # transitions ---------------------------------------------------------
     def launch(self, run_id, *, task_type=None, target=None, local_path=None,
-               plan_id=None, plan_unit_seq=None, subject=None):
+               plan_id=None, plan_unit_seq=None, subject=None, slack_profile=None):
         with self._lock:
             if run_id not in self._rows:
                 row = self._ensure(run_id)
@@ -136,6 +153,7 @@ class InMemoryRunStore:
                 row["local_path"] = local_path
                 row["plan_id"], row["plan_unit_seq"] = plan_id, plan_unit_seq
                 row["subject"] = subject
+                row["slack_profile"] = slack_profile
 
     def mark_running(self, run_id, *, target=None, local_path=None):
         with self._lock:
@@ -227,6 +245,28 @@ class InMemoryRunStore:
             targets = {r["target"] for r in self._rows.values() if r["target"]}
         return sorted(targets)
 
+    def profile_digest(self, slack_profile, *, created_from=None, top_n=5):
+        with self._lock:
+            rows = [r for r in self._rows.values()
+                    if r.get("slack_profile") == slack_profile
+                    and (created_from is None or r["created_at"] >= created_from)]
+        by_status, by_target = {}, {}
+        for r in rows:
+            by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+            if r["target"]:
+                tg = by_target.setdefault(r["target"], {"runs": 0, "cost_usd": 0.0})
+                tg["runs"] += 1
+                tg["cost_usd"] += r["cost_usd"]
+        top = sorted(by_target.items(), key=lambda kv: -kv[1]["cost_usd"])[:top_n]
+        return {
+            "profile": slack_profile,
+            "runs": len(rows),
+            "cost_usd": round(sum(r["cost_usd"] for r in rows), 8),
+            "by_status": by_status,
+            "top_targets": [{"target": k, "runs": v["runs"], "cost_usd": round(v["cost_usd"], 8)}
+                            for k, v in top],
+        }
+
     # durable event log ---------------------------------------------------
     def append_event(self, run_id, seq, event_type, data):
         with self._lock:
@@ -243,6 +283,32 @@ class InMemoryRunStore:
         with self._lock:
             log = self._events.get(run_id, [])
             return max((e["seq"] for e in log), default=-1)
+
+    # notification outbox -------------------------------------------------
+    def append_notification(self, run_id, kind, *, slack_profile=None, payload):
+        from mission_control.runs_store import _ONCE_ONLY_KINDS
+        with self._lock:
+            if kind in _ONCE_ONLY_KINDS and any(
+                n["run_id"] == run_id and n["kind"] == kind for n in self._notifications
+            ):
+                return False
+            self._notify_seq += 1
+            self._notifications.append({
+                "seq": self._notify_seq, "run_id": run_id,
+                "slack_profile": slack_profile, "kind": kind, "payload": payload,
+                "created_at": self._now(),
+            })
+            return True
+
+    def read_notifications(self, *, after_seq=0, limit=100):
+        with self._lock:
+            rows = sorted(self._notifications, key=lambda n: n["seq"])
+            return [dict(n) for n in rows if n["seq"] > after_seq][:limit]
+
+    def notifications_summary(self):
+        with self._lock:
+            return {"total": len(self._notifications),
+                    "last_seq": max((n["seq"] for n in self._notifications), default=0)}
 
 
 @pytest.fixture
@@ -264,15 +330,23 @@ def make_service(tmp_path):
     created = []
     counter = {"n": 0}
 
-    def _make(store, *, worker_factory=None, telemetry_dir=None):
+    def _make(store, *, worker_factory=None, telemetry_dir=None, slack_registry=None,
+              checkpointer=None, cost_alerts=None, default_slack_profile=None,
+              auth_token=None):
         counter["n"] += 1
+        # A shared checkpointer + shared store = the durable substrate; a fresh manager
+        # with empty channels = the restarted process. Pass the SAME checkpointer to two
+        # calls to simulate a restart that can still RESUME (not just replay events).
         manager = RunManager(
-            checkpointer=MemorySaver(),
+            checkpointer=checkpointer or MemorySaver(),
             runs_store=store,
             worker_factory=worker_factory or (lambda: StubWorker()),
             telemetry_dir=telemetry_dir or (tmp_path / f"telemetry-{counter['n']}"),
+            slack_registry=slack_registry,
+            cost_alerts=cost_alerts,
+            default_slack_profile=default_slack_profile,
         )
-        client = TestClient(create_app(manager))
+        client = TestClient(create_app(manager, auth_token=auth_token))
         client.__enter__()
         created.append(client)
         return client

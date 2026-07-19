@@ -8,6 +8,8 @@ NO auth (see ``__main__`` for the 127.0.0.1 bind).
 from __future__ import annotations
 
 import json
+import os
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -19,12 +21,18 @@ from starlette.concurrency import run_in_threadpool
 from ..repo_source import BootstrapError
 from .manager import RunConflict, RunManager, RunNotFound
 from .metrics import compute_metrics
+from ..slack_registry import OPT_OUT_LABEL, UnknownSlackProfile
 from .models import (
     DecisionResponse,
     LaunchRequest,
     MetricsResponse,
+    Notification,
+    NotificationList,
+    ProfileDigest,
     RunDetail,
     RunList,
+    SlackProfile,
+    SlackProfileList,
     TargetList,
 )
 from .plan_models import (
@@ -89,6 +97,32 @@ async def _plan_turn_sse(gen):
         await fut
 
 
+# The env var holding the API bearer token. Unset ⇒ the mutating endpoints stay OPEN
+# (the backward-compatible localhost/dev posture); set ⇒ they require this token. Shared
+# with the Slack bridge (its ServiceClient sends the same token). No token in source.
+MC_API_TOKEN_ENV = "MC_API_TOKEN"
+
+
+def require_api_token(
+    request: Request, authorization: Optional[str] = Header(default=None)
+) -> None:
+    """A pluggable auth gate for mutating endpoints. When ``app.state.auth_token`` is
+    unset (``MC_API_TOKEN`` absent), the endpoint is OPEN — nothing changes for existing
+    localhost/dev use. When set, the request MUST carry ``Authorization: Bearer <token>``
+    matching it (constant-time compare); otherwise 401. This ensures a gate decision
+    requires an authenticated principal even off the Slack surface — the seam is no
+    longer no-auth once a token is configured."""
+    expected = getattr(request.app.state, "auth_token", None)
+    if not expected:
+        return  # no token configured → open (backward-compatible)
+    scheme, _, token = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(token.strip(), expected):
+        raise HTTPException(
+            status_code=401, detail="missing or invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
 def get_manager(request: Request) -> RunManager:
     return request.app.state.manager
 
@@ -104,12 +138,18 @@ def create_app(
     manager: RunManager,
     plan_manager: Optional[PlanManager] = None,
     builder=None,
+    *,
+    auth_token: Optional[str] = None,
 ) -> FastAPI:
     """Build the app around a ready :class:`RunManager` (its graph/checkpointer/
     ledger are already wired). Kept injectable so tests supply their own. When a
     :class:`PlanManager` is supplied, the ``/plans`` seam is mounted over it; when a
     :class:`~.plan_builder.PlanBuilder` is also supplied, finalize dispatches the
-    plan's units as runs (the hand-off to Mission Control)."""
+    plan's units as runs (the hand-off to Mission Control).
+
+    ``auth_token`` gates the mutating run endpoints behind a bearer token; when omitted
+    it falls back to ``MC_API_TOKEN`` in the environment, and stays open when neither is
+    set (backward-compatible)."""
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # On startup, resume any build left mid-flight by a previous process — the
@@ -124,6 +164,10 @@ def create_app(
     app.state.manager = manager
     app.state.plans = plan_manager
     app.state.builder = builder
+    # Bearer token for the mutating endpoints: explicit arg wins, else MC_API_TOKEN, else
+    # None (open). Read once at build so a missing/empty var is unambiguously "open".
+    app.state.auth_token = auth_token if auth_token is not None else (
+        os.environ.get(MC_API_TOKEN_ENV) or None)
 
     # Additive browser access for a separately-built SPA: permit an env-configured
     # dev-origin allow-list (default none → unchanged). Does not relax the loopback
@@ -135,7 +179,11 @@ def create_app(
     @app.post("/runs", response_model=RunDetail, status_code=201)
     async def launch_run(body: LaunchRequest, mgr: RunManager = Depends(get_manager)) -> RunDetail:
         try:
-            run_id = mgr.launch(target=body.target, task_type=body.task_type, prompt=body.prompt)
+            run_id = mgr.launch(target=body.target, task_type=body.task_type, prompt=body.prompt,
+                                slack_profile=body.slack_profile)
+        except UnknownSlackProfile as exc:
+            # Reject an unknown Slack profile early with a clear error (nothing launched).
+            raise HTTPException(status_code=400, detail=str(exc))
         except RunConflict as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return RunDetail.from_row(mgr.get_run(run_id))
@@ -151,19 +199,24 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc))
         return DecisionResponse(run_id=row.run_id, status=row.status)
 
-    @app.post("/runs/{run_id}/approve", response_model=DecisionResponse)
+    # The gate-decision / run-control endpoints MUTATE a run (apply a burn, scrub, or
+    # cancel), so each is gated behind require_api_token — a decision needs an
+    # authenticated principal even off the Slack surface. Reads (GET) stay open.
+    _auth = [Depends(require_api_token)]
+
+    @app.post("/runs/{run_id}/approve", response_model=DecisionResponse, dependencies=_auth)
     async def approve(run_id: str, mgr: RunManager = Depends(get_manager)) -> DecisionResponse:
         return _decision(mgr.approve, run_id)
 
-    @app.post("/runs/{run_id}/reject", response_model=DecisionResponse)
+    @app.post("/runs/{run_id}/reject", response_model=DecisionResponse, dependencies=_auth)
     async def reject(run_id: str, mgr: RunManager = Depends(get_manager)) -> DecisionResponse:
         return _decision(mgr.reject, run_id)
 
-    @app.post("/runs/{run_id}/scrub", response_model=DecisionResponse)
+    @app.post("/runs/{run_id}/scrub", response_model=DecisionResponse, dependencies=_auth)
     async def scrub(run_id: str, mgr: RunManager = Depends(get_manager)) -> DecisionResponse:
         return _decision(mgr.scrub, run_id)
 
-    @app.post("/runs/{run_id}/cancel", response_model=DecisionResponse)
+    @app.post("/runs/{run_id}/cancel", response_model=DecisionResponse, dependencies=_auth)
     async def cancel(run_id: str, mgr: RunManager = Depends(get_manager)) -> DecisionResponse:
         # Distinct from scrub: stops an IN-FLIGHT (mid-node) run at the next node
         # boundary and tears down; scrub only resolves a run paused at the gate.
@@ -214,6 +267,62 @@ def create_app(
     @app.get("/targets", response_model=TargetList)
     def list_targets(mgr: RunManager = Depends(get_manager)) -> TargetList:
         return TargetList(targets=mgr.list_targets())
+
+    # -- Slack profiles (the launch selector) ------------------------------
+
+    @app.get("/slack/profiles", response_model=SlackProfileList)
+    def slack_profiles(mgr: RunManager = Depends(get_manager)) -> SlackProfileList:
+        """The NON-SECRET Slack profiles a run may select — names + channel, NO tokens.
+        Lets the CLI validate/tab-complete and the UI populate a dropdown. ``none`` is
+        the canonical opt-out (a null ``slack_profile`` = a silent run)."""
+        return SlackProfileList(
+            profiles=[SlackProfile(**p) for p in mgr.slack_profiles()],
+            none=OPT_OUT_LABEL,
+        )
+
+    # -- fleet-wide notification outbox (the bridge's pull feed) -----------
+
+    @app.get("/notifications", response_model=NotificationList)
+    def list_notifications(
+        after: int = Query(0, ge=0),
+        limit: int = Query(100, ge=1, le=1000),
+        mgr: RunManager = Depends(get_manager),
+    ) -> NotificationList:
+        """The fleet-wide milestone feed: notifications with ``seq > after`` (oldest-
+        first), plus ``total``/``last_seq`` so a bridge advances a durable cursor. This
+        is the at-least-once pull contract — the bridge persists its own cursor and
+        dedupes on ``seq``."""
+        data = mgr.read_notifications(after_seq=after, limit=limit)
+        return NotificationList(
+            notifications=[Notification.from_row(r) for r in data["notifications"]],
+            total=data["total"], last_seq=data["last_seq"],
+        )
+
+    @app.get("/notifications/digest", response_model=ProfileDigest)
+    def notifications_digest(
+        profile: str,
+        hours: Optional[float] = Query(None, gt=0),
+        mgr: RunManager = Depends(get_manager),
+    ) -> ProfileDigest:
+        """A metadata-only fleet digest scoped to ONE Slack profile — the runs that named
+        it, counted by status, with total cost + top targets. ``hours`` bounds the window
+        (omit for all-time). The bridge posts this per active profile on a schedule."""
+        data = mgr.profile_digest(profile, window_hours=hours)
+        return ProfileDigest(**data, window_hours=hours)
+
+    @app.post("/runs/{run_id}/alerts/regression")
+    def emit_regression(
+        run_id: str, gate_result: dict, mgr: RunManager = Depends(get_manager)
+    ) -> dict:
+        """Emit a regression alert for ``run_id`` from an EXISTING Phase-3 eval-gate
+        result (``GateResult.to_json()``). A client of the gate result, not a new eval
+        path: only the regressed axes' metadata is kept. A no-op (``emitted=false``) when
+        the gate passed or the run opted out of Slack; 404 when the run is unknown."""
+        try:
+            mgr.get_run(run_id)
+        except RunNotFound:
+            raise HTTPException(status_code=404, detail=f"no such run: {run_id}")
+        return {"run_id": run_id, "emitted": mgr.record_regression(run_id, gate_result)}
 
     # -- live feed (SSE) ---------------------------------------------------
 

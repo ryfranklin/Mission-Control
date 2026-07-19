@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Mission Control — the Slack bridge (launchd user agent, TEMPLATE).
+
+  A SEPARATE long-running client: it connects OUT to Slack via Socket Mode (no public
+  endpoint) and polls the service's notification outbox. It needs the SERVICE up first.
+  Copy to ~/Library/LaunchAgents/com.mission-control.slack.plist, replace every
+  __PLACEHOLDER__, then `launchctl bootstrap gui/$(id -u) <plist>`.
+
+  Placeholders: same set as the service plist (__REPO__ / __PYTHON__ / __ENV_FILE__ /
+  __HOMEBREW_PREFIX__). The bridge reads MC_SERVICE_URL, MC_SLACK_REGISTRY, the per-profile
+  bot/app token env vars, and (optional) MC_SLACK_CURSOR / MC_LOG_LEVEL — ALL from the env
+  file. No secrets live here.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mission-control.slack</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO__/deploy/launchd/wrapper.sh</string>
+    <string>__PYTHON__</string>
+    <string>-m</string>
+    <string>mission_control.slack.bridge</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+
+  <!-- Wait for the service seam before starting. Point at a cheap GET on the service
+       (its base URL is MC_SERVICE_URL in the env file; keep this in sync). -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MC_WAIT_HTTP</key>
+    <string>http://127.0.0.1:8000/targets</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__REPO__/deploy/launchd/logs/slack.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO__/deploy/launchd/logs/slack.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
