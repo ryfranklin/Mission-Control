@@ -29,6 +29,8 @@ re-implementing any orchestration.
                                    teardown ◄───────────────────────┘   (no worktree leaks)
 ```
 
+▶ **Interactive architecture map:** [architecture.html](./architecture.html) (open in a browser) — tiered Clients → seam → runtime → durable state, click-through detail, metaphor overlay.
+
 ---
 
 ## Why it's different

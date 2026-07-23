@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mission Control — Interactive Architecture</title>
+<!--
+  A single self-contained architecture map of Mission Control.
+  Supplements README.md — the Mermaid diagrams there stay the source-of-record;
+  this is the interactive view. No build step, no CDN, no network. Opens over
+  file:// with no console errors. Vanilla JS + inline SVG connector overlay.
+-->
+<style>
+  :root {
+    /* status tokens — always paired with a glyph + text label, never colour alone */
+    --go:        #2fe57a;   /* ● go / applied            */
+    --inflight:  #ffb020;   /* ◆ in-flight / gate        */
+    --fault:     #ff3b47;   /* ▲ fault / scrub           */
+    --telemetry: #22d3ee;   /* ◈ telemetry / priced feed */
+
+    --bg:        #0b1016;
+    --bg-2:      #0e141c;
+    --surface:   #1e2833;   /* tier surface */
+    --surface-2: #172029;
+    --line:      #2a3846;
+    --line-dim:  #223040;
+    --text:      #c9d5e1;
+    --muted:     #8598ab;
+    --dim:       #5c6f81;
+    --seam:      #7cc7ff;
+
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 50% -10%, #12202e 0%, transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--seam); }
+
+  /* ---- header ---- */
+  header {
+    padding: 22px 26px 10px;
+    border-bottom: 1px solid var(--line-dim);
+    display: flex; flex-wrap: wrap; gap: 18px 28px; align-items: flex-end;
+  }
+  .title h1 {
+    margin: 0; font-size: 19px; letter-spacing: .3px; font-weight: 650;
+  }
+  .title h1 .mark { color: var(--go); }
+  .title p { margin: 4px 0 0; color: var(--muted); max-width: 62ch; }
+  .title .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+
+  .controls { margin-left: auto; display: flex; flex-direction: column; gap: 10px; align-items: flex-end; }
+  .toggle {
+    display: inline-flex; align-items: center; gap: 8px; cursor: pointer;
+    font-size: 12.5px; color: var(--muted); user-select: none;
+    border: 1px solid var(--line); background: var(--surface-2);
+    padding: 6px 11px; border-radius: 7px;
+  }
+  .toggle:hover { border-color: var(--seam); color: var(--text); }
+  .toggle input { accent-color: var(--seam); width: 15px; height: 15px; margin: 0; }
+
+  /* ---- legend ---- */
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-family: var(--mono); font-size: 11.5px; }
+  .legend .item { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+  .legend .g { font-size: 13px; line-height: 1; }
+  .g.go        { color: var(--go); }
+  .g.inflight  { color: var(--inflight); }
+  .g.fault     { color: var(--fault); }
+  .g.telemetry { color: var(--telemetry); }
+
+  /* ---- layout: diagram + detail drawer ---- */
+  main { display: grid; grid-template-columns: minmax(0,1fr) 340px; gap: 0; align-items: start; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+  .diagram-wrap { padding: 20px 24px 60px; overflow-x: auto; }
+  .diagram { position: relative; min-width: 720px; }
+
+  /* connector overlay sits under the boxes */
+  #wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; overflow: visible; }
+  #wires path { fill: none; stroke: var(--line); stroke-width: 1.4; opacity: .55; }
+  #wires path.flow { stroke: var(--seam); opacity: .38; }
+  #wires path.telemetry { stroke: var(--telemetry); stroke-dasharray: 4 4; opacity: .5; }
+  #wires path.feedback { stroke: var(--telemetry); stroke-dasharray: 2 5; opacity: .42; }
+
+  /* ---- tiers ---- */
+  .tier { position: relative; z-index: 1; margin: 0 0 34px; }
+  .tier-label {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: 2px; text-transform: uppercase;
+    color: var(--dim); margin: 0 0 9px 2px; display: flex; align-items: center; gap: 10px;
+  }
+  .tier-label::after { content: ""; flex: 1; height: 1px; background: var(--line-dim); }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; }
+  .row.center { justify-content: center; }
+
+  /* ---- nodes ---- */
+  .node {
+    position: relative; z-index: 2;
+    background: linear-gradient(180deg, var(--surface) 0%, var(--surface-2) 100%);
+    border: 1px solid var(--line);
+    border-radius: 10px; padding: 11px 13px; min-width: 150px; flex: 1 1 150px; max-width: 240px;
+    text-align: left; color: var(--text); cursor: pointer; font-family: var(--sans);
+    transition: border-color .12s, transform .12s, box-shadow .12s;
+  }
+  .node:hover { border-color: var(--seam); transform: translateY(-1px); }
+  .node:focus-visible { outline: 2px solid var(--seam); outline-offset: 2px; }
+  .node.selected { border-color: var(--go); box-shadow: 0 0 0 1px var(--go), 0 6px 20px -12px var(--go); }
+  .node .n-name { font-weight: 600; font-size: 13.5px; display: flex; align-items: center; gap: 7px; }
+  .node .n-sub { color: var(--muted); font-size: 11.5px; margin-top: 3px; }
+  .node .n-glyph { font-family: var(--mono); font-size: 12px; line-height: 1; }
+
+  /* the seam is the visual centre: one entry point */
+  .node.seam {
+    max-width: 560px; flex-basis: 560px; text-align: center;
+    border-color: var(--seam);
+    background: linear-gradient(180deg, #14202c 0%, #0f1a24 100%);
+    box-shadow: 0 0 0 1px rgba(124,199,255,.25), 0 10px 40px -18px var(--seam);
+    padding: 14px 18px;
+  }
+  .node.seam .n-name { justify-content: center; font-size: 15px; color: var(--seam); }
+  .node.seam .endpoints {
+    font-family: var(--mono); font-size: 10.5px; color: var(--muted);
+    margin-top: 8px; display: flex; flex-wrap: wrap; gap: 4px 8px; justify-content: center;
+  }
+  .node.seam .endpoints span { background: #0b141d; border: 1px solid var(--line-dim); border-radius: 5px; padding: 2px 6px; }
+  .auth-badge {
+    display: inline-flex; align-items: center; gap: 5px; font-family: var(--mono); font-size: 10px;
+    color: var(--inflight); border: 1px solid #4a3a1a; background: #211803; border-radius: 5px;
+    padding: 1px 6px; margin-top: 8px;
+  }
+
+  /* eval / CI cluster reads as a side lane */
+  .tier.eval .row { justify-content: flex-start; }
+  .node.util { background: linear-gradient(180deg, #131b23 0%, #10171e 100%); }
+
+  /* graph inner-node ribbon */
+  .pipeline {
+    font-family: var(--mono); font-size: 10.5px; color: var(--muted);
+    margin-top: 8px; display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+  }
+  .pipeline .step { white-space: nowrap; }
+  .pipeline .arrow { color: var(--dim); }
+
+  /* ---- metaphor overlay badges ---- */
+  .metaphor {
+    display: none; margin-top: 8px; font-family: var(--mono); font-size: 10px;
+    color: #d8c48a; border-top: 1px dashed #3d3418; padding-top: 6px;
+  }
+  .metaphor .m-term { color: #ffcf6b; }
+  body.show-metaphor .metaphor { display: block; }
+  body.show-metaphor .node.has-metaphor { border-color: #6b5a24; }
+
+  /* ---- detail drawer ---- */
+  aside {
+    position: sticky; top: 0; align-self: start; height: 100vh;
+    border-left: 1px solid var(--line-dim); background: var(--bg-2);
+    padding: 22px 20px; overflow-y: auto;
+  }
+  aside .placeholder { color: var(--dim); font-size: 13px; }
+  .d-tier { font-family: var(--mono); font-size: 10.5px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--seam); }
+  .d-title { font-size: 17px; font-weight: 650; margin: 5px 0 2px; }
+  .d-role { color: var(--muted); margin: 6px 0 14px; }
+  .d-metaphor {
+    font-family: var(--mono); font-size: 12px; color: #ffcf6b;
+    background: #1c1707; border: 1px solid #3d3418; border-radius: 7px; padding: 8px 10px; margin: 0 0 14px;
+  }
+  .d-section h4 {
+    font-size: 10.5px; letter-spacing: 1.2px; text-transform: uppercase; color: var(--dim);
+    margin: 14px 0 6px; font-weight: 600;
+  }
+  .d-list { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: 12px; }
+  .d-list li { padding: 3px 0; color: var(--muted); border-bottom: 1px solid var(--line-dim); }
+  .d-list li:last-child { border-bottom: 0; }
+  .d-list li .k { color: var(--text); }
+  .d-status { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11.5px; margin-top: 4px; }
+
+  footer { color: var(--dim); font-size: 11.5px; padding: 0 26px 26px; }
+  kbd { font-family: var(--mono); font-size: 11px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title">
+    <h1><span class="mark">▲</span> Mission Control — Architecture</h1>
+    <p>Durable, observable, cost-aware orchestration for coding agents. One HTTP seam; every surface is a thin client of it.</p>
+    <p class="hint">Click any component for its role and the real files / tables behind it. Supplements <a href="./README.md">README.md</a>.</p>
+  </div>
+  <div class="controls">
+    <label class="toggle">
+      <input type="checkbox" id="metaphor-toggle" />
+      Show Mission&nbsp;Control vocabulary
+    </label>
+    <div class="legend" aria-label="Status legend">
+      <span class="item"><span class="g go">●</span> go / applied</span>
+      <span class="item"><span class="g inflight">◆</span> in-flight / gate</span>
+      <span class="item"><span class="g fault">▲</span> fault / scrub</span>
+      <span class="item"><span class="g telemetry">◈</span> telemetry</span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="diagram-wrap">
+    <div class="diagram" id="diagram">
+      <svg id="wires" aria-hidden="true"></svg>
+
+      <!-- ===== CLIENTS ===== -->
+      <section class="tier" data-tier="Clients">
+        <p class="tier-label">Clients · every surface is a thin client</p>
+        <div class="row" id="row-clients">
+          <button class="node" data-id="cli"></button>
+          <button class="node" data-id="web"></button>
+          <button class="node" data-id="spa"></button>
+          <button class="node has-metaphor" data-id="slack"></button>
+          <button class="node has-metaphor" data-id="planner"></button>
+        </div>
+      </section>
+
+      <!-- ===== SERVICE SEAM ===== -->
+      <section class="tier" data-tier="Service seam">
+        <p class="tier-label">Service seam · the one entry point</p>
+        <div class="row center">
+          <button class="node seam has-metaphor" data-id="seam"></button>
+        </div>
+      </section>
+
+      <!-- ===== RUNTIME CORE ===== -->
+      <section class="tier" data-tier="Runtime core">
+        <p class="tier-label">Runtime core · owns all orchestration</p>
+        <div class="row" id="row-core">
+          <button class="node has-metaphor" data-id="manager"></button>
+          <button class="node has-metaphor" data-id="graph"></button>
+          <button class="node has-metaphor" data-id="worker"></button>
+          <button class="node has-metaphor" data-id="capcom"></button>
+          <button class="node has-metaphor" data-id="live"></button>
+          <button class="node" data-id="worktree"></button>
+        </div>
+      </section>
+
+      <!-- ===== DURABLE STATE ===== -->
+      <section class="tier" data-tier="Durable state">
+        <p class="tier-label">Durable state · Postgres system-of-record</p>
+        <div class="row" id="row-state">
+          <button class="node util" data-id="checkpointer"></button>
+          <button class="node util" data-id="runs"></button>
+          <button class="node util" data-id="runevents"></button>
+          <button class="node util" data-id="notifications"></button>
+          <button class="node util has-metaphor" data-id="plans"></button>
+        </div>
+      </section>
+
+      <!-- ===== EVAL & CI ===== -->
+      <section class="tier eval" data-tier="Eval & CI">
+        <p class="tier-label">Eval &amp; CI gate · cost / quality telemetry</p>
+        <div class="row">
+          <button class="node util has-metaphor" data-id="telemetry"></button>
+          <button class="node util" data-id="analytics"></button>
+          <button class="node util" data-id="evalgate"></button>
+          <button class="node util" data-id="baseline"></button>
+          <button class="node util has-metaphor" data-id="jenkins"></button>
+        </div>
+      </section>
+    </div>
+    <footer>
+      Opens standalone over <kbd>file://</kbd> — no network, no build. The Mermaid diagrams in the README remain the canonical source.
+    </footer>
+  </div>
+
+  <aside id="detail" aria-live="polite">
+    <p class="placeholder">Select a component to inspect its role, key source files, and the Postgres tables or artifacts it owns.</p>
+  </aside>
+</main>
+
+<script>
+"use strict";
+
+// ---- component model: sourced from the real codebase (roles.py, graph.py,
+// runs_store.py, plans_store.py, service/*, slack/*, eval_gate*, Jenkinsfile) ----
+const NODES = {
+  // ------- clients -------
+  cli: {
+    tier: "Clients", name: "CLI", sub: "mission-control", status: null,
+    role: "A thin client of the service API — launch · watch/follow · runs · approve/reject/scrub. Never imports the graph.",
+    files: ["cli.py"],
+    detail: [["talks to", "the seam over HTTP only"], ["config", "--base-url / $MC_SERVICE_URL"]],
+  },
+  web: {
+    tier: "Clients", name: "Control-room Web UI", sub: "htmx · served at /ui", status: null,
+    role: "Server-rendered Jinja + htmx + the htmx SSE extension (no JS build): fleet dashboard, per-run live station, wired go/no-go/scrub, cost/perf dashboard.",
+    files: ["service/web/routes.py", "service/web/templates/*", "service/web/static/vendor/{htmx,sse}.js"],
+    detail: [["replay", "SSE timeline replays durable history before tailing live"], ["cost", "honest 'not yet reconciled', never $0"]],
+  },
+  spa: {
+    tier: "Clients", name: "React SPA", sub: "opt-in · mounted at /app", status: null,
+    role: "An additive single-page-app bundle built in a separate repo. Opt-in: the seam only serves it when MC_SPA_DIST points at a build. Touches no orchestration.",
+    files: ["service/spa.py"],
+    detail: [["mount", "/app (does not shadow any API route)"], ["cors", "MC_UI_DEV_ORIGINS allow-list"]],
+  },
+  slack: {
+    tier: "Clients", name: "Slack app", sub: "Socket Mode · separate process", status: "telemetry",
+    role: "A separate long-running client process. Connects OUT to Slack via Socket Mode (no public endpoint), polls GET /notifications, routes each milestone to the profile's channel as a metadata-only Block Kit card.",
+    files: ["slack/bridge.py", "slack/message.py", "slack/cursor.py", "slack_registry.py"],
+    tables: ["notifications (tailed via a global durable cursor)"],
+    metaphor: "Surfaces go / no-go decisions back to the crew — routes on each run's slack_profile.",
+    detail: [["first message", "run_terminal, end-to-end"], ["routing", "profile absent on this box → skip (another box owns it)"]],
+  },
+  planner: {
+    tier: "Clients", name: "Flight Planner", sub: "interactive INCEPTION walk", status: null,
+    role: "The planner engine behind POST /plans/{id}/turns. A client of the seam: it reads/writes the plan store and, for a brownfield target, reuses the run-launch path to reverse-engineer via a real read-only sim. Adds NO orchestration.",
+    files: ["service/planner.py", "service/plan_builder.py", "aidlc.py", "aidlc_v2/*"],
+    metaphor: "The Flight Planner persona — drives AI-DLC INCEPTION → CONSTRUCTION and hands off a durable Flight Plan.",
+    detail: [["greenfield", "walk INCEPTION stages → units"], ["brownfield", "launch a sim to reverse-engineer, then loop requirements to a readiness gate"]],
+  },
+
+  // ------- seam -------
+  seam: {
+    tier: "Service seam", name: "FastAPI Service — the one entry point", sub: "wraps graph.py · owns no orchestration", status: null,
+    role: "A thin FastAPI app that wraps the runtime. It launches / resolves / streams / queries runs and plans, but the graph still does all orchestration. Every client above drives the runtime purely through these endpoints.",
+    files: ["service/app.py", "service/models.py", "service/metrics.py"],
+    endpoints: ["POST /runs", "/runs/{id}/approve", "/reject", "/scrub", "/cancel", "GET /runs/{id}/events (SSE)", "GET /metrics", "/notifications", "POST /plans", "/plans/{id}/turns", "/finalize"],
+    metaphor: "sim (read-only) and burn (side-effectful) runs are launched here; a burn halts at the go / no-go gate.",
+    detail: [["invariant", "one entry point — no client re-implements orchestration"], ["deploy", "v1 = localhost; service-side bearer auth (5c) gates mutating routes"]],
+  },
+
+  // ------- runtime core -------
+  manager: {
+    tier: "Runtime core", name: "RunManager", sub: "the service's only stateful piece", status: "inflight",
+    role: "Wraps graph.py — does not re-implement orchestration. Launches a run by driving the existing graph in a background task keyed by thread_id, fans the merged live feed to SSE subscribers (and persists every event), resolves the durable go/no-go by resuming interrupt(), cancels at the next node boundary with clean teardown.",
+    files: ["service/manager.py"],
+    metaphor: "On each child run reaching terminal, calls CAPCOM's on_run_terminal to advance the build.",
+    detail: [["launch", "live.stream_run_sync in a worker thread"], ["outbox", "appends run-lifecycle milestones to notifications"]],
+  },
+  graph: {
+    tier: "Runtime core", name: "LangGraph StateGraph", sub: "graph.py · durable shell", status: "inflight",
+    role: "The run lifecycle as a durable LangGraph StateGraph, checkpointed to Postgres and resumable. Nodes are idempotent (recovery is at node boundaries); apply-burn is its own node so a crash never half-applies a change. The durable interrupt() go/no-go survives a restart.",
+    files: ["graph.py", "orchestrator.py (imperative twin)"],
+    pipeline: ["dispatch", "run_worker", "gate", "apply_burn", "teardown"],
+    metaphor: "The Flight Director (orchestrator). The gate is go / no-go; killing a run is a scrub.",
+    detail: [["gate ◆", "interrupt()-based, durable across restart"], ["apply_burn ●", "own node; commit/merge no-op if already applied"], ["scrub ▲", "kill + idempotent teardown, no worktree leak"]],
+  },
+  worker: {
+    tier: "Runtime core", name: "Worker", sub: "SdkWorker / StubWorker", status: null,
+    role: "A minimal Worker interface — investigate(task, workdir). SdkWorker wraps the Claude Agent SDK with fully explicit context (setting_sources=[], no ambient CLAUDE.md), probes the target for an AI-DLC install and composes its rules into the system prompt, and reports per-step usage. StubWorker is a deterministic offline stand-in.",
+    files: ["worker.py", "sdk_worker.py"],
+    metaphor: "The Controller — the worker the Flight Director dispatches into an isolated worktree.",
+    detail: [["context", "explicit only — keeps telemetry honest"], ["steering", "AI-DLC rules composed per target repo at run time"]],
+  },
+  capcom: {
+    tier: "Runtime core", name: "CAPCOM", sub: "build coordinator", status: "inflight",
+    role: "Translates a finalized plan's units into runs on the existing launch path (design → sim, change → gated burn). Drives units in dependency order, verifies each stage's artifacts actually landed, gates the next on the previous being done, and runs a bounded re-run loop for a stage that produces nothing.",
+    files: ["service/plan_builder.py"],
+    tables: ["plan_units (committed status is the authority for what to dispatch)"],
+    metaphor: "CAPCOM — Mission Control's single voice to the worker fleet, so no worker deploys onto missing inputs.",
+    detail: [["edge-triggered", "on SUCCESS: mark unit done → push to git → dispatch unblocked units"], ["portable", "resumes on a different machine from committed unit status"]],
+  },
+  live: {
+    tier: "Runtime core", name: "Live feed", sub: "live.py · merged view", status: "telemetry",
+    role: "Converges two streams of truth into one ordered async iterator: LangGraph node transitions (updates) + priced telemetry (custom). A live view only — the JSONL files stay the durable record byte-for-byte.",
+    files: ["live.py"],
+    metaphor: "Carries the priced telemetry ◈ that every Controller step emits.",
+    detail: [["stream", "graph.astream(stream_mode=['updates','custom'])"], ["events", "NodeTransition · StepMetric · GateWaiting"]],
+  },
+  worktree: {
+    tier: "Runtime core", name: "Worktree isolation", sub: "worktree.py", status: null,
+    role: "Every task runs in its own throwaway git worktree; teardown leaves no leaks. The dispatch node reuses an existing worktree on re-run so recovery is idempotent.",
+    files: ["worktree.py"],
+    detail: [["isolation", "one worktree per task"], ["teardown", "forgiving / idempotent — no leaks"]],
+  },
+
+  // ------- durable state -------
+  checkpointer: {
+    tier: "Durable state", name: "PostgresSaver checkpointer", sub: "LangGraph durability substrate", status: null,
+    role: "LangGraph's private, opaque checkpoint tables (keyed by thread + checkpoint blobs). This is what makes a run survive a crash and resume without re-paying for completed steps. The host-local in-flight checkpoint is deliberately NOT portable.",
+    files: ["graph.py (PostgresSaver.setup())"],
+    tables: ["LangGraph checkpoint tables (private)"],
+    detail: [["identity", "run_id == LangGraph thread_id"], ["recovery", "at node boundaries — whole node re-runs"]],
+  },
+  runs: {
+    tier: "Durable state", name: "runs ledger", sub: "status / cost registry", status: "go",
+    role: "A small, first-class table in the same Postgres — our own denormalized status/cost ledger, one row per run, cheap to list and filter. All writes are upserts keyed by run_id; once-only stamps guarded with COALESCE so a replay can't move them.",
+    files: ["runs_store.py"],
+    tables: ["runs (run_id, status, cost_usd, plan_id, slack_profile, changes_json…)"],
+    detail: [["statuses", "queued · running · awaiting_gate · applied · scrubbed · failed…"], ["cost", "reconciles at teardown"]],
+  },
+  runevents: {
+    tier: "Durable state", name: "run_events", sub: "replay spine", status: "telemetry",
+    role: "The durable per-run event log backing the SSE feed's replay (Last-Event-ID). The in-process channel is the live tail; this table is the durable timeline, so a reconnect after a restart reconstructs the whole run — not just the resume leg.",
+    files: ["runs_store.py"],
+    tables: ["run_events (run_id, seq, event_type, data)"],
+    detail: [["seq", "global per-run counter, continues across restarts"], ["backs", "the /runs/{id}/events SSE replay"]],
+  },
+  notifications: {
+    tier: "Durable state", name: "notifications", sub: "fleet outbox", status: null,
+    role: "A fleet-wide notification outbox — one durable row per run-lifecycle milestone (NOT the per-node firehose). A fleet bridge tails it to learn 'something happened somewhere' without following every run's SSE. Payload is metadata-only by construction.",
+    files: ["runs_store.py"],
+    tables: ["notifications (seq, run_id, slack_profile, kind, payload)"],
+    detail: [["seq", "global monotonic cursor — consumers advance one position"], ["dedupe", "once-only kinds unique on (run_id, kind)"]],
+  },
+  plans: {
+    tier: "Durable state", name: "Flight Plan store", sub: "plans / turns / requirements / units", status: null,
+    role: "The planner's durable, hand-off-able output: the plan, its interactive transcript, the accreting requirements, and the CONSTRUCTION work-list. Committed unit status is the portable-progress record CAPCOM dispatches from.",
+    files: ["plans_store.py", "plan_docs.py"],
+    tables: ["plans", "plan_turns", "plan_requirements", "plan_units"],
+    metaphor: "The Flight Plan — reconciled into Postgres on load, committed to git with produced artifacts.",
+    detail: [["units", "task_type derived from phase; depends_on is a JSONB list of prereqs"], ["methodology", "aidlc / aidlc_v2 (INCEPTION → CONSTRUCTION)"]],
+  },
+
+  // ------- eval & CI -------
+  telemetry: {
+    tier: "Eval & CI", name: "Telemetry + pricing", sub: "JSONL bronze spine", status: "telemetry",
+    role: "Every model request is one JSONL row (input/output/cache tokens, cost_usd, latency, model, step ids). Pricing lives in exactly one module — the single model→price table.",
+    files: ["telemetry.py", "pricing.py"],
+    metaphor: "The priced ◈ per-step record behind every Controller step.",
+    detail: [["spine", "JSONL is the raw/bronze layer — one file per run"], ["price", "model→price table in one place"]],
+  },
+  analytics: {
+    tier: "Eval & CI", name: "DuckDB analytics", sub: "cross-run cost / quality", status: "telemetry",
+    role: "DuckDB queries the JSONL spine in place (read_json_auto, zero ETL) for cross-run cost/quality. Different tool, different job from the transactional Postgres — nothing crammed into one store. Backs GET /metrics.",
+    files: ["analytics.py"],
+    detail: [["reads", "the JSONL bronze spine directly"], ["serves", "the /metrics cross-run pass"]],
+  },
+  evalgate: {
+    tier: "Eval & CI", name: "eval-gate", sub: "exit 0 / nonzero · + MCP", status: "go",
+    role: "Runs the golden suite, compares to baseline.json, and exits 0 (pass) / nonzero (regression) on quality OR total cost — emitting a human report and machine JSON. Also exposed as an MCP server so any agent/IDE can call it over the protocol, same exit-code contract.",
+    files: ["eval_gate.py", "eval_gate_mcp.py", "evals.py", "judge.py"],
+    detail: [["contract", "exit 0 = pass, nonzero = regression"], ["scoring", "deterministic asserts + an LLM judge rubric"]],
+  },
+  baseline: {
+    tier: "Eval & CI", name: "Baseline", sub: "variance-aware regression", status: "inflight",
+    role: "Runs the suite N times and records mean/σ/min-max; the regression check flags a drop only outside a k·σ band — separating a real regression from LLM noise.",
+    files: ["baseline.py"],
+    detail: [["band", "k·σ noise band from N repeats"], ["artifact", "golden/baseline.json"]],
+  },
+  jenkins: {
+    tier: "Eval & CI", name: "Jenkins pipeline", sub: "nonprod gate → prod go/no-go", status: "inflight",
+    role: "Mirrors a Liquibase-style pipeline: a nonprod stage runs eval-gate (fails the build on regression), and a prod stage is a manual go/no-go reachable only if nonprod passed.",
+    files: ["Jenkinsfile", "ci/run_pipeline_demo.sh"],
+    metaphor: "The prod promotion is a manual go / no-go — the same gate metaphor, at the pipeline level.",
+    detail: [["nonprod", "eval-gate blocks a regression from promoting"], ["prod", "manual approval, only if nonprod is green"]],
+  },
+};
+
+const STATUS = {
+  go:        { glyph: "●", label: "go / applied",      cls: "go" },
+  inflight:  { glyph: "◆", label: "in-flight",         cls: "inflight" },
+  fault:     { glyph: "▲", label: "fault",             cls: "fault" },
+  telemetry: { glyph: "◈", label: "telemetry",         cls: "telemetry" },
+};
+
+// ---- render node cards ----
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+
+document.querySelectorAll(".node").forEach(el => {
+  const n = NODES[el.dataset.id];
+  if (!n) return;
+  let glyph = "";
+  if (n.status && STATUS[n.status]) {
+    const s = STATUS[n.status];
+    glyph = `<span class="n-glyph g ${s.cls}" title="${s.label}">${s.glyph}</span>`;
+  }
+  let body = `<div class="n-name">${glyph}<span>${esc(n.name)}</span></div>`;
+  if (n.sub) body += `<div class="n-sub">${esc(n.sub)}</div>`;
+
+  if (n.endpoints) {
+    body += `<div class="endpoints">` + n.endpoints.map(e => `<span>${esc(e)}</span>`).join("") + `</div>`;
+    body += `<div class="auth-badge">◆ bearer auth · mutating routes</div>`;
+  }
+  if (n.pipeline) {
+    body += `<div class="pipeline">` +
+      n.pipeline.map((s, i) => `<span class="step">${esc(s)}</span>` + (i < n.pipeline.length - 1 ? `<span class="arrow">→</span>` : "")).join("") +
+      `</div>`;
+  }
+  if (n.metaphor) {
+    body += `<div class="metaphor"><span class="m-term">▸ Mission Control:</span> ${esc(n.metaphor)}</div>`;
+  }
+  el.innerHTML = body;
+});
+
+// ---- detail drawer ----
+const detail = document.getElementById("detail");
+let selected = null;
+
+function select(id) {
+  const n = NODES[id];
+  if (!n) return;
+  document.querySelectorAll(".node").forEach(e => e.classList.toggle("selected", e.dataset.id === id));
+  selected = id;
+
+  let html = `<div class="d-tier">${esc(n.tier)}</div>`;
+  html += `<div class="d-title">${esc(n.name)}</div>`;
+  if (n.status && STATUS[n.status]) {
+    const s = STATUS[n.status];
+    html += `<div class="d-status g ${s.cls}">${s.glyph}&nbsp;<span>${s.label}</span></div>`;
+  }
+  html += `<p class="d-role">${esc(n.role)}</p>`;
+  if (n.metaphor) html += `<div class="d-metaphor">▸ ${esc(n.metaphor)}</div>`;
+
+  if (n.detail) {
+    html += `<div class="d-section"><h4>Behaviour</h4><ul class="d-list">` +
+      n.detail.map(([k, v]) => `<li><span class="k">${esc(k)}</span> — ${esc(v)}</li>`).join("") + `</ul></div>`;
+  }
+  if (n.files) {
+    html += `<div class="d-section"><h4>Key files</h4><ul class="d-list">` +
+      n.files.map(f => `<li>${esc(f)}</li>`).join("") + `</ul></div>`;
+  }
+  if (n.tables) {
+    html += `<div class="d-section"><h4>Tables / artifacts</h4><ul class="d-list">` +
+      n.tables.map(t => `<li>${esc(t)}</li>`).join("") + `</ul></div>`;
+  }
+  detail.innerHTML = html;
+}
+
+document.querySelectorAll(".node").forEach(el => {
+  el.addEventListener("click", () => select(el.dataset.id));
+});
+
+// ---- metaphor toggle ----
+document.getElementById("metaphor-toggle").addEventListener("change", e => {
+  document.body.classList.toggle("show-metaphor", e.target.checked);
+  requestAnimationFrame(drawWires); // metaphor rows change box heights
+});
+
+// ---- connector overlay ----
+// [from, to, class]. Default anchors: from = bottom-centre, to = top-centre.
+const EDGES = [
+  // clients converge into the one seam
+  ["cli", "seam", "flow"], ["web", "seam", "flow"], ["spa", "seam", "flow"],
+  ["slack", "seam", "flow"], ["planner", "seam", "flow"],
+  // seam into the runtime core
+  ["seam", "manager", "flow"],
+  // runtime core wiring
+  ["manager", "graph", ""], ["manager", "live", ""], ["manager", "capcom", ""],
+  ["graph", "worker", ""], ["graph", "worktree", ""],
+  // core → durable state
+  ["graph", "checkpointer", ""], ["graph", "runs", ""],
+  ["manager", "runevents", ""], ["manager", "notifications", ""],
+  ["capcom", "plans", ""], ["planner", "plans", "flow"],
+  // telemetry / eval lane
+  ["worker", "telemetry", "telemetry"], ["live", "telemetry", "telemetry"],
+  ["telemetry", "analytics", "telemetry"], ["analytics", "evalgate", ""],
+  ["evalgate", "baseline", ""], ["evalgate", "jenkins", ""],
+  // feedback: the outbox drives Slack (routed milestones)
+  ["notifications", "slack", "feedback"],
+];
+
+const svg = document.getElementById("wires");
+const diagram = document.getElementById("diagram");
+const SVGNS = "http://www.w3.org/2000/svg";
+
+function centerBottom(r, d) { return [r.left - d.left + r.width / 2, r.top - d.top + r.height]; }
+function centerTop(r, d)    { return [r.left - d.left + r.width / 2, r.top - d.top]; }
+
+function drawWires() {
+  const d = diagram.getBoundingClientRect();
+  svg.setAttribute("viewBox", `0 0 ${diagram.scrollWidth} ${diagram.scrollHeight}`);
+  svg.setAttribute("width", diagram.scrollWidth);
+  svg.setAttribute("height", diagram.scrollHeight);
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+  for (const [from, to, cls] of EDGES) {
+    const a = document.querySelector(`.node[data-id="${from}"]`);
+    const b = document.querySelector(`.node[data-id="${to}"]`);
+    if (!a || !b) continue;
+    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+    let p1, p2;
+    if (cls === "feedback") {
+      // upward feedback edge: top of source → bottom of target
+      p1 = centerTop(ra, d); p2 = centerBottom(rb, d);
+    } else {
+      p1 = centerBottom(ra, d); p2 = centerTop(rb, d);
+    }
+    const [x1, y1] = p1, [x2, y2] = p2;
+    const dy = Math.max(24, Math.abs(y2 - y1) * 0.4) * (y2 >= y1 ? 1 : -1);
+    const path = document.createElementNS(SVGNS, "path");
+    path.setAttribute("d", `M ${x1} ${y1} C ${x1} ${y1 + dy}, ${x2} ${y2 - dy}, ${x2} ${y2}`);
+    if (cls) path.setAttribute("class", cls);
+    svg.appendChild(path);
+  }
+}
+
+// draw once laid out, and keep in sync with reflow
+window.addEventListener("load", drawWires);
+window.addEventListener("resize", drawWires);
+if (window.ResizeObserver) new ResizeObserver(drawWires).observe(diagram);
+drawWires();
+
+// select the seam first — the hero of the map
+select("seam");
+</script>
+</body>
+</html>
