@@ -29,7 +29,10 @@ re-implementing any orchestration.
                                    teardown ◄───────────────────────┘   (no worktree leaks)
 ```
 
-▶ **Interactive architecture map:** [architecture.html](./architecture.html) (open in a browser) — tiered Clients → seam → runtime → durable state, click-through detail, metaphor overlay.
+▶ **Interactive diagrams** (open in a browser, self-contained — no build/network):
+[architecture.html](./architecture.html) (component map — Clients → seam → runtime → durable state) ·
+[architecture-uml.html](./architecture-uml.html) (UML class diagram of the real classes) ·
+[architecture-sequence.html](./architecture-sequence.html) (sequence flow of a gated burn run).
 
 ---
 

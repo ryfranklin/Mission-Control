@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mission Control — UML Class Diagram</title>
+<!--
+  A detailed UML class diagram of Mission Control, grounded in the real classes
+  (worker.py, sdk_worker.py, orchestrator.py, graph.py, service/*, runs_store.py,
+  plans_store.py, telemetry.py, pricing.py, eval_gate.py, baseline.py, judge.py,
+  analytics.py, slack/*, live.py). Self-contained: inline CSS + vanilla JS + an
+  inline SVG overlay for the relationship connectors. No build, no CDN, no network.
+  Renders over file:// with no console errors. Companion to architecture.html.
+-->
+<style>
+  :root {
+    --go:        #2fe57a;
+    --inflight:  #ffb020;
+    --fault:     #ff3b47;
+    --telemetry: #22d3ee;
+    --iface:     #7cc7ff;
+    --enum:      #c792ea;
+
+    --bg:        #0b1016;
+    --bg-2:      #0e141c;
+    --surface:   #1e2833;
+    --surface-2: #172029;
+    --panel:     #101922;
+    --line:      #2a3846;
+    --line-dim:  #223040;
+    --text:      #c9d5e1;
+    --muted:     #8598ab;
+    --dim:       #5c6f81;
+
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: radial-gradient(1400px 700px at 50% -10%, #12202e 0%, transparent 62%), var(--bg);
+    color: var(--text); font-family: var(--sans); font-size: 13.5px; line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--iface); }
+
+  header {
+    padding: 20px 24px 12px; border-bottom: 1px solid var(--line-dim);
+    display: flex; flex-wrap: wrap; gap: 16px 26px; align-items: flex-end;
+  }
+  .title h1 { margin: 0; font-size: 18px; letter-spacing: .3px; font-weight: 650; }
+  .title h1 .mark { color: var(--go); }
+  .title p { margin: 4px 0 0; color: var(--muted); max-width: 66ch; }
+  .title .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .title a { color: var(--iface); }
+
+  .controls { margin-left: auto; display: flex; flex-direction: column; gap: 9px; align-items: flex-end; }
+  .btnrow { display: flex; gap: 8px; }
+  .toggle, .btn {
+    display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 12px;
+    color: var(--muted); user-select: none; border: 1px solid var(--line);
+    background: var(--surface-2); padding: 6px 11px; border-radius: 7px;
+  }
+  .toggle:hover, .btn:hover { border-color: var(--iface); color: var(--text); }
+  .toggle input { accent-color: var(--iface); width: 15px; height: 15px; margin: 0; }
+
+  /* UML notation legend */
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 11px; }
+  .legend .item { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); white-space: nowrap; }
+  .legend svg { display: block; }
+
+  main { display: grid; grid-template-columns: minmax(0,1fr) 336px; align-items: start; }
+  @media (max-width: 940px) { main { grid-template-columns: 1fr; } }
+
+  .canvas-wrap { padding: 18px 20px 60px; overflow: auto; }
+  .canvas { position: relative; min-width: 1180px; }
+
+  #wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; overflow: visible; }
+  #wires path { fill: none; }
+  #wires .edge { transition: opacity .12s; }
+  .edge.realize   { stroke: var(--iface);     stroke-width: 1.5; stroke-dasharray: 6 4; opacity: .62; }
+  .edge.generalize{ stroke: var(--iface);     stroke-width: 1.5; opacity: .62; }
+  .edge.compose   { stroke: var(--go);        stroke-width: 1.6; opacity: .55; }
+  .edge.aggregate { stroke: var(--telemetry); stroke-width: 1.5; opacity: .5; }
+  .edge.dep       { stroke: var(--muted);     stroke-width: 1.3; stroke-dasharray: 4 4; opacity: .4; }
+  .edge.assoc     { stroke: var(--muted);     stroke-width: 1.3; opacity: .45; }
+  /* focus mode */
+  body.focus #wires .edge { opacity: .06; }
+  body.focus #wires .edge.on { opacity: .95; stroke-width: 2.2; }
+
+  /* packages */
+  .packages { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; position: relative; z-index: 1; }
+  .pkg {
+    background: linear-gradient(180deg, rgba(20,30,40,.55), rgba(12,18,24,.55));
+    border: 1px solid var(--line-dim); border-radius: 12px; padding: 10px 10px 12px;
+    display: flex; flex-direction: column; gap: 9px; flex: 1 1 218px; min-width: 210px; max-width: 260px;
+  }
+  .pkg > h2 {
+    margin: 0 2px 2px; font-family: var(--mono); font-size: 10px; letter-spacing: 1.6px;
+    text-transform: uppercase; color: var(--dim); font-weight: 600;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .pkg > h2 .tab { color: var(--muted); }
+
+  /* class boxes */
+  .uml {
+    position: relative; z-index: 2; background: linear-gradient(180deg, var(--surface), var(--surface-2));
+    border: 1px solid var(--line); border-radius: 8px; overflow: hidden; cursor: pointer;
+    transition: border-color .12s, box-shadow .12s, opacity .12s, transform .12s;
+  }
+  .uml:hover { border-color: var(--iface); transform: translateY(-1px); }
+  .uml.selected { border-color: var(--go); box-shadow: 0 0 0 1px var(--go), 0 8px 22px -14px var(--go); }
+  body.focus .uml { opacity: .28; }
+  body.focus .uml.on { opacity: 1; }
+  body.focus .uml.selected { opacity: 1; }
+
+  .uml .head { padding: 7px 9px 6px; border-bottom: 1px solid var(--line-dim); }
+  .uml .stereo { font-family: var(--mono); font-size: 9.5px; letter-spacing: .4px; color: var(--muted); display: block; }
+  .uml .cname { font-weight: 650; font-size: 13px; letter-spacing: .2px; }
+  .uml.i .cname { color: var(--iface); font-style: italic; }
+  .uml.e .cname { color: var(--enum); }
+  .uml.t .cname { color: var(--telemetry); }
+  .uml.g .cname { color: var(--go); }
+
+  .uml .compartment { padding: 5px 9px; font-family: var(--mono); font-size: 10.5px; line-height: 1.5; border-top: 1px solid var(--line-dim); }
+  .uml .compartment:first-of-type { border-top: 0; }
+  .uml .compartment .row { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .uml .compartment .row .vis { color: var(--dim); }
+  .uml .compartment .row .ty { color: var(--iface); }
+  .uml .methods .row .mn { color: var(--text); }
+  body.compact .uml .compartment { display: none; }
+
+  /* detail drawer */
+  aside {
+    position: sticky; top: 0; align-self: start; height: 100vh; border-left: 1px solid var(--line-dim);
+    background: var(--bg-2); padding: 20px 18px; overflow-y: auto;
+  }
+  aside .placeholder { color: var(--dim); font-size: 13px; }
+  .d-pkg { font-family: var(--mono); font-size: 10px; letter-spacing: 1.4px; text-transform: uppercase; color: var(--dim); }
+  .d-stereo { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .d-name { font-size: 18px; font-weight: 650; margin: 1px 0 2px; }
+  .d-file { font-family: var(--mono); font-size: 11.5px; color: var(--iface); margin: 2px 0 12px; word-break: break-all; }
+  .d-sec h4 { font-size: 10px; letter-spacing: 1.1px; text-transform: uppercase; color: var(--dim); margin: 14px 0 6px; font-weight: 600; }
+  .d-list { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: 11.5px; }
+  .d-list li { padding: 3px 0; color: var(--muted); border-bottom: 1px solid var(--line-dim); }
+  .d-list li:last-child { border-bottom: 0; }
+  .d-list .ty { color: var(--iface); }
+  .d-list .mn { color: var(--text); }
+  .rel { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 11px; padding: 3px 0; color: var(--muted); }
+  .rel .kind { color: var(--dim); min-width: 74px; }
+  .rel .peer { color: var(--text); cursor: pointer; }
+  .rel .peer:hover { color: var(--iface); text-decoration: underline; }
+
+  footer { color: var(--dim); font-size: 11.5px; padding: 0 24px 26px; }
+  kbd { font-family: var(--mono); font-size: 11px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title">
+    <h1><span class="mark">▲</span> Mission Control — UML Class Diagram</h1>
+    <p>The runtime's real classes and how they relate: the <code>Worker</code> interface and its two implementations, the durable graph, the service seam, the Postgres stores, telemetry/pricing, the eval gate, CAPCOM/planner, and the Slack surface.</p>
+    <p class="hint">Click a class to focus its relationships. Companion to the component view in <a href="./architecture.html">architecture.html</a>.</p>
+  </div>
+  <div class="controls">
+    <div class="btnrow">
+      <label class="toggle"><input type="checkbox" id="compact-toggle" /> Compact (names only)</label>
+      <button class="btn" id="reset-btn">Clear focus</button>
+    </div>
+    <div class="legend" id="legend" aria-label="UML notation legend"></div>
+  </div>
+</header>
+
+<main>
+  <div class="canvas-wrap">
+    <div class="canvas" id="canvas">
+      <svg id="wires" aria-hidden="true"></svg>
+      <div class="packages" id="packages"></div>
+    </div>
+    <footer>
+      Notation: <b>◁┄</b> realization (implements) · <b>◆</b> composition (owns) · <b>◇</b> aggregation (holds) · <b>┄▷</b> dependency (uses/produces) · <b>→</b> association.
+      Renders standalone over <kbd>file://</kbd> — no network, no build.
+    </footer>
+  </div>
+
+  <aside id="detail" aria-live="polite">
+    <p class="placeholder">Select a class to see its file, full members, and its relationships (realization, composition, aggregation, dependency).</p>
+  </aside>
+</main>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Class model — sourced from the real code. Members are curated (the load-bearing
+// ones), not exhaustive. "?" marks Optional; "[]" a list. Stereotypes: interface
+// (Protocol), dataclass, enum, TypedDict, service class, LangGraph shell.
+// ---------------------------------------------------------------------------
+const K = { I: "interface", D: "dataclass", E: "enum", TD: "TypedDict", C: "class", G: "LangGraph StateGraph" };
+
+const CLASSES = {
+  // ---- Worker & domain ----
+  TaskType: { pkg: "domain", stereo: K.E, file: "tasks.py",
+    attrs: ["READ_ONLY = sim", "SIDE_EFFECTFUL = burn"], methods: ["+is_side_effectful: bool"] },
+  Task: { pkg: "domain", stereo: K.D, file: "tasks.py",
+    attrs: ["task_id: str", "task_type: TaskType", "prompt: str", "greenfield: bool", "workstream: str?", "stage_slug: str?", "gated: bool"], methods: [] },
+  Worker: { pkg: "domain", stereo: K.I, file: "worker.py",
+    attrs: [], methods: ["+investigate(task, workdir): WorkerResult"] },
+  WorkerResult: { pkg: "domain", stereo: K.D, file: "worker.py",
+    attrs: ["summary: str", "made_changes: bool", "steps: StepUsage[]"], methods: [] },
+  StubWorker: { pkg: "domain", stereo: K.C, file: "worker.py",
+    attrs: [], methods: ["+investigate(task, workdir): WorkerResult"] },
+  SdkWorker: { pkg: "domain", stereo: K.C, file: "sdk_worker.py",
+    attrs: ["model: str", "max_turns: int", "eval_gate_mcp: bool"], methods: ["+investigate(task, workdir): WorkerResult", "-_mcp_servers(): dict"] },
+
+  // ---- Orchestration (durable graph) ----
+  RunGraph: { pkg: "orch", stereo: K.G, file: "graph.py",
+    attrs: ["nodes: dispatch → run_worker →", "  gate → apply_burn → teardown"], methods: ["+build_run_graph(deps): StateGraph", "durable interrupt() go/no-go"] },
+  RunState: { pkg: "orch", stereo: K.TD, file: "graph.py",
+    attrs: ["run_id: str", "task_type: str", "decision: str?  (go/no-go)", "applied: bool", "steps: dict[]", "outcome: str"], methods: [] },
+  Deps: { pkg: "orch", stereo: K.D, file: "graph.py",
+    attrs: ["worker: Worker", "target_ref: str?", "telemetry_dir: Path?", "runs_store: RunStore?"], methods: [] },
+  Orchestrator: { pkg: "orch", stereo: K.C, file: "orchestrator.py",
+    attrs: ["target_repo: Path", "worker: Worker"], methods: ["+dispatch(task): TaskRun", "+run_task(task, approval?): RunResult", "+terminate(run): RunResult"] },
+  TaskRun: { pkg: "orch", stereo: K.D, file: "orchestrator.py",
+    attrs: ["task: Task", "worktree: Worktree", "live: bool"], methods: [] },
+  RunResult: { pkg: "orch", stereo: K.D, file: "orchestrator.py",
+    attrs: ["applied: bool", "decision: str?", "outcome: str", "push_status: str?"], methods: [] },
+  Worktree: { pkg: "orch", stereo: K.D, file: "worktree.py",
+    attrs: ["path: Path", "branch: str", "target_repo: Path"], methods: ["create_worktree() · remove_worktree()", "merge_into_target() · changes()"] },
+
+  // ---- Service seam ----
+  RunManager: { pkg: "service", stereo: K.C, file: "service/manager.py",
+    attrs: ["runs: RunStore", "plans: PlanStore"], methods: ["+launch(...): RunRow", "+approve/reject/scrub/cancel(id): RunRow", "+run_sim(...): SimResult", "+events(id, last_id)", "+cost_summary() · +record_regression()"] },
+  Channel: { pkg: "service", stereo: K.C, file: "service/manager.py",
+    attrs: ["(per-run live SSE fan-out)"], methods: ["+push(event) · +attach(): Queue", "+detach(q) · +next_seq(): int"] },
+  SimResult: { pkg: "service", stereo: K.D, file: "service/manager.py",
+    attrs: ["summary: str", "cost_usd: float"], methods: [] },
+
+  // ---- CAPCOM & Planner ----
+  PlanBuilder: { pkg: "plan", stereo: K.C, file: "service/plan_builder.py",
+    attrs: ["plans: PlanStore", "runs: RunManager", "docs_sync?"], methods: ["+start_build(plan_id)", "+resume_builds()", "+on_run_terminal(run_id, plan_id)"] },
+  PlannerEngine: { pkg: "plan", stereo: K.C, file: "service/planner.py",
+    attrs: ["plans: PlanStore", "brain: PlannerBrain", "sim: SimRunner"], methods: ["+run_turn(plan_id, content): Events", "+reply_for_latest(plan_id): Events"] },
+  PlannerBrain: { pkg: "plan", stereo: K.I, file: "service/planner.py",
+    attrs: [], methods: ["+advance(ctx): Iterator[str]"] },
+  StubPlannerBrain: { pkg: "plan", stereo: K.C, file: "service/planner.py",
+    attrs: [], methods: ["+advance(ctx): Iterator[str]"] },
+  SdkPlannerBrain: { pkg: "plan", stereo: K.C, file: "service/planner.py",
+    attrs: [], methods: ["+advance(ctx): Iterator[str]"] },
+
+  // ---- Persistence (Postgres) ----
+  RunStore: { pkg: "store", stereo: K.C, file: "runs_store.py",
+    attrs: ["(runs · run_events · notifications)"], methods: ["+launch() · +mark_running()", "+mark_awaiting_gate() · +finish()", "+get_run(): RunRow · +list_runs()", "+append_event() · +read_events()", "+append_notification()"] },
+  RunRow: { pkg: "store", stereo: K.D, file: "runs_store.py",
+    attrs: ["run_id: str  (= thread_id)", "target: str?", "status: str", "cost_usd: float", "plan_id: str?", "changes_json: dict?", "slack_profile: str?"], methods: [] },
+  PlanStore: { pkg: "store", stereo: K.C, file: "plans_store.py",
+    attrs: ["(plans · turns · requirements · units)"], methods: ["+open_plan() · +get_plan(): PlanRow", "+upsert_unit() · +list_units()", "+set_unit_status() · +bump_unit_attempts()", "+upsert_requirement() · +append_turn()"] },
+  PlanRow: { pkg: "store", stereo: K.D, file: "plans_store.py",
+    attrs: ["id: str", "target: str?", "mode: str", "methodology: str", "status: str", "workstream: str?"], methods: [] },
+  PlanUnit: { pkg: "store", stereo: K.D, file: "plans_store.py",
+    attrs: ["seq: int", "title: str", "phase: str", "task_type: str", "depends_on: list", "status: str", "gated: bool", "attempts: int"], methods: [] },
+
+  // ---- Telemetry & pricing ----
+  StepUsage: { pkg: "tele", stereo: K.D, file: "telemetry.py",
+    attrs: ["model: str", "input_tokens: int", "output_tokens: int", "cache_read_tokens: int", "latency_ms: int"], methods: [] },
+  StepEvent: { pkg: "tele", stereo: K.D, file: "telemetry.py",
+    attrs: ["step_id: str", "parent_step_id: str?", "cost_usd: float", "context_size_tokens: int", "outcome: str"], methods: ["+from_usage(usage, ...): StepEvent"] },
+  RunTelemetry: { pkg: "tele", stereo: K.D, file: "telemetry.py",
+    attrs: ["steps: StepEvent[]"], methods: ["+summary(): dict", "+summary_line(): str"] },
+  TelemetrySink: { pkg: "tele", stereo: K.C, file: "telemetry.py",
+    attrs: ["(JSONL bronze spine — one file/run)"], methods: ["+record(event) · +close()"] },
+  ModelPrice: { pkg: "tele", stereo: K.D, file: "pricing.py",
+    attrs: ["input_per_mtok: float", "output_per_mtok: float"], methods: ["resolve(model) · price(...)"] },
+
+  // ---- Eval & CI ----
+  GateResult: { pkg: "eval", stereo: K.D, file: "eval_gate.py",
+    attrs: ["passed: bool", "k: float · n: int", "current_quality: float", "current_cost: float", "report: RegressionReport"], methods: ["+exit_code(): int", "+to_json(): dict · +summary_line(): str"] },
+  Baseline: { pkg: "eval", stereo: K.D, file: "baseline.py",
+    attrs: ["metrics: MetricStats"], methods: ["+save(path) · +load(path)", "+from_dict(d): Baseline"] },
+  MetricStats: { pkg: "eval", stereo: K.D, file: "baseline.py",
+    attrs: ["quality: Stat", "cost: Stat  (mean/σ/min-max)"], methods: [] },
+  RegressionReport: { pkg: "eval", stereo: K.D, file: "baseline.py",
+    attrs: ["checks: AxisCheck[]"], methods: ["+regressions(): AxisCheck[]"] },
+  EvalRun: { pkg: "eval", stereo: K.D, file: "evals.py",
+    attrs: ["results: EvalResult[]"], methods: ["run golden set → asserts"] },
+  LlmJudge: { pkg: "eval", stereo: K.C, file: "judge.py",
+    attrs: ["(rubric scored by a stronger model)"], methods: ["+score(...): JudgeResult"] },
+  Analytics: { pkg: "eval", stereo: K.D, file: "analytics.py",
+    attrs: ["(DuckDB over the JSONL spine)"], methods: ["+to_dict() · +print_report()"] },
+
+  // ---- Slack surface ----
+  SlackBridge: { pkg: "slack", stereo: K.C, file: "slack/bridge.py",
+    attrs: ["client: ServiceClient", "registry: SlackRegistry", "active: {profile: ActiveProfile}"], methods: ["+connect() · +poll_once(): int", "+handle_gate_action() · +run_forever()"] },
+  ServiceClient: { pkg: "slack", stereo: K.C, file: "slack/bridge.py",
+    attrs: ["base_url: str"], methods: ["+fetch_notifications() · +get_run()", "+resolve(id, action): GateRelay"] },
+  SlackRegistry: { pkg: "slack", stereo: K.D, file: "slack_registry.py",
+    attrs: ["profiles: {name: SlackProfile}"], methods: ["+from_env() · +get(): SlackProfile", "+validate(name) · +public_profiles()"] },
+  SlackProfile: { pkg: "slack", stereo: K.D, file: "slack_registry.py",
+    attrs: ["name: str", "channel: str?", "approvers: list", "token_env: str?  (NAME, not value)", "app_token_env: str?"], methods: ["+public(): dict"] },
+
+  // ---- Live feed ----
+  NodeTransition: { pkg: "live", stereo: K.D, file: "live.py", attrs: ["node: str", "update: Any"], methods: [] },
+  StepMetric: { pkg: "live", stereo: K.D, file: "live.py", attrs: ["event: StepEvent"], methods: [] },
+  GateWaiting: { pkg: "live", stereo: K.D, file: "live.py", attrs: ["(a burn paused at go/no-go)"], methods: [] },
+};
+
+const PACKAGES = [
+  { id: "domain",  name: "Worker & domain",     tab: "worker.py · tasks.py",     classes: ["TaskType", "Task", "Worker", "WorkerResult", "StubWorker", "SdkWorker"] },
+  { id: "orch",    name: "Orchestration",       tab: "graph.py · orchestrator.py", classes: ["RunGraph", "RunState", "Deps", "Orchestrator", "TaskRun", "RunResult", "Worktree"] },
+  { id: "service", name: "Service seam",        tab: "service/manager.py",       classes: ["RunManager", "Channel", "SimResult"] },
+  { id: "plan",    name: "CAPCOM & Planner",    tab: "service/plan_builder · planner", classes: ["PlanBuilder", "PlannerEngine", "PlannerBrain", "SdkPlannerBrain", "StubPlannerBrain"] },
+  { id: "store",   name: "Persistence · Postgres", tab: "runs_store · plans_store", classes: ["RunStore", "RunRow", "PlanStore", "PlanRow", "PlanUnit"] },
+  { id: "tele",    name: "Telemetry & pricing", tab: "telemetry.py · pricing.py", classes: ["StepUsage", "StepEvent", "RunTelemetry", "TelemetrySink", "ModelPrice"] },
+  { id: "eval",    name: "Eval & CI gate",      tab: "eval_gate · baseline · judge", classes: ["GateResult", "Baseline", "MetricStats", "RegressionReport", "EvalRun", "LlmJudge", "Analytics"] },
+  { id: "slack",   name: "Slack surface",       tab: "slack/* · slack_registry",  classes: ["SlackBridge", "ServiceClient", "SlackRegistry", "SlackProfile"] },
+  { id: "live",    name: "Live feed",           tab: "live.py",                   classes: ["NodeTransition", "StepMetric", "GateWaiting"] },
+];
+
+// Relationships. [a, b, type]:
+//   realize [impl, iface] · dep [from, to] · assoc [from, to]
+//   compose [part, whole] · aggregate [part, whole]   (diamond drawn at `whole`)
+const EDGES = [
+  // realizations
+  ["StubWorker", "Worker", "realize"],
+  ["SdkWorker", "Worker", "realize"],
+  ["StubPlannerBrain", "PlannerBrain", "realize"],
+  ["SdkPlannerBrain", "PlannerBrain", "realize"],
+  // worker / domain wiring
+  ["Worker", "Task", "dep"],
+  ["Worker", "WorkerResult", "dep"],
+  ["StepUsage", "WorkerResult", "compose"],
+  ["Task", "TaskType", "assoc"],
+  // orchestration
+  ["Worker", "Orchestrator", "aggregate"],
+  ["Orchestrator", "Task", "dep"],
+  ["Orchestrator", "TaskRun", "dep"],
+  ["Orchestrator", "RunResult", "dep"],
+  ["Worktree", "TaskRun", "compose"],
+  ["Task", "TaskRun", "aggregate"],
+  ["WorkerResult", "RunResult", "aggregate"],
+  ["RunTelemetry", "RunResult", "aggregate"],
+  ["Worker", "Deps", "aggregate"],
+  ["RunStore", "Deps", "aggregate"],
+  ["Deps", "RunGraph", "aggregate"],
+  ["RunGraph", "RunState", "dep"],
+  ["RunGraph", "Task", "dep"],
+  ["RunGraph", "Worktree", "dep"],
+  // service seam
+  ["RunManager", "RunGraph", "dep"],
+  ["RunStore", "RunManager", "aggregate"],
+  ["PlanStore", "RunManager", "aggregate"],
+  ["Channel", "RunManager", "compose"],
+  ["RunManager", "RunRow", "dep"],
+  ["RunManager", "SimResult", "dep"],
+  // CAPCOM & planner
+  ["PlanStore", "PlanBuilder", "aggregate"],
+  ["RunManager", "PlanBuilder", "aggregate"],
+  ["PlanUnit", "PlanBuilder", "dep"],
+  ["PlanBuilder", "Task", "dep"],
+  ["PlanStore", "PlannerEngine", "aggregate"],
+  ["PlannerBrain", "PlannerEngine", "aggregate"],
+  ["PlannerEngine", "SimResult", "dep"],
+  // persistence
+  ["RunRow", "RunStore", "aggregate"],
+  ["PlanRow", "PlanStore", "aggregate"],
+  ["PlanUnit", "PlanStore", "aggregate"],
+  // telemetry & pricing
+  ["StepEvent", "StepUsage", "dep"],
+  ["StepEvent", "ModelPrice", "dep"],
+  ["StepEvent", "RunTelemetry", "compose"],
+  ["StepEvent", "TelemetrySink", "dep"],
+  ["RunTelemetry", "Orchestrator", "dep"],
+  // eval & CI
+  ["EvalRun", "LlmJudge", "dep"],
+  ["MetricStats", "Baseline", "compose"],
+  ["RegressionReport", "GateResult", "aggregate"],
+  ["Baseline", "GateResult", "dep"],
+  ["EvalRun", "GateResult", "dep"],
+  ["Analytics", "StepEvent", "dep"],
+  // slack
+  ["ServiceClient", "SlackBridge", "aggregate"],
+  ["SlackRegistry", "SlackBridge", "aggregate"],
+  ["SlackProfile", "SlackRegistry", "compose"],
+  ["ServiceClient", "RunManager", "dep"],
+  // live feed
+  ["StepMetric", "StepEvent", "aggregate"],
+  ["NodeTransition", "RunGraph", "dep"],
+];
+
+// ---- render packages + class boxes ----
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+const stereoClass = { [K.I]: "i", [K.E]: "e", [K.TD]: "t", [K.G]: "g", [K.D]: "", [K.C]: "" };
+
+function memberRow(m, isMethod) {
+  // colour a leading +/- and a trailing ": Type"
+  let s = esc(m), vis = "";
+  const vm = s.match(/^([+\-#])\s*/);
+  if (vm) { vis = `<span class="vis">${vm[1]}</span>`; s = s.slice(vm[0].length); }
+  s = s.replace(/:\s*([A-Za-z_][\w\[\]?]*)\s*$/, (x, t) => `: <span class="ty">${t}</span>`);
+  const name = isMethod ? `<span class="mn">${s}</span>` : s;
+  return `<div class="row" title="${esc(m)}">${vis}${name}</div>`;
+}
+
+const pkgHost = document.getElementById("packages");
+PACKAGES.forEach(pkg => {
+  const el = document.createElement("section");
+  el.className = "pkg";
+  let html = `<h2>${esc(pkg.name)} <span class="tab">${esc(pkg.tab)}</span></h2>`;
+  pkg.classes.forEach(id => {
+    const c = CLASSES[id];
+    if (!c) return;
+    const sc = stereoClass[c.stereo] || "";
+    html += `<div class="uml ${sc}" data-id="${id}">`;
+    html += `<div class="head"><span class="stereo">«${esc(c.stereo)}»</span><span class="cname">${esc(id)}</span></div>`;
+    if (c.attrs.length) html += `<div class="compartment attrs">${c.attrs.map(a => memberRow(a, false)).join("")}</div>`;
+    if (c.methods.length) html += `<div class="compartment methods">${c.methods.map(m => memberRow(m, true)).join("")}</div>`;
+    html += `</div>`;
+  });
+  el.innerHTML = html;
+  pkgHost.appendChild(el);
+});
+
+// ---- UML notation legend (inline SVG glyphs) ----
+document.getElementById("legend").innerHTML = [
+  ['<svg width="34" height="12"><line x1="0" y1="6" x2="26" y2="6" stroke="#7cc7ff" stroke-width="1.5" stroke-dasharray="6 4"/><path d="M26,1 L34,6 L26,11 Z" fill="#0e141c" stroke="#7cc7ff" stroke-width="1.3"/></svg>', "realization"],
+  ['<svg width="34" height="12"><line x1="12" y1="6" x2="34" y2="6" stroke="#2fe57a" stroke-width="1.6"/><path d="M0,6 L6,1 L12,6 L6,11 Z" fill="#2fe57a"/></svg>', "composition"],
+  ['<svg width="34" height="12"><line x1="12" y1="6" x2="34" y2="6" stroke="#22d3ee" stroke-width="1.5"/><path d="M0,6 L6,1 L12,6 L6,11 Z" fill="#0e141c" stroke="#22d3ee" stroke-width="1.2"/></svg>', "aggregation"],
+  ['<svg width="34" height="12"><line x1="0" y1="6" x2="30" y2="6" stroke="#8598ab" stroke-width="1.3" stroke-dasharray="4 4"/><path d="M26,2 L34,6 L26,10" fill="none" stroke="#8598ab" stroke-width="1.3"/></svg>', "dependency"],
+  ['<svg width="34" height="12"><line x1="0" y1="6" x2="30" y2="6" stroke="#8598ab" stroke-width="1.3"/><path d="M26,2 L34,6 L26,10" fill="none" stroke="#8598ab" stroke-width="1.3"/></svg>', "association"],
+].map(([g, t]) => `<span class="item">${g}${esc(t)}</span>`).join("");
+
+// ---- SVG connectors ----
+const svg = document.getElementById("wires");
+const canvas = document.getElementById("canvas");
+const SVGNS = "http://www.w3.org/2000/svg";
+
+// arrowhead / diamond markers, one per relationship end
+const DEFS = `
+<defs>
+  <marker id="m-tri" markerWidth="13" markerHeight="13" refX="11" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+    <path d="M1,1 L11,5 L1,9 Z" fill="#0e141c" stroke="#7cc7ff" stroke-width="1.3"/></marker>
+  <marker id="m-diamond-fill" markerWidth="16" markerHeight="12" refX="14" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+    <path d="M2,5 L8,1 L14,5 L8,9 Z" fill="#2fe57a"/></marker>
+  <marker id="m-diamond-open" markerWidth="16" markerHeight="12" refX="14" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+    <path d="M2,5 L8,1 L14,5 L8,9 Z" fill="#0e141c" stroke="#22d3ee" stroke-width="1.2"/></marker>
+  <marker id="m-arrow" markerWidth="12" markerHeight="12" refX="9" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+    <path d="M1,1 L9,5 L1,9" fill="none" stroke="#8598ab" stroke-width="1.3"/></marker>
+  <marker id="m-arrow-solid" markerWidth="12" markerHeight="12" refX="9" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+    <path d="M1,1 L9,5 L1,9" fill="none" stroke="#8598ab" stroke-width="1.3"/></marker>
+</defs>`;
+
+const MARKER = { realize: "m-tri", generalize: "m-tri", compose: "m-diamond-fill", aggregate: "m-diamond-open", dep: "m-arrow", assoc: "m-arrow-solid" };
+
+// intersection of the segment (center→toward) with a rect border
+function borderPoint(r, d, tx, ty) {
+  const cx = r.left - d.left + r.width / 2, cy = r.top - d.top + r.height / 2;
+  const dx = tx - cx, dy = ty - cy;
+  if (dx === 0 && dy === 0) return [cx, cy];
+  const sx = dx !== 0 ? (r.width / 2) / Math.abs(dx) : Infinity;
+  const sy = dy !== 0 ? (r.height / 2) / Math.abs(dy) : Infinity;
+  const t = Math.min(sx, sy);
+  return [cx + dx * t, cy + dy * t];
+}
+function center(r, d) { return [r.left - d.left + r.width / 2, r.top - d.top + r.height / 2]; }
+
+function drawWires() {
+  const d = canvas.getBoundingClientRect();
+  const W = canvas.scrollWidth, H = canvas.scrollHeight;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("width", W); svg.setAttribute("height", H);
+  svg.innerHTML = DEFS;
+
+  EDGES.forEach(([a, b, type], i) => {
+    const ea = document.querySelector(`.uml[data-id="${a}"]`);
+    const eb = document.querySelector(`.uml[data-id="${b}"]`);
+    if (!ea || !eb) return;
+    const ra = ea.getBoundingClientRect(), rb = eb.getBoundingClientRect();
+    const [bx, by] = center(rb, d), [ax, ay] = center(ra, d);
+    const [x1, y1] = borderPoint(ra, d, bx, by);
+    const [x2, y2] = borderPoint(rb, d, ax, ay);
+    const path = document.createElementNS(SVGNS, "path");
+    path.setAttribute("d", `M ${x1} ${y1} L ${x2} ${y2}`);
+    path.setAttribute("class", `edge ${type}`);
+    path.setAttribute("marker-end", `url(#${MARKER[type]})`);
+    path.dataset.a = a; path.dataset.b = b;
+    svg.appendChild(path);
+  });
+}
+
+// ---- neighbours + detail drawer ----
+function neighbours(id) {
+  const set = new Set([id]);
+  EDGES.forEach(([a, b]) => { if (a === id) set.add(b); if (b === id) set.add(a); });
+  return set;
+}
+const REL_LABEL = { realize: "implements ▷", compose: "owns ◆", aggregate: "holds ◇", dep: "uses ┄▷", assoc: "→", generalize: "extends ▷" };
+
+const detail = document.getElementById("detail");
+let selected = null;
+
+function focus(id) {
+  const c = CLASSES[id];
+  if (!c) return;
+  selected = id;
+  const near = neighbours(id);
+
+  document.body.classList.add("focus");
+  document.querySelectorAll(".uml").forEach(el => {
+    el.classList.toggle("on", near.has(el.dataset.id));
+    el.classList.toggle("selected", el.dataset.id === id);
+  });
+  svg.querySelectorAll(".edge").forEach(p => {
+    p.classList.toggle("on", p.dataset.a === id || p.dataset.b === id);
+  });
+
+  const pkg = PACKAGES.find(p => p.id === c.pkg);
+  let html = `<div class="d-pkg">${esc(pkg ? pkg.name : c.pkg)}</div>`;
+  html += `<div class="d-stereo">«${esc(c.stereo)}»</div>`;
+  html += `<div class="d-name">${esc(id)}</div>`;
+  html += `<div class="d-file">${esc(c.file)}</div>`;
+
+  if (c.attrs.length) html += `<div class="d-sec"><h4>Attributes</h4><ul class="d-list">` +
+    c.attrs.map(a => `<li>${memberRow(a, false)}</li>`).join("") + `</ul></div>`;
+  if (c.methods.length) html += `<div class="d-sec"><h4>Operations</h4><ul class="d-list">` +
+    c.methods.map(m => `<li>${memberRow(m, true)}</li>`).join("") + `</ul></div>`;
+
+  // relationships
+  const rels = [];
+  EDGES.forEach(([a, b, t]) => {
+    if (a === id) rels.push([REL_LABEL[t], b]);
+    else if (b === id) {
+      const inv = { compose: "owned by ◆", aggregate: "held by ◇", dep: "used by ┄▷", realize: "implemented by ▷", assoc: "←", generalize: "extended by ▷" };
+      rels.push([inv[t] || t, a]);
+    }
+  });
+  if (rels.length) html += `<div class="d-sec"><h4>Relationships</h4>` +
+    rels.map(([k, peer]) => `<div class="rel"><span class="kind">${esc(k)}</span><span class="peer" data-goto="${peer}">${esc(peer)}</span></div>`).join("") + `</div>`;
+
+  detail.innerHTML = html;
+  detail.querySelectorAll(".peer").forEach(p => p.addEventListener("click", () => focus(p.dataset.goto)));
+}
+
+function clearFocus() {
+  selected = null;
+  document.body.classList.remove("focus");
+  document.querySelectorAll(".uml").forEach(el => el.classList.remove("on", "selected"));
+  svg.querySelectorAll(".edge").forEach(p => p.classList.remove("on"));
+  detail.innerHTML = `<p class="placeholder">Select a class to see its file, full members, and its relationships (realization, composition, aggregation, dependency).</p>`;
+}
+
+document.querySelectorAll(".uml").forEach(el => el.addEventListener("click", () => focus(el.dataset.id)));
+document.getElementById("reset-btn").addEventListener("click", clearFocus);
+document.getElementById("compact-toggle").addEventListener("change", () => {
+  requestAnimationFrame(drawWires); // box heights change → reroute
+});
+
+window.addEventListener("load", drawWires);
+window.addEventListener("resize", drawWires);
+if (window.ResizeObserver) new ResizeObserver(drawWires).observe(canvas);
+drawWires();
+</script>
+</body>
+</html>

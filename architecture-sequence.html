@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mission Control — Sequence Flow</title>
+<!--
+  A UML sequence diagram of the signature Mission Control flow: launching a burn
+  (side-effectful run), the durable go/no-go gate, and apply/scrub → teardown.
+  Grounded in the real path (service/app.py → service/manager.py → graph.py nodes
+  dispatch → run_worker → gate(interrupt()) → apply_burn → teardown, runs_store).
+  Self-contained: inline CSS + vanilla JS building an inline SVG. No build, no CDN,
+  no network. Renders over file:// with no console errors. Companion to
+  architecture.html and architecture-uml.html.
+-->
+<style>
+  :root {
+    --go: #2fe57a; --inflight: #ffb020; --fault: #ff3b47; --telemetry: #22d3ee; --seam: #7cc7ff;
+    --bg: #0b1016; --bg-2: #0e141c; --surface: #1e2833; --surface-2: #172029;
+    --line: #2a3846; --line-dim: #223040; --text: #c9d5e1; --muted: #8598ab; --dim: #5c6f81;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: radial-gradient(1300px 640px at 50% -10%, #12202e 0%, transparent 60%), var(--bg);
+    color: var(--text); font-family: var(--sans); font-size: 13.5px; line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--seam); }
+  header {
+    padding: 20px 24px 12px; border-bottom: 1px solid var(--line-dim);
+    display: flex; flex-wrap: wrap; gap: 16px 26px; align-items: flex-end;
+  }
+  .title h1 { margin: 0; font-size: 18px; letter-spacing: .3px; font-weight: 650; }
+  .title h1 .mark { color: var(--go); }
+  .title p { margin: 4px 0 0; color: var(--muted); max-width: 66ch; }
+  .title .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .controls { margin-left: auto; display: flex; flex-direction: column; gap: 9px; align-items: flex-end; }
+  .btnrow { display: flex; gap: 8px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 7px; cursor: pointer; font-size: 12px;
+    color: var(--muted); user-select: none; border: 1px solid var(--line);
+    background: var(--surface-2); padding: 6px 12px; border-radius: 7px;
+  }
+  .btn:hover { border-color: var(--seam); color: var(--text); }
+  .btn.primary { border-color: #2a4a5e; color: var(--seam); }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 15px; font-size: 11px; }
+  .legend .item { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); white-space: nowrap; }
+  .swatch { width: 22px; height: 0; border-top-width: 2px; border-top-style: solid; display: inline-block; }
+
+  main { display: grid; grid-template-columns: minmax(0,1fr) 330px; align-items: start; }
+  @media (max-width: 940px) { main { grid-template-columns: 1fr; } }
+  .canvas-wrap { padding: 12px 16px 50px; overflow: auto; }
+
+  /* SVG element styling */
+  #seq { display: block; }
+  #seq .lifeline { stroke: var(--line); stroke-width: 1.2; stroke-dasharray: 3 5; }
+  #seq .head-box { fill: var(--surface); stroke: var(--line); }
+  #seq .head-box.actor { fill: #14202c; stroke: var(--seam); }
+  #seq .head-label { fill: var(--text); font: 650 12.5px var(--sans); }
+  #seq .head-sub { fill: var(--muted); font: 10px var(--mono); }
+  #seq .activation { fill: #223341; stroke: var(--line); opacity: .9; }
+  #seq .msg-line { stroke: var(--muted); stroke-width: 1.5; }
+  #seq .msg-line.dashed { stroke-dasharray: 5 4; }
+  #seq .msg-label { fill: var(--text); font: 11.5px var(--mono); }
+  #seq .msg-num { fill: var(--dim); font: 10px var(--mono); }
+  #seq .msg-hit { fill: transparent; cursor: pointer; }
+  #seq .node-tag { fill: var(--dim); font: italic 10px var(--sans); }
+  #seq .frag-box { fill: none; stroke: var(--line); stroke-width: 1.1; }
+  #seq .frag-tab { fill: var(--surface-2); stroke: var(--line); }
+  #seq .frag-label { fill: var(--seam); font: 650 10px var(--mono); }
+  #seq .frag-guard { fill: var(--muted); font: 10px var(--mono); }
+  #seq .frag-div { stroke: var(--line); stroke-width: 1; stroke-dasharray: 4 4; }
+  #seq .note-box { fill: #1d1707; stroke: #4a3a1a; }
+  #seq .note-text { fill: #e7c887; font: 10.5px var(--sans); }
+
+  /* tone colours */
+  .t-go .msg-line { stroke: var(--go); } .t-go .msg-label { fill: var(--go); }
+  .t-fault .msg-line { stroke: var(--fault); } .t-fault .msg-label { fill: var(--fault); }
+  .t-telemetry .msg-line { stroke: var(--telemetry); } .t-telemetry .msg-label { fill: var(--telemetry); }
+  .t-inflight .msg-line { stroke: var(--inflight); } .t-inflight .msg-label { fill: var(--inflight); }
+
+  /* step / focus */
+  body.step .msg { opacity: .22; }
+  body.step .msg.on { opacity: 1; }
+  .msg.sel .msg-label { text-decoration: underline; }
+
+  aside {
+    position: sticky; top: 0; align-self: start; height: 100vh; border-left: 1px solid var(--line-dim);
+    background: var(--bg-2); padding: 20px 18px; overflow-y: auto;
+  }
+  aside .placeholder { color: var(--dim); font-size: 13px; }
+  .d-step { font-family: var(--mono); font-size: 11px; color: var(--seam); letter-spacing: 1px; }
+  .d-label { font-size: 16px; font-weight: 650; margin: 6px 0 8px; }
+  .d-meta { font-family: var(--mono); font-size: 11.5px; color: var(--muted); margin: 3px 0; }
+  .d-meta .k { color: var(--dim); }
+  .d-file { font-family: var(--mono); font-size: 11.5px; color: var(--seam); word-break: break-all; margin-top: 2px; }
+  .d-desc { color: var(--muted); margin-top: 12px; }
+  footer { color: var(--dim); font-size: 11.5px; padding: 0 24px 26px; }
+  kbd { font-family: var(--mono); font-size: 11px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title">
+    <h1><span class="mark">▲</span> Mission Control — Sequence Flow</h1>
+    <p>The signature path: launch a <b>burn</b> (side-effectful run), meter the <b>Controller</b>, pause at the durable <b>go/no-go</b> gate, then apply or scrub → teardown — end to end, across the real components.</p>
+    <p class="hint">Click a message for its endpoint / graph node and code ref, or step through with the buttons. Companion to <a href="./architecture.html">architecture.html</a> · <a href="./architecture-uml.html">architecture-uml.html</a>.</p>
+  </div>
+  <div class="controls">
+    <div class="btnrow">
+      <button class="btn" id="prev-btn">‹ Prev</button>
+      <button class="btn primary" id="next-btn">Step ›</button>
+      <button class="btn" id="reset-btn">Reset</button>
+    </div>
+    <div class="legend" aria-label="Message kinds">
+      <span class="item"><span class="swatch" style="border-color:var(--muted)"></span>sync / call</span>
+      <span class="item"><span class="swatch" style="border-color:var(--muted);border-top-style:dashed"></span>return</span>
+      <span class="item"><span class="swatch" style="border-color:var(--inflight)"></span>gate ◆</span>
+      <span class="item"><span class="swatch" style="border-color:var(--go)"></span>go / applied ●</span>
+      <span class="item"><span class="swatch" style="border-color:var(--fault)"></span>no-go / scrub ▲</span>
+      <span class="item"><span class="swatch" style="border-color:var(--telemetry)"></span>telemetry ◈</span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="canvas-wrap">
+    <svg id="seq" aria-label="Sequence diagram"></svg>
+    <footer>
+      Renders standalone over <kbd>file://</kbd> — no network, no build. The go/no-go pause is a durable <code>interrupt()</code>: a crash/restart resumes it without re-paying for completed steps.
+    </footer>
+  </div>
+  <aside id="detail" aria-live="polite">
+    <p class="placeholder">Click a message (or use Step ›) to see the endpoint / graph node behind it and its code reference.</p>
+  </aside>
+</main>
+
+<script>
+"use strict";
+
+// ---- participants (lifelines), left → right ----
+const P = [
+  { id: "op",    label: "Operator",   sub: "CLI / Web / Slack", actor: true },
+  { id: "svc",   label: "Service",    sub: "FastAPI seam" },
+  { id: "mgr",   label: "RunManager", sub: "service/manager.py" },
+  { id: "graph", label: "RunGraph",   sub: "LangGraph" },
+  { id: "wrk",   label: "Worker",     sub: "Controller (SDK)" },
+  { id: "wt",    label: "Worktree",   sub: "git isolation" },
+  { id: "pg",    label: "Postgres",   sub: "runs · events · ckpt" },
+];
+const PX = Object.fromEntries(P.map((p, i) => [p.id, i]));
+
+// ---- messages (ordered top → bottom) ----
+// kind: sync (filled arrow) | return (dashed open) | async (open arrow) | self
+const M = [
+  { from: "op",  to: "svc",  kind: "sync",   label: "POST /runs {target, type: burn}", node: "POST /runs", file: "service/app.py", desc: "The client launches a side-effectful run against a target. Every surface (CLI, web, Slack) is a thin client of this one endpoint." },
+  { from: "svc", to: "mgr",  kind: "sync",   label: "launch(task)", node: "seam → runtime", file: "service/manager.py · launch()", desc: "The seam hands off to the RunManager — it owns no orchestration itself." },
+  { from: "mgr", to: "pg",   kind: "async",  label: "INSERT runs (status = queued)", node: "runs ledger", file: "runs_store.py · launch()", desc: "A first-class row in the runs ledger, keyed by run_id (= the LangGraph thread_id that survives a crash)." },
+  { from: "mgr", to: "graph",kind: "async",  label: "drive graph in bg task · thread_id", node: "background run", file: "graph.py · run_tracked()", desc: "The graph is driven in a worker thread via live.stream_run_sync, keyed by thread_id, so the HTTP call returns immediately." },
+  { from: "mgr", to: "svc",  kind: "return", label: "run_id", file: "service/manager.py", desc: "Launch is non-blocking; the run proceeds in the background." },
+  { from: "svc", to: "op",   kind: "return", label: "201 Created {run_id}", file: "service/app.py", desc: "The client now follows the run over SSE (GET /runs/{id}/events)." },
+
+  { from: "graph", to: "wt", kind: "sync",   label: "create_worktree()", node: "dispatch node", file: "graph.py · _dispatch()", desc: "Every task runs in its own throwaway git worktree. The dispatch node is idempotent — it reuses an existing worktree on a re-run." },
+  { from: "wt", to: "graph", kind: "return", label: "Worktree(path, branch)", file: "worktree.py", desc: "An isolated working copy on a dedicated branch, carved off the target repo." },
+  { from: "graph", to: "pg", kind: "async",  label: "checkpoint · mark_running", node: "durable state", file: "PostgresSaver · runs_store", desc: "Node-boundary checkpoint to Postgres plus a status bump — recovery re-runs whole nodes." },
+
+  { from: "graph", to: "wrk",kind: "sync",   label: "investigate(task, workdir)", node: "run_worker node", file: "graph.py · _run_worker()", desc: "The Controller runs with fully explicit context (setting_sources=[]) — no ambient config — editing only the disposable worktree." },
+  { from: "wrk", to: "wt",   kind: "async",  label: "edit files (isolated)", file: "sdk_worker.py", desc: "A burn mutates the worktree; the change is not yet applied to the target." },
+  { from: "wrk", to: "graph",kind: "return", label: "WorkerResult(made_changes, steps)", file: "worker.py", desc: "The worker reports what it did plus per-model-request usage (StepUsage) for pricing." },
+  { from: "graph", to: "pg", kind: "async",  tone: "telemetry", label: "append_event · step_metric (priced)", node: "run_events + JSONL", file: "telemetry.py · pricing.py", desc: "Each step becomes one priced JSONL row (tokens, cost_usd, latency) — priced from the single model→price table — and a durable run_events row backing SSE replay." },
+
+  { from: "graph", to: "pg", kind: "async",  tone: "inflight", label: "interrupt() · checkpoint (awaiting_gate)", node: "gate node", file: "graph.py · _gate()", desc: "A burn pauses at a durable interrupt(). The whole run state is checkpointed — this is the go/no-go gate, and it survives a process restart." },
+  { from: "graph", to: "mgr",kind: "async",  tone: "inflight", label: "GateWaiting", file: "live.py · GateWaiting", desc: "The merged live feed surfaces that the run is waiting on a human decision." },
+  { from: "mgr", to: "op",   kind: "async",  tone: "inflight", label: "SSE: gate-waiting ◆", node: "GET /runs/{id}/events", file: "service/manager.py · events()", desc: "The operator sees the pending gate over the live SSE feed. Nothing is applied without an approval on record." },
+
+  // alt: GO
+  { from: "op",  to: "svc",  kind: "sync",   tone: "go", label: "POST /runs/{id}/approve", node: "approve", file: "service/app.py", desc: "GO — resolve the durable gate by resuming the existing interrupt()." },
+  { from: "svc", to: "mgr",  kind: "sync",   tone: "go", label: "approve(run_id)", file: "service/manager.py · approve()", desc: "The seam forwards the decision; the manager resumes the graph." },
+  { from: "mgr", to: "graph",kind: "async",  tone: "go", label: "Command(resume = go)", file: "graph.py", desc: "Resuming the interrupt() routes the run into apply_burn." },
+  { from: "graph", to: "wt", kind: "sync",   tone: "go", label: "commit + merge_into_target()", node: "apply_burn node", file: "graph.py · _apply_burn()", desc: "Apply-burn is its OWN node and safe to re-run: commit no-ops with nothing to commit, merge no-ops when already merged — a crash never half-applies." },
+  { from: "graph", to: "pg", kind: "async",  tone: "go", label: "finish(applied) · set_changes", node: "runs ledger", file: "runs_store.py · finish()", desc: "The ledger records the applied status, cost, and the captured changed-files diff (persisted so it survives worktree teardown)." },
+
+  // alt: NO-GO / scrub
+  { from: "op",  to: "svc",  kind: "sync",   tone: "fault", label: "POST /reject  |  /scrub", node: "reject / scrub", file: "service/app.py", desc: "NO-GO rejects the change; scrub kills the run outright. Either way the worktree branch is discarded — nothing lands." },
+  { from: "graph", to: "wt", kind: "async",  tone: "fault", label: "discard branch (no-go / scrub) ▲", file: "graph.py · worktree.py", desc: "The unmerged branch is dropped; the target repo is untouched." },
+
+  // teardown
+  { from: "graph", to: "wt", kind: "async",  label: "remove_worktree() (idempotent)", node: "teardown node", file: "graph.py · _teardown()", desc: "Teardown is forgiving and idempotent — no worktree leaks, whichever way the run ended." },
+  { from: "graph", to: "pg", kind: "async",  tone: "telemetry", label: "append notifications · run_terminal", node: "notifications outbox", file: "runs_store.py · append_notification()", desc: "One durable, metadata-only milestone row per run — deduped on (run_id, kind) so a resume can't double-emit." },
+  { from: "mgr", to: "op",   kind: "async",  tone: "go", label: "SSE: terminal ●", file: "service/manager.py", desc: "The live feed emits an explicit terminal event and cost reconciles at teardown (never a misleading $0 mid-flight)." },
+];
+
+// fragments over message index ranges (1-based, inclusive)
+const FRAGS = [
+  { label: "alt", start: 17, end: 23, guardTop: "[ GO — approve ]", divAfter: 21, guardBot: "[ NO-GO / scrub ]" },
+];
+// notes: {rows:[a,b] cols:[from,to], text}
+const NOTES = [
+  { start: 14, end: 15, from: "op", to: "svc", text: "Durable here: a crash or restart resumes at interrupt() — no re-pay for completed steps, no worktree leak." },
+];
+// activation bars: {col, from, to}
+const ACT = [
+  { col: "svc", from: 1, to: 6 }, { col: "mgr", from: 2, to: 5 },
+  { col: "graph", from: 4, to: 25 }, { col: "wrk", from: 10, to: 12 },
+  { col: "svc", from: 17, to: 18 }, { col: "mgr", from: 18, to: 19 },
+];
+
+// ---- geometry ----
+const LEFT = 120, COLGAP = 168, TOP = 74, ROWH = 45, RIGHT = 90;
+const N = M.length;
+const W = LEFT + COLGAP * (P.length - 1) + RIGHT;
+const H = TOP + (N + 1) * ROWH + 60;
+const colX = id => LEFT + COLGAP * PX[id];
+const rowY = i => TOP + i * ROWH;                 // i is 1-based message index
+const SVGNS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("seq");
+svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+svg.setAttribute("width", W); svg.setAttribute("height", H);
+
+function el(name, attrs, parent) {
+  const e = document.createElementNS(SVGNS, name);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+
+// arrowhead markers
+const defs = el("defs", {}, svg);
+[["ah-fill", "var(--muted)", true], ["ah-open", "var(--muted)", false],
+ ["ah-go", "var(--go)", true], ["ah-fault", "var(--fault)", false],
+ ["ah-tel", "var(--telemetry)", false], ["ah-inf", "var(--inflight)", false]
+].forEach(([id, col, filled]) => {
+  const m = el("marker", { id, markerWidth: 11, markerHeight: 11, refX: 8, refY: 5, orient: "auto", markerUnits: "userSpaceOnUse" }, defs);
+  el("path", filled ? { d: "M0,1 L9,5 L0,9 Z", fill: col } : { d: "M0,1 L9,5 L0,9", fill: "none", stroke: col, "stroke-width": 1.4 }, m);
+});
+const MARK = { sync: "ah-fill", return: "ah-open", async: "ah-open" };
+const MARK_TONE = { go: "ah-go", fault: "ah-fault", telemetry: "ah-tel", inflight: "ah-inf" };
+
+// layers
+const gFrag = el("g", {}, svg), gLife = el("g", {}, svg), gAct = el("g", {}, svg),
+      gNote = el("g", {}, svg), gHead = el("g", {}, svg), gMsg = el("g", {}, svg);
+
+// lifelines + heads
+P.forEach(p => {
+  const x = colX(p.id);
+  el("line", { class: "lifeline", x1: x, y1: TOP - 4, x2: x, y2: H - 40 }, gLife);
+  const bw = 132, bh = 40;
+  const box = el("rect", { class: "head-box" + (p.actor ? " actor" : ""), x: x - bw / 2, y: 8, width: bw, height: bh, rx: 8 }, gHead);
+  box.dataset.col = p.id; box.style.cursor = "pointer";
+  box.addEventListener("click", () => highlightCol(p.id));
+  el("text", { class: "head-label", x, y: 27, "text-anchor": "middle" }, gHead).textContent = p.label;
+  el("text", { class: "head-sub", x, y: 40, "text-anchor": "middle" }, gHead).textContent = p.sub;
+});
+
+// activations
+ACT.forEach(a => {
+  const x = colX(a.col);
+  el("rect", { class: "activation", x: x - 5, y: rowY(a.from) - 6, width: 10, height: rowY(a.to) - rowY(a.from) + 12, rx: 2 }, gAct);
+});
+
+// fragments
+FRAGS.forEach(f => {
+  const cols = P.map(p => colX(p.id));
+  const minX = Math.min(...cols) - 24, maxX = Math.max(...cols) + 24;
+  const y1 = rowY(f.start) - 24, y2 = rowY(f.end) + 14;
+  el("rect", { class: "frag-box", x: minX, y: y1, width: maxX - minX, height: y2 - y1, rx: 4 }, gFrag);
+  const tab = el("path", { class: "frag-tab", d: `M${minX},${y1} h44 l0,12 l-8,8 h-36 Z` }, gFrag);
+  el("text", { class: "frag-label", x: minX + 8, y: y1 + 14 }, gFrag).textContent = f.label;
+  el("text", { class: "frag-guard", x: minX + 58, y: y1 + 14 }, gFrag).textContent = f.guardTop;
+  if (f.divAfter) {
+    const dy = rowY(f.divAfter) + ROWH / 2 + 4;
+    el("line", { class: "frag-div", x1: minX, y1: dy, x2: maxX, y2: dy }, gFrag);
+    el("text", { class: "frag-guard", x: minX + 8, y: dy + 14 }, gFrag).textContent = f.guardBot;
+  }
+});
+
+// notes
+NOTES.forEach(nt => {
+  const x1 = colX(nt.from), x2 = colX(nt.to);
+  const bx = Math.min(x1, x2) + 14, bw = Math.abs(x2 - x1) - 28;
+  const by = rowY(nt.start) - 18, bh = rowY(nt.end) - rowY(nt.start) + 30;
+  el("rect", { class: "note-box", x: bx, y: by, width: Math.max(bw, 150), height: bh, rx: 6 }, gNote);
+  wrapText(el("text", { class: "note-text", x: bx + 10, y: by + 18 }, gNote), nt.text, Math.max(bw, 150) - 20, 13);
+});
+
+// messages
+M.forEach((m, idx) => {
+  const i = idx + 1;
+  const y = rowY(i);
+  const x1 = colX(m.from), x2 = colX(m.to);
+  const g = el("g", { class: "msg" + (m.tone ? " t-" + m.tone : ""), "data-idx": i }, gMsg);
+
+  // number in the left gutter
+  el("text", { class: "msg-num", x: 26, y: y + 4, "text-anchor": "middle" }, g).textContent = i;
+
+  const dir = x2 >= x1 ? 1 : -1;
+  const off = 5 * dir; // start just off the source activation edge
+  const marker = m.tone && MARK_TONE[m.tone] ? MARK_TONE[m.tone] : MARK[m.kind];
+  const line = el("line", { class: "msg-line" + (m.kind === "return" ? " dashed" : ""),
+    x1: x1 + off, y1: y, x2: x2 - 6 * dir, y2: y, "marker-end": `url(#${marker})` }, g);
+
+  // label, sitting above the line
+  const midX = (x1 + x2) / 2;
+  const t = el("text", { class: "msg-label", x: midX, y: y - 6, "text-anchor": "middle" }, g);
+  t.textContent = m.label;
+
+  // node/endpoint tag under the arrow (small, italic)
+  if (m.node) el("text", { class: "node-tag", x: midX, y: y + 12, "text-anchor": "middle" }, g).textContent = "« " + m.node + " »";
+
+  // invisible hit area for clicking
+  const hit = el("rect", { class: "msg-hit", x: Math.min(x1, x2) - 6, y: y - 20, width: Math.abs(x2 - x1) + 12, height: 30 }, g);
+  hit.addEventListener("click", () => selectMsg(i));
+});
+
+function wrapText(textEl, str, maxW, lh) {
+  const words = str.split(" ");
+  let line = "", tsp = el("tspan", { x: textEl.getAttribute("x"), dy: 0 }, textEl);
+  const approx = 5.4; // px per char at 10.5px mono-ish
+  words.forEach(w => {
+    const test = line ? line + " " + w : w;
+    if (test.length * approx > maxW && line) {
+      tsp.textContent = line;
+      line = w;
+      tsp = el("tspan", { x: textEl.getAttribute("x"), dy: lh }, textEl);
+    } else line = test;
+  });
+  tsp.textContent = line;
+}
+
+// ---- interaction: select / step / highlight column ----
+const detail = document.getElementById("detail");
+let cur = 0;
+
+function selectMsg(i) {
+  cur = i;
+  document.body.classList.add("step");
+  document.querySelectorAll(".msg").forEach(g => {
+    const on = +g.dataset.idx === i;
+    g.classList.toggle("on", on);
+    g.classList.toggle("sel", on);
+  });
+  const m = M[i - 1];
+  const arrow = { sync: "▶ sync call", return: "◁┈ return", async: "▷ async" }[m.kind] || m.kind;
+  let html = `<div class="d-step">Message ${i} / ${N} · ${esc(arrow)}</div>`;
+  html += `<div class="d-label">${esc(m.label)}</div>`;
+  html += `<div class="d-meta"><span class="k">from</span> ${esc(P[PX[m.from]].label)} &nbsp;<span class="k">to</span> ${esc(P[PX[m.to]].label)}</div>`;
+  if (m.node) html += `<div class="d-meta"><span class="k">where</span> « ${esc(m.node)} »</div>`;
+  if (m.file) html += `<div class="d-file">${esc(m.file)}</div>`;
+  if (m.desc) html += `<div class="d-desc">${esc(m.desc)}</div>`;
+  detail.innerHTML = html;
+}
+function step(delta) {
+  let next = cur + delta;
+  if (next < 1) next = 1; if (next > N) next = N;
+  selectMsg(next);
+}
+function reset() {
+  cur = 0;
+  document.body.classList.remove("step");
+  document.querySelectorAll(".msg").forEach(g => g.classList.remove("on", "sel"));
+  detail.innerHTML = `<p class="placeholder">Click a message (or use Step ›) to see the endpoint / graph node behind it and its code reference.</p>`;
+}
+function highlightCol(colId) {
+  document.body.classList.add("step");
+  document.querySelectorAll(".msg").forEach(g => {
+    const m = M[+g.dataset.idx - 1];
+    g.classList.toggle("on", m.from === colId || m.to === colId);
+  });
+  detail.innerHTML = `<div class="d-step">Lifeline</div><div class="d-label">${esc(P[PX[colId]].label)}</div><div class="d-desc">Highlighting every message this participant sends or receives.</div>`;
+}
+
+document.getElementById("next-btn").addEventListener("click", () => step(+1));
+document.getElementById("prev-btn").addEventListener("click", () => step(-1));
+document.getElementById("reset-btn").addEventListener("click", reset);
+window.addEventListener("keydown", e => {
+  if (e.key === "ArrowRight") { step(+1); e.preventDefault(); }
+  else if (e.key === "ArrowLeft") { step(-1); e.preventDefault(); }
+  else if (e.key === "Escape") reset();
+});
+</script>
+</body>
+</html>
