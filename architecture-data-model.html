@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mission Control — Data Model (Postgres)</title>
+<!--
+  An interactive entity-relationship diagram of Mission Control's Postgres schema,
+  grounded in the real DDL (src/mission_control/runs_store.py, plans_store.py).
+  Self-contained: inline CSS + vanilla JS + an inline SVG overlay for the FK
+  connectors. No build, no CDN, no network. Renders over file:// with no console
+  errors. Companion to architecture.html / architecture-uml.html / architecture-sequence.html.
+-->
+<style>
+  :root {
+    --go:        #2fe57a;
+    --inflight:  #ffb020;
+    --fault:     #ff3b47;
+    --telemetry: #22d3ee;
+    --seam:      #7cc7ff;
+
+    --bg:        #0b1016;
+    --bg-2:      #0e141c;
+    --surface:   #1e2833;
+    --surface-2: #172029;
+    --line:      #2a3846;
+    --line-dim:  #223040;
+    --text:      #c9d5e1;
+    --muted:     #8598ab;
+    --dim:       #5c6f81;
+
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: radial-gradient(1300px 640px at 50% -10%, #12202e 0%, transparent 60%), var(--bg);
+    color: var(--text); font-family: var(--sans); font-size: 13.5px; line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--seam); }
+
+  header {
+    padding: 20px 24px 12px; border-bottom: 1px solid var(--line-dim);
+    display: flex; flex-wrap: wrap; gap: 16px 26px; align-items: flex-end;
+  }
+  .title h1 { margin: 0; font-size: 18px; letter-spacing: .3px; font-weight: 650; }
+  .title h1 .mark { color: var(--go); }
+  .title p { margin: 4px 0 0; color: var(--muted); max-width: 70ch; }
+  .title .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .title a { color: var(--seam); }
+  code { font-family: var(--mono); font-size: .92em; }
+
+  .controls { margin-left: auto; display: flex; flex-direction: column; gap: 9px; align-items: flex-end; }
+  .btnrow { display: flex; gap: 8px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 12px;
+    color: var(--muted); user-select: none; border: 1px solid var(--line);
+    background: var(--surface-2); padding: 6px 11px; border-radius: 7px;
+  }
+  .btn:hover { border-color: var(--seam); color: var(--text); }
+
+  /* marker legend */
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 11px; }
+  .legend .item { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); white-space: nowrap; }
+  .legend .g { font-family: var(--mono); font-weight: 700; color: var(--seam); }
+  .legend svg { display: block; }
+
+  main { display: grid; grid-template-columns: minmax(0,1fr) 330px; align-items: start; }
+  @media (max-width: 940px) { main { grid-template-columns: 1fr; } }
+
+  .canvas-wrap { padding: 18px 20px 60px; overflow: auto; }
+  .canvas { position: relative; min-width: 1080px; }
+
+  #wires { position: absolute; inset: 0; pointer-events: none; z-index: 5; overflow: visible; }
+  #wires path { fill: none; }
+  #wires .edge { transition: opacity .12s; }
+  .edge.fk   { stroke: var(--seam);      stroke-width: 1.6; opacity: .6; }
+  .edge.self { stroke: var(--inflight);  stroke-width: 1.5; stroke-dasharray: 5 4; opacity: .6; }
+  .edge.same { stroke: var(--telemetry); stroke-width: 1.5; stroke-dasharray: 3 4; opacity: .55; }
+  /* focus mode */
+  body.focus #wires .edge { opacity: .06; }
+  body.focus #wires .edge.on { opacity: .95; stroke-width: 2.4; }
+
+  /* entity layout — free-positioned via inline left/top */
+  .grid { position: relative; z-index: 1; min-height: 1180px; }
+  .ent {
+    position: absolute; z-index: 2; width: 250px;
+    background: linear-gradient(180deg, var(--surface), var(--surface-2));
+    border: 1px solid var(--line); border-radius: 8px; overflow: hidden; cursor: pointer;
+    transition: border-color .12s, box-shadow .12s, opacity .12s, transform .12s;
+  }
+  .ent:hover { border-color: var(--seam); transform: translateY(-1px); }
+  .ent.selected { border-color: var(--go); box-shadow: 0 0 0 1px var(--go), 0 8px 22px -14px var(--go); }
+  body.focus .ent { opacity: .28; }
+  body.focus .ent.on { opacity: 1; }
+  body.focus .ent.selected { opacity: 1; }
+
+  .ent.opaque { background: repeating-linear-gradient(135deg, #141b23, #141b23 7px, #111820 7px, #111820 14px); border-style: dashed; border-color: var(--dim); }
+  .ent.opaque .tname { color: var(--dim); }
+
+  .ent .head { padding: 7px 10px 6px; border-bottom: 1px solid var(--line-dim); background: rgba(124,199,255,.05); }
+  .ent .tname { font-weight: 650; font-size: 13px; letter-spacing: .2px; color: var(--seam); font-family: var(--mono); }
+  .ent .sub { display: block; font-family: var(--mono); font-size: 9.5px; letter-spacing: .3px; color: var(--muted); margin-top: 2px; }
+
+  .cols { padding: 3px 0; font-family: var(--mono); font-size: 10.5px; line-height: 1.5; }
+  .col { display: flex; align-items: baseline; gap: 6px; padding: 2px 10px; white-space: nowrap; }
+  .col .mk { width: 26px; flex: none; color: var(--dim); letter-spacing: -.5px; }
+  .col .mk .pk { color: var(--go); }
+  .col .mk .fk { color: var(--seam); }
+  .col .mk .uq { color: var(--inflight); }
+  .col .mk .ix { color: var(--telemetry); }
+  .col .cn { color: var(--text); overflow: hidden; text-overflow: ellipsis; }
+  .col .ct { color: var(--muted); margin-left: auto; padding-left: 8px; }
+  .col.key .cn { font-weight: 650; }
+
+  /* detail drawer */
+  aside {
+    position: sticky; top: 0; align-self: start; height: 100vh; border-left: 1px solid var(--line-dim);
+    background: var(--bg-2); padding: 20px 18px; overflow-y: auto;
+  }
+  aside .placeholder { color: var(--dim); font-size: 13px; }
+  .d-kicker { font-family: var(--mono); font-size: 10px; letter-spacing: 1.4px; text-transform: uppercase; color: var(--dim); }
+  .d-name { font-size: 18px; font-weight: 650; margin: 3px 0 1px; font-family: var(--mono); color: var(--seam); }
+  .d-file { font-family: var(--mono); font-size: 11.5px; color: var(--telemetry); margin: 2px 0 10px; word-break: break-all; }
+  .d-purpose { color: var(--muted); font-size: 12.5px; margin: 0 0 6px; }
+  .d-sec h4 { font-size: 10px; letter-spacing: 1.1px; text-transform: uppercase; color: var(--dim); margin: 14px 0 6px; font-weight: 600; }
+  .d-list { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: 11px; }
+  .d-list li { display: flex; align-items: baseline; gap: 7px; padding: 3px 0; color: var(--muted); border-bottom: 1px solid var(--line-dim); }
+  .d-list li:last-child { border-bottom: 0; }
+  .d-list .mk { width: 30px; flex: none; letter-spacing: -.5px; }
+  .d-list .mk .pk { color: var(--go); } .d-list .mk .fk { color: var(--seam); }
+  .d-list .mk .uq { color: var(--inflight); } .d-list .mk .ix { color: var(--telemetry); }
+  .d-list .cn { color: var(--text); }
+  .d-list .ct { color: var(--muted); margin-left: auto; padding-left: 8px; }
+  .rel { display: flex; align-items: baseline; gap: 8px; font-family: var(--mono); font-size: 11px; padding: 3px 0; color: var(--muted); }
+  .rel .kind { color: var(--dim); min-width: 84px; }
+  .rel .peer { color: var(--text); cursor: pointer; }
+  .rel .peer:hover { color: var(--seam); text-decoration: underline; }
+
+  .callout {
+    margin-top: 18px; padding: 10px 12px; border: 1px solid var(--line-dim); border-left: 2px solid var(--telemetry);
+    border-radius: 6px; background: var(--surface-2); color: var(--muted); font-size: 11.5px; line-height: 1.5;
+  }
+  .callout b { color: var(--telemetry); }
+
+  footer { color: var(--dim); font-size: 11.5px; padding: 0 24px 26px; }
+  kbd { font-family: var(--mono); font-size: 11px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title">
+    <h1><span class="mark">▲</span> Mission Control — Data Model (Postgres)</h1>
+    <p>The transactional system-of-record: the operator-facing <code>runs</code> ledger, its durable event log and milestone outbox, and the Flight Plan tables (header, transcript, requirements, and the CONSTRUCTION work-list).</p>
+    <p class="hint">Click a table to inspect it. Companion to <a href="./architecture.html">architecture.html</a> · <a href="./architecture-uml.html">architecture-uml.html</a> · <a href="./architecture-sequence.html">architecture-sequence.html</a>.</p>
+  </div>
+  <div class="controls">
+    <div class="btnrow">
+      <button class="btn" id="reset-btn">Clear focus</button>
+    </div>
+    <div class="legend" id="legend" aria-label="Key and constraint markers"></div>
+  </div>
+</header>
+
+<main>
+  <div class="canvas-wrap">
+    <div class="canvas" id="canvas">
+      <svg id="wires" aria-hidden="true"></svg>
+      <div class="grid" id="grid"></div>
+    </div>
+    <footer>
+      Notation: crow's-foot <b>one —&lt;</b> many. <b class="mono">PK</b> primary key · <b>FK</b> foreign key · <b>UQ</b> unique · <b>IX</b> index · <b>JSONB</b> document column.
+      Renders standalone over <kbd>file://</kbd> — no network, no build.
+    </footer>
+  </div>
+
+  <aside id="detail" aria-live="polite">
+    <p class="placeholder">Select a table to see its purpose, full column list (with PK/FK/UQ/IX markers), and its foreign-key relationships. Hover a table to highlight its edges.</p>
+    <div class="callout">
+      <b>Where's the telemetry table?</b> There isn't one. Postgres is the transactional system-of-record; the per-step telemetry lives OUTSIDE Postgres as a JSONL "bronze" spine queried in place by DuckDB (zero ETL) — different tools, different jobs.
+    </div>
+  </aside>
+</main>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Schema — sourced verbatim from the DDL in runs_store.py and plans_store.py.
+// Each column: [markers, name, type]. markers ⊂ {PK, FK, UQ, IX}.
+// ---------------------------------------------------------------------------
+const TABLES = {
+  runs: {
+    file: "runs_store.py", sub: "status / cost ledger", pos: [40, 40],
+    purpose: "The operator-facing status/cost ledger — one row per run. run_id IS the LangGraph thread_id, so identity survives crash/resume. A denormalized status/cost table sitting in the same DB as the opaque checkpoint substrate, but separate from it.",
+    cols: [
+      [["PK"], "run_id", "TEXT"],
+      [[], "thread_id", "TEXT"],
+      [[], "target", "TEXT"],
+      [[], "local_path", "TEXT"],
+      [[], "task_type", "TEXT"],
+      [["IX"], "status", "TEXT"],
+      [[], "cost_usd", "DOUBLE"],
+      [["IX"], "created_at", "TIMESTAMPTZ"],
+      [[], "started_at", "TIMESTAMPTZ"],
+      [[], "ended_at", "TIMESTAMPTZ"],
+      [[], "detail", "TEXT"],
+      [["FK","IX"], "plan_id", "TEXT →plans"],
+      [[], "plan_unit_seq", "INTEGER"],
+      [[], "changes_json", "JSONB"],
+      [[], "subject", "TEXT"],
+      [[], "slack_profile", "TEXT"],
+    ],
+    notes: "Indexes: (status), (created_at DESC), (plan_id). plan_id is nullable — standalone runs carry none; plan_unit_seq points at the owning plan's plan_units.seq. changes_json is the applied diff, persisted past worktree teardown. slack_profile NULL = opt-out.",
+  },
+  run_events: {
+    file: "runs_store.py", sub: "durable event log", pos: [360, 40],
+    purpose: "Durable per-run event log backing the SSE feed's replay (Last-Event-ID). The in-process channel is the live tail; this table is the durable timeline, so a reconnect after a restart reconstructs full history.",
+    cols: [
+      [["PK","FK"], "run_id", "TEXT →runs"],
+      [["PK"], "seq", "INTEGER"],
+      [[], "event_type", "TEXT"],
+      [[], "data", "JSONB"],
+      [[], "created_at", "TIMESTAMPTZ"],
+    ],
+    notes: "PK is (run_id, seq). seq is a global per-run counter that continues across process restarts — not the in-memory index.",
+  },
+  notifications: {
+    file: "runs_store.py", sub: "milestone outbox", pos: [360, 250],
+    purpose: "The fleet-wide milestone outbox — one durable row per run-lifecycle milestone (NOT the per-node firehose; that's run_events). A fleet bridge tails this to learn \"something happened somewhere\" without following every run's SSE.",
+    cols: [
+      [["PK"], "seq", "BIGINT IDENTITY"],
+      [["FK"], "run_id", "TEXT →runs"],
+      [[], "slack_profile", "TEXT"],
+      [["UQ"], "kind", "TEXT"],
+      [[], "payload", "JSONB"],
+      [[], "created_at", "TIMESTAMPTZ"],
+    ],
+    notes: "seq is a global monotonic cursor (across all runs) — one durable position a consumer advances. UNIQUE(run_id, kind) is once-only dedupe so a resume can't double-emit. payload is metadata-only by construction (never prompt/code/diff/target).",
+  },
+  plans: {
+    file: "plans_store.py", sub: "Flight Plan header", pos: [40, 520],
+    purpose: "The Flight Plan header — one row per plan. Owns its child runs, transcript turns, requirements, and CONSTRUCTION units.",
+    cols: [
+      [["PK"], "id", "TEXT"],
+      [[], "target", "TEXT"],
+      [[], "local_path", "TEXT"],
+      [[], "workstream", "TEXT"],
+      [[], "remote_dest", "TEXT"],
+      [[], "allow_secrets", "BOOL"],
+      [[], "mode", "TEXT"],
+      [[], "methodology", "TEXT"],
+      [[], "cloud_target", "TEXT"],
+      [[], "stage", "TEXT"],
+      [["IX"], "status", "TEXT"],
+      [["IX"], "created_at", "TIMESTAMPTZ"],
+      [[], "updated_at", "TIMESTAMPTZ"],
+    ],
+    notes: "Indexes: (status), (created_at DESC). target carries the portable remote ref; local_path is the derived machine-local working dir — never the identity.",
+  },
+  plan_turns: {
+    file: "plans_store.py", sub: "interactive transcript", pos: [400, 520],
+    purpose: "The interactive transcript — operator turns and the planner's replies, in order.",
+    cols: [
+      [["PK","FK"], "plan_id", "TEXT →plans"],
+      [["PK"], "seq", "INTEGER"],
+      [[], "role", "TEXT"],
+      [[], "content", "TEXT"],
+      [[], "created_at", "TIMESTAMPTZ"],
+    ],
+    notes: "PK is (plan_id, seq). seq is a per-plan counter continuing across process restarts.",
+  },
+  plan_requirements: {
+    file: "plans_store.py", sub: "accreting requirements", pos: [400, 720],
+    purpose: "The accreting requirements — upserted by (plan_id, key) so re-running the capturing stage updates in place rather than duplicating.",
+    cols: [
+      [["PK","FK"], "plan_id", "TEXT →plans"],
+      [["PK"], "key", "TEXT"],
+      [[], "value", "TEXT"],
+      [[], "state", "TEXT"],
+      [[], "created_at", "TIMESTAMPTZ"],
+      [[], "updated_at", "TIMESTAMPTZ"],
+    ],
+    notes: "PK is (plan_id, key) — upsert semantics keep one row per requirement key.",
+  },
+  plan_units: {
+    file: "plans_store.py", sub: "CONSTRUCTION work-list", pos: [400, 930],
+    purpose: "The CONSTRUCTION work-list — upserted by (plan_id, seq). task_type is derived from phase at write time. depends_on is a JSONB list of prerequisite unit seqs, forming a self-reference DAG within the plan.",
+    cols: [
+      [["PK","FK"], "plan_id", "TEXT →plans"],
+      [["PK"], "seq", "INTEGER"],
+      [[], "title", "TEXT"],
+      [[], "phase", "TEXT"],
+      [[], "task_type", "TEXT"],
+      [[], "depends_on", "JSONB ⟲seq"],
+      [[], "status", "TEXT"],
+      [[], "stage_slug", "TEXT"],
+      [[], "gated", "BOOL"],
+      [[], "attempts", "INTEGER"],
+      [[], "created_at", "TIMESTAMPTZ"],
+    ],
+    notes: "PK is (plan_id, seq). depends_on holds prerequisite unit seqs within the SAME plan — a self-referential DAG (dashed self-edge).",
+  },
+  checkpoints: {
+    file: "PostgresSaver.setup()", sub: "opaque · thread_id", pos: [40, 250], opaque: true,
+    purpose: "LangGraph's PostgresSaver private durability substrate (checkpoints / checkpoint_writes / checkpoint_blobs), keyed by thread_id. Managed by PostgresSaver.setup(); NOT derived-from the runs ledger.",
+    cols: [
+      [[], "checkpoints", "opaque"],
+      [[], "checkpoint_writes", "opaque"],
+      [[], "checkpoint_blobs", "opaque"],
+    ],
+    label: "LangGraph checkpoint tables (opaque)",
+    notes: "Managed by PostgresSaver.setup(); keyed by thread_id == runs.run_id. NOT derived-from — the runs ledger is a separate, denormalized status/cost table in the SAME database.",
+  },
+};
+
+// Relationships. [parentPK, childFK, type]. one(parent) —< many(child).
+//   fk   → real FK (crow's-foot at child) · self → self-referential DAG · same → same-identity link
+const EDGES = [
+  ["plans", "plan_units", "fk"],
+  ["plans", "plan_turns", "fk"],
+  ["plans", "plan_requirements", "fk"],
+  ["plans", "runs", "fk"],
+  ["runs", "run_events", "fk"],
+  ["runs", "notifications", "fk"],
+  ["plan_units", "plan_units", "self"],
+  ["runs", "checkpoints", "same"],
+];
+
+const REL_TEXT = {
+  fk:   { fwd: "1 —< many", inv: "many >— 1" },
+  self: { fwd: "self DAG ⟲", inv: "self DAG ⟲" },
+  same: { fwd: "same identity ⋯", inv: "same identity ⋯" },
+};
+
+// ---- helpers ----
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+const MK_ORDER = ["PK", "FK", "UQ", "IX"];
+const MK_CLASS = { PK: "pk", FK: "fk", UQ: "uq", IX: "ix" };
+function markerHtml(mks) {
+  return MK_ORDER.filter(m => mks.includes(m))
+    .map(m => `<span class="${MK_CLASS[m]}" title="${m}">${m === "IX" ? "IX" : m}</span>`).join("");
+}
+
+// ---- render entity boxes ----
+const grid = document.getElementById("grid");
+Object.entries(TABLES).forEach(([id, t]) => {
+  const el = document.createElement("section");
+  el.className = "ent" + (t.opaque ? " opaque" : "");
+  el.dataset.id = id;
+  el.style.left = t.pos[0] + "px";
+  el.style.top = t.pos[1] + "px";
+  const title = t.label || id;
+  let html = `<div class="head"><span class="tname">${esc(title)}</span><span class="sub">${esc(t.sub)}</span></div>`;
+  html += `<div class="cols">`;
+  t.cols.forEach(([mks, cn, ct]) => {
+    const isKey = mks.includes("PK") || mks.includes("FK");
+    html += `<div class="col${isKey ? " key" : ""}"><span class="mk">${markerHtml(mks)}</span>`
+          + `<span class="cn">${esc(cn)}</span><span class="ct">${esc(ct)}</span></div>`;
+  });
+  html += `</div>`;
+  el.innerHTML = html;
+  grid.appendChild(el);
+});
+
+// ---- marker legend ----
+document.getElementById("legend").innerHTML = [
+  ['<span class="g" style="color:var(--go)">PK</span>', "primary key"],
+  ['<span class="g">FK</span>', "foreign key"],
+  ['<span class="g" style="color:var(--inflight)">UQ</span>', "unique"],
+  ['<span class="g" style="color:var(--telemetry)">IX</span>', "index"],
+  ['<span class="g" style="color:var(--muted)">JSONB</span>', "document column"],
+  ['<svg width="30" height="12"><line x1="0" y1="6" x2="20" y2="6" stroke="#7cc7ff" stroke-width="1.6"/><path d="M20,1 L20,11 M20,6 L30,1 M20,6 L30,11" fill="none" stroke="#7cc7ff" stroke-width="1.4"/></svg>', "1 —< many"],
+].map(([g, t]) => `<span class="item">${g}${esc(t)}</span>`).join("");
+
+// ---- SVG connectors ----
+const svg = document.getElementById("wires");
+const canvas = document.getElementById("canvas");
+const SVGNS = "http://www.w3.org/2000/svg";
+
+const DEFS = `
+<defs>
+  <marker id="m-crow" markerWidth="14" markerHeight="14" refX="12" refY="6" orient="auto" markerUnits="userSpaceOnUse">
+    <path d="M2,6 L12,1 M2,6 L12,6 M2,6 L12,11" fill="none" stroke="#7cc7ff" stroke-width="1.5"/></marker>
+  <marker id="m-one" markerWidth="10" markerHeight="14" refX="4" refY="6" orient="auto" markerUnits="userSpaceOnUse">
+    <path d="M4,1 L4,11" fill="none" stroke="#7cc7ff" stroke-width="1.5"/></marker>
+  <marker id="m-self" markerWidth="12" markerHeight="12" refX="9" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+    <path d="M1,1 L9,5 L1,9" fill="none" stroke="#ffb020" stroke-width="1.4"/></marker>
+</defs>`;
+
+function center(r, d) { return [r.left - d.left + r.width / 2, r.top - d.top + r.height / 2]; }
+function borderPoint(r, d, tx, ty) {
+  const cx = r.left - d.left + r.width / 2, cy = r.top - d.top + r.height / 2;
+  const dx = tx - cx, dy = ty - cy;
+  if (dx === 0 && dy === 0) return [cx, cy];
+  const sx = dx !== 0 ? (r.width / 2) / Math.abs(dx) : Infinity;
+  const sy = dy !== 0 ? (r.height / 2) / Math.abs(dy) : Infinity;
+  const t = Math.min(sx, sy);
+  return [cx + dx * t, cy + dy * t];
+}
+
+function drawWires() {
+  const d = canvas.getBoundingClientRect();
+  const W = canvas.scrollWidth, H = canvas.scrollHeight;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("width", W); svg.setAttribute("height", H);
+  svg.innerHTML = DEFS;
+
+  EDGES.forEach(([parent, child, type]) => {
+    const ep = document.querySelector(`.ent[data-id="${parent}"]`);
+    const ec = document.querySelector(`.ent[data-id="${child}"]`);
+    if (!ep || !ec) return;
+
+    if (parent === child && type === "self") {
+      // self-loop on the right edge of the box
+      const r = ep.getBoundingClientRect();
+      const x = r.right - d.left, y1 = r.top - d.top + r.height * 0.32, y2 = r.top - d.top + r.height * 0.62;
+      const path = document.createElementNS(SVGNS, "path");
+      path.setAttribute("d", `M ${x} ${y1} C ${x + 46} ${y1}, ${x + 46} ${y2}, ${x} ${y2}`);
+      path.setAttribute("class", "edge self");
+      path.setAttribute("marker-end", "url(#m-self)");
+      path.dataset.a = parent; path.dataset.b = child;
+      svg.appendChild(path);
+      return;
+    }
+
+    const rp = ep.getBoundingClientRect(), rc = ec.getBoundingClientRect();
+    const [px, py] = center(rp, d), [cx, cy] = center(rc, d);
+    const [x1, y1] = borderPoint(rp, d, cx, cy);   // parent end (the "one")
+    const [x2, y2] = borderPoint(rc, d, px, py);   // child end  (the "many")
+    const path = document.createElementNS(SVGNS, "path");
+    path.setAttribute("d", `M ${x1} ${y1} L ${x2} ${y2}`);
+    path.setAttribute("class", `edge ${type}`);
+    if (type === "fk") {
+      path.setAttribute("marker-start", "url(#m-one)");
+      path.setAttribute("marker-end", "url(#m-crow)");
+    }
+    path.dataset.a = parent; path.dataset.b = child;
+    svg.appendChild(path);
+  });
+}
+
+// ---- neighbours + detail drawer ----
+function neighbours(id) {
+  const set = new Set([id]);
+  EDGES.forEach(([a, b]) => { if (a === id) set.add(b); if (b === id) set.add(a); });
+  return set;
+}
+
+const detail = document.getElementById("detail");
+
+function focusTable(id) {
+  const t = TABLES[id];
+  if (!t) return;
+  const near = neighbours(id);
+
+  document.body.classList.add("focus");
+  document.querySelectorAll(".ent").forEach(el => {
+    el.classList.toggle("on", near.has(el.dataset.id));
+    el.classList.toggle("selected", el.dataset.id === id);
+  });
+  highlightEdges(id);
+
+  let html = `<div class="d-kicker">Postgres table</div>`;
+  html += `<div class="d-name">${esc(t.label || id)}</div>`;
+  html += `<div class="d-file">${esc(t.file)}</div>`;
+  html += `<p class="d-purpose">${esc(t.purpose)}</p>`;
+
+  html += `<div class="d-sec"><h4>Columns</h4><ul class="d-list">`;
+  t.cols.forEach(([mks, cn, ct]) => {
+    html += `<li><span class="mk">${markerHtml(mks)}</span><span class="cn">${esc(cn)}</span><span class="ct">${esc(ct)}</span></li>`;
+  });
+  html += `</ul></div>`;
+
+  const rels = [];
+  EDGES.forEach(([a, b, type]) => {
+    if (a === b) { if (a === id) rels.push([REL_TEXT[type].fwd, a]); return; }
+    if (a === id) rels.push([REL_TEXT[type].fwd, b]);
+    else if (b === id) rels.push([REL_TEXT[type].inv, a]);
+  });
+  if (rels.length) html += `<div class="d-sec"><h4>Relationships</h4>` +
+    rels.map(([k, peer]) => `<div class="rel"><span class="kind">${esc(k)}</span><span class="peer" data-goto="${peer}">${esc(TABLES[peer].label || peer)}</span></div>`).join("") + `</div>`;
+
+  if (t.notes) html += `<div class="callout">${esc(t.notes)}</div>`;
+
+  detail.innerHTML = html;
+  detail.querySelectorAll(".peer").forEach(p => p.addEventListener("click", () => focusTable(p.dataset.goto)));
+}
+
+function highlightEdges(id) {
+  svg.querySelectorAll(".edge").forEach(p => {
+    p.classList.toggle("on", p.dataset.a === id || p.dataset.b === id);
+  });
+}
+
+function clearFocus() {
+  document.body.classList.remove("focus");
+  document.querySelectorAll(".ent").forEach(el => el.classList.remove("on", "selected"));
+  svg.querySelectorAll(".edge").forEach(p => p.classList.remove("on"));
+  detail.innerHTML = `<p class="placeholder">Select a table to see its purpose, full column list (with PK/FK/UQ/IX markers), and its foreign-key relationships. Hover a table to highlight its edges.</p>`
+    + `<div class="callout"><b>Where's the telemetry table?</b> There isn't one. Postgres is the transactional system-of-record; the per-step telemetry lives OUTSIDE Postgres as a JSONL "bronze" spine queried in place by DuckDB (zero ETL) — different tools, different jobs.</div>`;
+}
+
+// ---- wiring ----
+document.querySelectorAll(".ent").forEach(el => {
+  el.addEventListener("click", () => focusTable(el.dataset.id));
+  el.addEventListener("mouseenter", () => { if (!document.body.classList.contains("focus")) highlightEdges(el.dataset.id); });
+  el.addEventListener("mouseleave", () => { if (!document.body.classList.contains("focus")) svg.querySelectorAll(".edge").forEach(p => p.classList.remove("on")); });
+});
+document.getElementById("reset-btn").addEventListener("click", clearFocus);
+
+window.addEventListener("load", drawWires);
+window.addEventListener("resize", drawWires);
+if (window.ResizeObserver) new ResizeObserver(drawWires).observe(canvas);
+drawWires();
+</script>
+</body>
+</html>

@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mission Control — Deployment Topology</title>
+<!--
+  An interactive deployment / topology map of Mission Control's runtime: the three
+  cooperating processes on a host (Postgres, the FastAPI service/seam, the Slack
+  bridge), the external services they reach (Anthropic, Slack, git remotes), the
+  clients (CLI, browser /ui + /app, Slack users), and the analytics side-spine
+  (JSONL → DuckDB → /metrics, plus the eval-gate MCP for CI). Grounded in
+  docs/DEPLOY.md, docker-compose.yml, .env.example, service/app.py and slack/bridge.py.
+  Self-contained: inline CSS + vanilla JS + an inline SVG overlay for connectors.
+  No build, no CDN, no network. Renders over file:// with no console errors.
+  Companion to architecture.html / architecture-uml.html / architecture-sequence.html.
+-->
+<style>
+  :root {
+    --go:        #2fe57a;
+    --inflight:  #ffb020;
+    --fault:     #ff3b47;
+    --telemetry: #22d3ee;
+    --seam:      #7cc7ff;
+
+    --bg:        #0b1016;
+    --bg-2:      #0e141c;
+    --surface:   #1e2833;
+    --surface-2: #172029;
+    --line:      #2a3846;
+    --line-dim:  #223040;
+    --text:      #c9d5e1;
+    --muted:     #8598ab;
+    --dim:       #5c6f81;
+
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: radial-gradient(1300px 640px at 50% -10%, #12202e 0%, transparent 60%), var(--bg);
+    color: var(--text); font-family: var(--sans); font-size: 13.5px; line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--seam); }
+
+  header {
+    padding: 20px 24px 12px; border-bottom: 1px solid var(--line-dim);
+    display: flex; flex-wrap: wrap; gap: 16px 26px; align-items: flex-end;
+  }
+  .title h1 { margin: 0; font-size: 18px; letter-spacing: .3px; font-weight: 650; }
+  .title h1 .mark { color: var(--go); }
+  .title p { margin: 4px 0 0; color: var(--muted); max-width: 70ch; }
+  .title .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .title a { color: var(--seam); }
+
+  .controls { margin-left: auto; display: flex; flex-direction: column; gap: 9px; align-items: flex-end; }
+  .btnrow { display: flex; gap: 8px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 12px;
+    color: var(--muted); user-select: none; border: 1px solid var(--line);
+    background: var(--surface-2); padding: 6px 11px; border-radius: 7px;
+  }
+  .btn:hover { border-color: var(--seam); color: var(--text); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 11px; max-width: 640px; }
+  .legend .grp { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+  .legend .item { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); white-space: nowrap; }
+  .legend .item .glyph { font-family: var(--mono); }
+  .legend svg { display: block; }
+  .legend .lbl { font-family: var(--mono); font-size: 10px; letter-spacing: .3px; }
+
+  main { display: grid; grid-template-columns: minmax(0,1fr) 336px; align-items: start; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+
+  .canvas-wrap { padding: 18px 20px 60px; overflow: auto; }
+  .canvas { position: relative; min-width: 1120px; }
+
+  #wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; overflow: visible; }
+  #wires path { fill: none; }
+  #wires .edge { transition: opacity .12s; }
+  #wires text {
+    font-family: var(--mono); font-size: 9.5px; fill: var(--muted);
+    paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round;
+  }
+  /* link styles: colour + line-style; the legend gives each a text label + glyph */
+  .edge.http { stroke: var(--seam);      stroke-width: 1.6; opacity: .6; }
+  .edge.sse  { stroke: var(--telemetry); stroke-width: 1.6; stroke-dasharray: 6 4; opacity: .62; }
+  .edge.ws   { stroke: var(--inflight);  stroke-width: 1.6; stroke-dasharray: 7 5; opacity: .6; }
+  .edge.db   { stroke: var(--go);        stroke-width: 1.8; opacity: .6; }
+  .edge.poll { stroke: var(--muted);     stroke-width: 1.5; stroke-dasharray: 2 4; opacity: .55; }
+  /* focus mode */
+  body.focus #wires .edge { opacity: .05; }
+  body.focus #wires .edge.on { opacity: .95; stroke-width: 2.4; }
+  body.focus #wires text { opacity: .12; }
+  body.focus #wires text.on { opacity: 1; }
+
+  /* zones */
+  .zones { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-start; position: relative; z-index: 1; }
+  .zone {
+    background: linear-gradient(180deg, rgba(20,30,40,.5), rgba(12,18,24,.5));
+    border: 1px solid var(--line-dim); border-radius: 12px; padding: 11px 12px 14px;
+    display: flex; flex-direction: column; gap: 11px;
+  }
+  .zone.host   { flex: 1 1 340px; min-width: 320px; border-color: #24425a; }
+  .zone.ext    { flex: 1 1 250px; min-width: 240px; }
+  .zone.client { flex: 1 1 230px; min-width: 220px; }
+  .zone.analytics { flex: 1 1 100%; }
+  .zone > h2 {
+    margin: 0 2px 0; font-family: var(--mono); font-size: 10px; letter-spacing: 1.6px;
+    text-transform: uppercase; color: var(--dim); font-weight: 600;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .zone > h2 .sub { color: var(--muted); letter-spacing: .4px; text-transform: none; font-size: 10px; }
+  .zone.analytics .lane { display: flex; flex-wrap: wrap; gap: 11px; }
+  .zone.analytics .lane .node { flex: 1 1 200px; }
+
+  /* nodes */
+  .node {
+    position: relative; z-index: 2; background: linear-gradient(180deg, var(--surface), var(--surface-2));
+    border: 1px solid var(--line); border-radius: 8px; overflow: hidden; cursor: pointer;
+    transition: border-color .12s, box-shadow .12s, opacity .12s, transform .12s;
+  }
+  .node:hover { border-color: var(--seam); transform: translateY(-1px); }
+  .node.selected { border-color: var(--go); box-shadow: 0 0 0 1px var(--go), 0 8px 22px -14px var(--go); }
+  body.focus .node { opacity: .26; }
+  body.focus .node.on { opacity: 1; }
+  body.focus .node.selected { opacity: 1; }
+
+  .node .head { padding: 7px 9px 6px; border-bottom: 1px solid var(--line-dim); display: flex; align-items: baseline; gap: 7px; }
+  .node .stereo { font-family: var(--mono); font-size: 9.5px; letter-spacing: .4px; color: var(--muted); }
+  .node .glyph { font-size: 12px; line-height: 1; }
+  .node .nname { font-weight: 650; font-size: 13px; letter-spacing: .2px; }
+  .node.process .nname { color: var(--go); }
+  .node.external .nname { color: var(--inflight); }
+  .node.client   .nname { color: var(--seam); }
+  .node.store    .nname { color: var(--telemetry); }
+  .node .body { padding: 6px 9px 8px; font-family: var(--mono); font-size: 10.5px; line-height: 1.55; }
+  .node .body .row { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .node .body .row .k { color: var(--dim); }
+  .node .body .row .v { color: var(--text); }
+  .node .body .row .port { color: var(--go); }
+  body.compact .node .body { display: none; }
+
+  /* detail drawer */
+  aside {
+    position: sticky; top: 0; align-self: start; height: 100vh; border-left: 1px solid var(--line-dim);
+    background: var(--bg-2); padding: 20px 18px; overflow-y: auto;
+  }
+  aside .placeholder { color: var(--dim); font-size: 13px; }
+  .d-zone { font-family: var(--mono); font-size: 10px; letter-spacing: 1.4px; text-transform: uppercase; color: var(--dim); }
+  .d-stereo { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .d-name { font-size: 18px; font-weight: 650; margin: 1px 0 2px; }
+  .d-file { font-family: var(--mono); font-size: 11.5px; color: var(--seam); margin: 2px 0 12px; word-break: break-all; }
+  .d-sec h4 { font-size: 10px; letter-spacing: 1.1px; text-transform: uppercase; color: var(--dim); margin: 14px 0 6px; font-weight: 600; }
+  .d-sec p { margin: 0 0 6px; color: var(--muted); font-size: 12.5px; }
+  .d-list { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: 11.5px; }
+  .d-list li { padding: 3px 0; color: var(--muted); border-bottom: 1px solid var(--line-dim); }
+  .d-list li:last-child { border-bottom: 0; }
+  .d-list .k { color: var(--dim); }
+  .d-list .v { color: var(--text); }
+  .cmd { font-family: var(--mono); font-size: 11.5px; color: var(--go); background: var(--surface-2);
+         border: 1px solid var(--line-dim); border-radius: 6px; padding: 6px 8px; margin: 2px 0 4px; word-break: break-all; }
+  .rel { display: flex; align-items: baseline; gap: 8px; font-family: var(--mono); font-size: 11px; padding: 3px 0; color: var(--muted); }
+  .rel .kind { color: var(--dim); min-width: 96px; }
+  .rel .peer { color: var(--text); cursor: pointer; }
+  .rel .peer:hover { color: var(--seam); text-decoration: underline; }
+
+  footer { color: var(--dim); font-size: 11.5px; padding: 0 24px 26px; max-width: 100ch; }
+  kbd { font-family: var(--mono); font-size: 11px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title">
+    <h1><span class="mark">&#9650;</span> Mission Control &mdash; Deployment Topology</h1>
+    <p>The runtime as it actually deploys: three cooperating processes on one host (Postgres, the FastAPI <b>service</b> seam, the <b>Slack bridge</b>), the external services they reach, the clients, and the analytics side-spine &mdash; all env-driven from one file outside the repo.</p>
+    <p class="hint">Click a box to focus its wiring and see its launch command / env. Companions: <a href="./architecture.html">architecture.html</a> &middot; <a href="./architecture-uml.html">architecture-uml.html</a> &middot; <a href="./architecture-sequence.html">architecture-sequence.html</a>.</p>
+  </div>
+  <div class="controls">
+    <div class="btnrow">
+      <button class="btn" id="compact-btn">Compact</button>
+      <button class="btn" id="reset-btn">Clear focus</button>
+    </div>
+    <div class="legend" id="legend" aria-label="Topology legend"></div>
+  </div>
+</header>
+
+<main>
+  <div class="canvas-wrap">
+    <div class="canvas" id="canvas">
+      <svg id="wires" aria-hidden="true"></svg>
+      <div class="zones" id="zones"></div>
+    </div>
+    <footer id="footnote"></footer>
+  </div>
+
+  <aside id="detail" aria-live="polite">
+    <p class="placeholder">Select a process, external service, or client to see what it is, its launch command, bind/port, key env vars, what it depends on, and the code/doc reference.</p>
+  </aside>
+</main>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Node model — the deployment units. Sourced from docs/DEPLOY.md, docker-compose.yml,
+// .env.example, service/app.py, slack/bridge.py, analytics.py, eval_gate_mcp.py.
+// zone: host | ext | client | analytics ;  kind: process | external | client | store
+// ---------------------------------------------------------------------------
+const NODES = {
+  // ---- Host / box: the three cooperating processes ----
+  postgres: {
+    zone: "host", kind: "process", stereo: "«node / docker»", glyph: "🗄",
+    name: "Postgres", file: "docker-compose.yml",
+    rows: [
+      ["image", "postgres:16.8-alpine"],
+      ["container", "mc-postgres"],
+      ["port", "5432", true],
+      ["volume", "mc_pgdata"],
+    ],
+    what: "Durable state for the whole runtime. Docker container, pinned image, healthchecked with pg_isready; the mc_pgdata named volume survives restarts.",
+    cmd: "docker compose up -d postgres",
+    bind: "0.0.0.0:5432 (host)",
+    env: [["POSTGRES_USER", "mc (dev)"], ["POSTGRES_PASSWORD", "mc (dev)"], ["POSTGRES_DB", "mission_control"], ["POSTGRES_PORT", "5432"]],
+    holds: "LangGraph PostgresSaver checkpointer + runs / run_events / notifications ledgers + plans / plan_* tables.",
+    depends: [], ref: "docker-compose.yml · docs/DEPLOY.md",
+  },
+  service: {
+    zone: "host", kind: "process", stereo: "«process»", glyph: "◉",
+    name: "service (the seam)", file: "src/mission_control/service/app.py",
+    rows: [
+      ["cmd", "python -m mission_control.service"],
+      ["bind", "127.0.0.1:8000", true],
+      ["serves", "/ui  /app  /runs  /notifications"],
+    ],
+    what: "The HTTP seam. FastAPI, binds localhost only in v1. Owns no orchestration — it wraps graph.py, spawns Worker (Controller) subprocesses each in an isolated git worktree, and writes the per-run JSONL telemetry spine. Serves the server-rendered htmx /ui and, when MC_SPA_DIST is set, the React /app.",
+    cmd: "python -m mission_control.service",
+    bind: "127.0.0.1:8000  (v1 = localhost)",
+    env: [
+      ["MC_POSTGRES_URL", "must match compose"],
+      ["MC_SERVICE_SDK", "1 = real Claude worker (else stub)"],
+      ["MC_WORKER_MODEL", "worker LLM model"],
+      ["MC_API_TOKEN", "optional bearer — gates mutating routes"],
+      ["MC_SPA_DIST", "React build dir (enables /app)"],
+      ["MC_UI_DEV_ORIGINS", "CORS origins for SPA dev"],
+    ],
+    holds: "MC_API_TOKEN (if set) gates the MUTATING routes only — approve / reject / scrub / cancel; unset = open localhost/dev. Reads (GET) stay open.",
+    depends: ["postgres"], ref: "service/app.py · graph.py · docs/DEPLOY.md",
+  },
+  bridge: {
+    zone: "host", kind: "process", stereo: "«process»", glyph: "◉",
+    name: "Slack bridge", file: "src/mission_control/slack/bridge.py",
+    rows: [
+      ["cmd", "python -m mission_control.slack.bridge"],
+      ["to Slack", "Socket Mode (outbound WS)"],
+      ["to service", "poll GET /notifications"],
+    ],
+    what: "A SEPARATE long-running process — NOT part of the FastAPI app. Connects OUT to Slack via Socket Mode (an outbound WebSocket — no public endpoint, no request URL). Talks to the service over HTTP: it POLLS GET /notifications on a few-second interval using a durable global cursor, routes each milestone by its slack_profile to that profile's channel via that profile's bot client, and can resolve a gate (approve / reject) back through the service.",
+    cmd: "python -m mission_control.slack.bridge",
+    bind: "no inbound bind (outbound only)",
+    env: [
+      ["MC_SERVICE_URL", "the seam it polls"],
+      ["MC_SLACK_REGISTRY", "path to non-secret registry JSON"],
+      ["MC_SLACK_CURSOR", "durable global poll cursor"],
+      ["MC_API_TOKEN", "same var as service; sent as bearer"],
+      ["<token_env>", "per-profile xoxb- bot token (by name)"],
+      ["<app_token_env>", "per-profile xapp- app token (by name)"],
+    ],
+    holds: "Loads the non-secret registry at MC_SLACK_REGISTRY; per-profile BOT (xoxb-) + APP (xapp-) tokens come from env-var NAMES the registry declares. A profile whose token vars are absent on THIS box is skipped — so a FLEET of boxes can each own a different subset of profiles.",
+    depends: ["service"], ref: "slack/bridge.py · docs/PHASE5C_FINDINGS.md · docs/DEPLOY.md",
+  },
+
+  // ---- External services ----
+  anthropic: {
+    zone: "ext", kind: "external", stereo: "«external»", glyph: "☁",
+    name: "Anthropic Claude Agent SDK / API", file: "src/mission_control/sdk_worker.py",
+    rows: [["protocol", "HTTPS"], ["auth", "ANTHROPIC_API_KEY / claude CLI"]],
+    what: "The Worker's LLM. When MC_SERVICE_SDK=1 the service spawns a real Claude Agent SDK worker (setting_sources=[], fully explicit context); its investigate() makes the model calls.",
+    cmd: "— (SaaS)",
+    bind: "api.anthropic.com (HTTPS)",
+    env: [["ANTHROPIC_API_KEY", "or a logged-in `claude` CLI"], ["MC_WORKER_MODEL", "which model the worker uses"]],
+    holds: "Reached FROM the service's Worker subprocess, not the service process directly.",
+    depends: [], ref: "sdk_worker.py",
+  },
+  slack: {
+    zone: "ext", kind: "external", stereo: "«external»", glyph: "☁",
+    name: "Slack (Socket Mode + Web API)", file: "— (SaaS)",
+    rows: [["gateway", "Socket Mode (WS)"], ["web api", "chat.postMessage …"]],
+    what: "Slack's Socket Mode gateway (the outbound WebSocket the bridge dials) plus the bot Web API used to post milestones and read interactions. No inbound webhook / request URL is exposed.",
+    cmd: "— (SaaS)",
+    bind: "slack.com (WSS + HTTPS)",
+    env: [["xapp- app token", "opens the Socket Mode connection"], ["xoxb- bot token", "posts to the profile's channel"]],
+    holds: "One Socket Mode connection + one bot client PER active profile.",
+    depends: [], ref: "slack/bridge.py",
+  },
+  gitremotes: {
+    zone: "ext", kind: "external", stereo: "«external»", glyph: "☁",
+    name: "git remotes (target repos)", file: "src/mission_control/worktree.py",
+    rows: [["protocol", "HTTPS / SSH"], ["ops", "clone · push on GO"]],
+    what: "The target repositories Mission Control works on. The Worker acquires/clones the target into an isolated worktree and, once a burn passes its go/no-go gate, pushes the merged branch back to the remote.",
+    cmd: "— (external)",
+    bind: "git remote (HTTPS/SSH)",
+    env: [["target_ref", "the repo the run targets"]],
+    holds: "Push only happens after a GO decision applies the burn.",
+    depends: [], ref: "worktree.py · orchestrator.py",
+  },
+
+  // ---- Clients ----
+  cli: {
+    zone: "client", kind: "client", stereo: "«client»", glyph: "⌨",
+    name: "CLI", file: "src/mission_control/cli.py",
+    rows: [["cmd", "mission-control · python -m …cli"], ["talks to", "$MC_SERVICE_URL (HTTP)"]],
+    what: "The command-line client. Every operation is an HTTP call to the service (GET /runs/{id}, GET /runs/{id}/events, GET /metrics, POST approve/reject/…) — no client re-implements orchestration.",
+    cmd: "mission-control  |  python -m mission_control.cli",
+    bind: "→ $MC_SERVICE_URL (HTTP :8000)",
+    env: [["MC_SERVICE_URL", "the seam base URL"], ["MC_API_TOKEN", "sent as bearer for mutating calls"]],
+    holds: "Thin client over the seam.",
+    depends: ["service"], ref: "cli.py",
+  },
+  browser: {
+    zone: "client", kind: "client", stereo: "«client»", glyph: "⌨",
+    name: "Browser", file: "src/mission_control/service/web/",
+    rows: [["/ui", "htmx control room (SSR)"], ["/app", "React SPA (if MC_SPA_DIST)"]],
+    what: "A web browser hitting the service: /ui is the server-rendered htmx control room; /app is the optional React SPA served when MC_SPA_DIST is set. Live run views subscribe to the SSE event stream.",
+    cmd: "— (browser)",
+    bind: "→ service :8000 (HTTP + SSE)",
+    env: [["MC_SPA_DIST", "enables /app"], ["MC_UI_DEV_ORIGINS", "CORS for SPA dev"]],
+    holds: "Receives GET /runs/{id}/events as an SSE stream (the telemetry token).",
+    depends: ["service"], ref: "service/web/routes.py · service/app.py",
+  },
+  slackusers: {
+    zone: "client", kind: "client", stereo: "«client»", glyph: "⌨",
+    name: "Slack workspace users", file: "—",
+    rows: [["surface", "Slack channels / buttons"], ["via", "the Slack bridge"]],
+    what: "Humans in Slack. They see milestone messages and press approve / reject buttons; the interaction travels Slack → bridge → service, never directly to the seam.",
+    cmd: "— (Slack app)",
+    bind: "→ Slack → bridge → service",
+    env: [["approvers", "per-profile allowlist (registry)"]],
+    holds: "Reach the service only through the bridge.",
+    depends: ["bridge"], ref: "slack/bridge.py",
+  },
+
+  // ---- Analytics side-spine ----
+  jsonl: {
+    zone: "analytics", kind: "store", stereo: "«artifact»", glyph: "📄",
+    name: "JSONL telemetry spine", file: "src/mission_control/telemetry.py",
+    rows: [["form", "per-run files on disk"], ["path", "telemetry/*.jsonl"]],
+    what: "The raw/bronze spine: one JSONL file per run, one event per step (tokens, cost_usd, latency_ms, context_size, model, outcome…). Written by the service as runs execute.",
+    cmd: "— (written by the service)",
+    bind: "$MC_TELEMETRY_DIR/telemetry/*.jsonl",
+    env: [["MC_TELEMETRY_DIR", "spine root (also evals/*.jsonl)"]],
+    holds: "Transactional truth; DuckDB reads it in place with zero ETL.",
+    depends: ["service"], ref: "telemetry.py",
+  },
+  duckdb: {
+    zone: "analytics", kind: "store", stereo: "«analytics»", glyph: "📄",
+    name: "DuckDB analytics", file: "src/mission_control/analytics.py",
+    rows: [["engine", "duckdb (in-process)"], ["reads", "read_json_auto (zero ETL)"]],
+    what: "The columnar read layer. Queries the JSONL spine in place via read_json_auto — no separate warehouse, no pipeline — and surfaces aggregates.",
+    cmd: "— (in-process, on demand)",
+    bind: "reads telemetry/*.jsonl + evals/*.jsonl",
+    env: [["DEFAULT_TELEMETRY_GLOB", "telemetry/*.jsonl"], ["DEFAULT_EVAL_GLOB", "evals/eval-*.jsonl"]],
+    holds: "Powers GET /metrics.",
+    depends: ["jsonl"], ref: "analytics.py",
+  },
+  metrics: {
+    zone: "analytics", kind: "store", stereo: "«endpoint»", glyph: "📄",
+    name: "GET /metrics", file: "src/mission_control/service/app.py",
+    rows: [["route", "GET /metrics"], ["source", "DuckDB over the spine"]],
+    what: "The service endpoint that surfaces the DuckDB aggregates — the analytic view of the JSONL spine.",
+    cmd: "curl $MC_SERVICE_URL/metrics",
+    bind: "service :8000 /metrics",
+    env: [],
+    holds: "Read-only view; part of the seam.",
+    depends: ["duckdb"], ref: "service/app.py · analytics.py",
+  },
+  evalmcp: {
+    zone: "analytics", kind: "store", stereo: "«mcp server»", glyph: "📄",
+    name: "eval-gate (MCP, stdio)", file: "src/mission_control/eval_gate_mcp.py",
+    rows: [["cmd", "python -m …eval_gate_mcp"], ["transport", "stdio · exit 0 / nonzero"]],
+    what: "A portable CI tool: the eval gate wrapped as an MCP server over stdio. A Jenkins pipeline calls the eval_gate tool and reads exit_code (0 = pass, nonzero = regression).",
+    cmd: "python -m mission_control.eval_gate_mcp",
+    bind: "stdio (no socket)",
+    env: [["MC_TELEMETRY_DIR", "where eval JSONL lives"]],
+    holds: "Independent of the running service; portable to any CI/IDE.",
+    depends: ["jsonl"], ref: "eval_gate_mcp.py · docs/EVAL_GATE.md",
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Links — the wiring. type: http | sse | ws | db | poll. label rides the edge.
+// dir "both" draws one line but lists the relationship on both endpoints.
+// ---------------------------------------------------------------------------
+const LINKS = [
+  { from: "cli",        to: "service",    type: "http", label: "HTTP :8000" },
+  { from: "browser",    to: "service",    type: "http", label: "HTTP :8000  /ui /app" },
+  { from: "service",    to: "browser",    type: "sse",  label: "SSE /runs/{id}/events" },
+  { from: "service",    to: "postgres",   type: "db",   label: "DB :5432" },
+  { from: "bridge",     to: "service",    type: "poll", label: "poll GET /notifications" },
+  { from: "bridge",     to: "service",    type: "http", label: "approve / reject (HTTP)" },
+  { from: "bridge",     to: "slack",      type: "ws",   label: "Socket Mode (WS) + bot Web API" },
+  { from: "slackusers", to: "bridge",     type: "http", label: "buttons → bridge" },
+  { from: "service",    to: "anthropic",  type: "http", label: "HTTPS (Worker → LLM)" },
+  { from: "service",    to: "gitremotes", type: "http", label: "HTTPS/SSH (clone · push on GO)" },
+  { from: "service",    to: "jsonl",      type: "http", label: "writes JSONL" },
+  { from: "jsonl",      to: "duckdb",     type: "poll", label: "read_json_auto" },
+  { from: "duckdb",     to: "metrics",    type: "http", label: "→ /metrics" },
+  { from: "jsonl",      to: "evalmcp",    type: "poll", label: "reads evals" },
+];
+
+const LINK_META = {
+  http: { name: "HTTP",             glyph: "──", dash: "",    color: "var(--seam)" },
+  sse:  { name: "SSE (telemetry)",  glyph: "┄┄", dash: "6 4", color: "var(--telemetry)" },
+  ws:   { name: "Socket Mode WS",   glyph: "┄┄", dash: "7 5", color: "var(--inflight)" },
+  db:   { name: "DB connection",    glyph: "══", dash: "",    color: "var(--go)" },
+  poll: { name: "poll",             glyph: "···", dash: "2 4", color: "var(--muted)" },
+};
+const NODE_META = {
+  process:  { name: "«process»", glyph: "◉", color: "var(--go)" },
+  external: { name: "«external»", glyph: "☁", color: "var(--inflight)" },
+  client:   { name: "«client»",   glyph: "⌨", color: "var(--seam)" },
+  store:    { name: "«artifact»", glyph: "📄", color: "var(--telemetry)" },
+};
+
+const ZONES = [
+  { id: "host",      cls: "host",      title: "Host / box", sub: "launchd (macOS) / systemd (Linux) · env: ~/.mission-control/mc.env (chmod 600)" },
+  { id: "ext",       cls: "ext",       title: "External services", sub: "SaaS / remote" },
+  { id: "client",    cls: "client",    title: "Clients", sub: "$MC_SERVICE_URL over HTTP" },
+  { id: "analytics", cls: "analytics", title: "Analytics side-spine", sub: "JSONL → DuckDB → /metrics · eval-gate MCP for CI" },
+];
+
+// ---------------------------------------------------------------------------
+// Render nodes
+// ---------------------------------------------------------------------------
+const zonesEl = document.getElementById("zones");
+const svg = document.getElementById("wires");
+const SVGNS = "http://www.w3.org/2000/svg";
+const nodeEls = {};
+
+function el(tag, cls, html) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (html != null) e.innerHTML = html;
+  return e;
+}
+
+for (const z of ZONES) {
+  const zc = el("div", "zone " + z.cls);
+  zc.appendChild(el("h2", null, z.title + ' <span class="sub">' + z.sub + "</span>"));
+  const lane = z.id === "analytics" ? el("div", "lane") : zc;
+  for (const [id, n] of Object.entries(NODES)) {
+    if (n.zone !== z.id) continue;
+    const node = el("div", "node " + n.kind);
+    node.id = "node-" + id;
+    node.dataset.id = id;
+    let rows = (n.rows || []).map(r => {
+      const v = r[2] ? '<span class="port">' + r[1] + "</span>" : '<span class="v">' + r[1] + "</span>";
+      return '<div class="row"><span class="k">' + r[0] + ":</span> " + v + "</div>";
+    }).join("");
+    node.innerHTML =
+      '<div class="head"><span class="glyph">' + n.glyph + '</span>' +
+      '<span class="stereo">' + n.stereo + '</span>' +
+      '<span class="nname">' + n.name + "</span></div>" +
+      '<div class="body">' + rows + "</div>";
+    node.addEventListener("click", () => select(id));
+    nodeEls[id] = node;
+    lane.appendChild(node);
+  }
+  if (z.id === "analytics") zc.appendChild(lane);
+  zonesEl.appendChild(zc);
+}
+
+// ---------------------------------------------------------------------------
+// Wires
+// ---------------------------------------------------------------------------
+const edgeEls = [];
+function drawWires() {
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  edgeEls.length = 0;
+  const canvas = document.getElementById("canvas");
+  const cb = canvas.getBoundingClientRect();
+
+  // count parallel edges between the same pair to fan them out
+  const pairIdx = {};
+  LINKS.forEach(l => { const k = [l.from, l.to].sort().join("|"); pairIdx[k] = (pairIdx[k] || 0); });
+  const seen = {};
+
+  LINKS.forEach((l, i) => {
+    const a = nodeEls[l.from], b = nodeEls[l.to];
+    if (!a || !b) return;
+    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+    const ax = ra.left + ra.width / 2 - cb.left, ay = ra.top + ra.height / 2 - cb.top;
+    const bx = rb.left + rb.width / 2 - cb.left, by = rb.top + rb.height / 2 - cb.top;
+
+    const pk = [l.from, l.to].sort().join("|");
+    const order = seen[pk] = (seen[pk] || 0) + 1;
+    const total = LINKS.filter(x => [x.from, x.to].sort().join("|") === pk).length;
+    const spread = (order - (total + 1) / 2) * 26;
+
+    const mx = (ax + bx) / 2, my = (ay + by) / 2;
+    // perpendicular offset so parallel edges between the same pair fan out
+    const dx = bx - ax, dy = by - ay, len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len, ny = dx / len;
+
+    const path = document.createElementNS(SVGNS, "path");
+    path.setAttribute("d", "M " + ax + " " + ay + " Q " + (mx + nx * spread) + " " + (my + ny * spread) + " " + bx + " " + by);
+    path.setAttribute("class", "edge " + l.type);
+    path.dataset.from = l.from; path.dataset.to = l.to;
+    svg.appendChild(path);
+
+    // arrowhead (small) at the target end
+    const ang = Math.atan2(by - (my + ny * spread), bx - (mx + nx * spread));
+    const ah = 7;
+    const arrow = document.createElementNS(SVGNS, "path");
+    arrow.setAttribute("d",
+      "M " + bx + " " + by +
+      " L " + (bx - Math.cos(ang - 0.4) * ah) + " " + (by - Math.sin(ang - 0.4) * ah) +
+      " M " + bx + " " + by +
+      " L " + (bx - Math.cos(ang + 0.4) * ah) + " " + (by - Math.sin(ang + 0.4) * ah));
+    arrow.setAttribute("class", "edge " + l.type);
+    arrow.style.strokeDasharray = "0";
+    arrow.dataset.from = l.from; arrow.dataset.to = l.to;
+    svg.appendChild(arrow);
+
+    // label at the curve midpoint
+    const lx = mx + nx * spread, ly = my + ny * spread;
+    const text = document.createElementNS(SVGNS, "text");
+    text.setAttribute("x", lx); text.setAttribute("y", ly - 3);
+    text.setAttribute("text-anchor", "middle");
+    text.textContent = l.label;
+    text.dataset.from = l.from; text.dataset.to = l.to;
+    svg.appendChild(text);
+
+    edgeEls.push({ path, arrow, text, from: l.from, to: l.to });
+  });
+  if (selectedId) applyFocus(selectedId);
+}
+
+// ---------------------------------------------------------------------------
+// Selection / focus + detail drawer
+// ---------------------------------------------------------------------------
+let selectedId = null;
+const detail = document.getElementById("detail");
+
+function neighbours(id) {
+  const set = new Set([id]);
+  LINKS.forEach(l => { if (l.from === id) set.add(l.to); if (l.to === id) set.add(l.from); });
+  return set;
+}
+function applyFocus(id) {
+  const near = neighbours(id);
+  Object.entries(nodeEls).forEach(([k, e]) => e.classList.toggle("on", near.has(k)));
+  edgeEls.forEach(e => {
+    const on = e.from === id || e.to === id;
+    e.path.classList.toggle("on", on);
+    e.arrow.classList.toggle("on", on);
+    e.text.classList.toggle("on", on);
+  });
+}
+function select(id) {
+  if (selectedId === id) { clearFocus(); return; }
+  selectedId = id;
+  document.body.classList.add("focus");
+  Object.entries(nodeEls).forEach(([k, e]) => e.classList.toggle("selected", k === id));
+  applyFocus(id);
+  renderDetail(id);
+}
+function clearFocus() {
+  selectedId = null;
+  document.body.classList.remove("focus");
+  Object.values(nodeEls).forEach(e => e.classList.remove("selected", "on"));
+  detail.innerHTML = '<p class="placeholder">Select a process, external service, or client to see what it is, its launch command, bind/port, key env vars, what it depends on, and the code/doc reference.</p>';
+}
+function renderDetail(id) {
+  const n = NODES[id];
+  const zone = ZONES.find(z => z.id === n.zone);
+  const envRows = (n.env || []).map(e => '<li><span class="k">' + e[0] + '</span> &mdash; <span class="v">' + e[1] + "</span></li>").join("") || '<li class="k">— none —</li>';
+
+  // relationships from LINKS
+  const rels = [];
+  LINKS.forEach(l => {
+    if (l.from === id) rels.push({ dir: "→ " + LINK_META[l.type].name, peer: l.to, label: l.label });
+    else if (l.to === id) rels.push({ dir: "← " + LINK_META[l.type].name, peer: l.from, label: l.label });
+  });
+  const relHtml = rels.map(r =>
+    '<div class="rel"><span class="kind">' + r.dir + '</span>' +
+    '<span class="peer" data-peer="' + r.peer + '">' + NODES[r.peer].name + '</span></div>' +
+    '<div class="rel"><span class="kind"></span><span style="color:var(--dim)">' + r.label + "</span></div>"
+  ).join("") || '<div class="rel"><span class="kind">—</span></div>';
+
+  const dep = (n.depends || []).map(d => '<span class="peer" data-peer="' + d + '">' + NODES[d].name + "</span>").join(", ") || "nothing";
+
+  detail.innerHTML =
+    '<div class="d-zone">' + zone.title + "</div>" +
+    '<div class="d-stereo">' + n.stereo + "</div>" +
+    '<div class="d-name">' + n.name + "</div>" +
+    '<div class="d-file">' + n.file + "</div>" +
+    '<div class="d-sec"><h4>What it is</h4><p>' + n.what + "</p></div>" +
+    '<div class="d-sec"><h4>Launch command</h4><div class="cmd">' + n.cmd + "</div></div>" +
+    '<div class="d-sec"><h4>Bind / port</h4><div class="cmd">' + n.bind + "</div></div>" +
+    '<div class="d-sec"><h4>Key env vars</h4><ul class="d-list">' + envRows + "</ul></div>" +
+    '<div class="d-sec"><h4>Depends on</h4><p>' + dep + "</p></div>" +
+    '<div class="d-sec"><h4>Notes</h4><p>' + n.holds + "</p></div>" +
+    '<div class="d-sec"><h4>Wiring</h4>' + relHtml + "</div>" +
+    '<div class="d-sec"><h4>Code / doc ref</h4><p style="font-family:var(--mono);font-size:11.5px;color:var(--seam)">' + n.ref + "</p></div>";
+
+  detail.querySelectorAll("[data-peer]").forEach(p =>
+    p.addEventListener("click", () => select(p.dataset.peer)));
+}
+
+// ---------------------------------------------------------------------------
+// Legend
+// ---------------------------------------------------------------------------
+(function buildLegend() {
+  const lg = document.getElementById("legend");
+  const links = el("div", "grp");
+  for (const [k, m] of Object.entries(LINK_META)) {
+    const item = el("div", "item");
+    const s = document.createElementNS(SVGNS, "svg");
+    s.setAttribute("width", "30"); s.setAttribute("height", "10");
+    const p = document.createElementNS(SVGNS, "path");
+    p.setAttribute("d", "M 1 5 L 29 5");
+    p.setAttribute("stroke", m.color); p.setAttribute("stroke-width", "1.8");
+    if (m.dash) p.setAttribute("stroke-dasharray", m.dash);
+    s.appendChild(p);
+    item.appendChild(s);
+    item.appendChild(el("span", "lbl", m.name));
+    links.appendChild(item);
+  }
+  const nodes = el("div", "grp");
+  for (const [k, m] of Object.entries(NODE_META)) {
+    const item = el("div", "item");
+    item.innerHTML = '<span class="glyph" style="color:' + m.color + '">' + m.glyph + '</span><span class="lbl">' + m.name + "</span>";
+    nodes.appendChild(item);
+  }
+  lg.appendChild(links);
+  lg.appendChild(nodes);
+})();
+
+// footnote
+document.getElementById("footnote").innerHTML =
+  "Links: <b style='color:var(--seam)'>─ HTTP</b> · <b style='color:var(--telemetry)'>┄ SSE (telemetry token)</b> · " +
+  "<b style='color:var(--inflight)'>┄ Socket Mode WS (outbound)</b> · <b style='color:var(--go)'>═ DB</b> · <b style='color:var(--muted)'>·· poll</b>. &nbsp; " +
+  "<b>v1 is demo-grade</b> — localhost bind, single-box Postgres, optional bearer auth (MC_API_TOKEN) on the mutating routes only. " +
+  "The <b>fleet model</b> lets multiple boxes each own a subset of Slack profiles: a profile whose token env vars are absent on a box is skipped, not fatal. " +
+  "Renders standalone over <kbd>file://</kbd> — no network, no build.";
+
+// controls
+document.getElementById("reset-btn").addEventListener("click", clearFocus);
+document.getElementById("compact-btn").addEventListener("click", (e) => {
+  document.body.classList.toggle("compact");
+  e.currentTarget.classList.toggle("btn-on");
+  requestAnimationFrame(drawWires);
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") clearFocus(); });
+
+// wire redraw
+window.addEventListener("load", drawWires);
+window.addEventListener("resize", drawWires);
+if (window.ResizeObserver) {
+  const ro = new ResizeObserver(() => drawWires());
+  ro.observe(document.getElementById("canvas"));
+}
+drawWires();
+</script>
+</body>
+</html>

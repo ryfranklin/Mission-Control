@@ -29,10 +29,18 @@ re-implementing any orchestration.
                                    teardown ◄───────────────────────┘   (no worktree leaks)
 ```
 
-▶ **Interactive diagrams** (open in a browser, self-contained — no build/network):
-[architecture.html](./architecture.html) (component map — Clients → seam → runtime → durable state) ·
-[architecture-uml.html](./architecture-uml.html) (UML class diagram of the real classes) ·
-[architecture-sequence.html](./architecture-sequence.html) (sequence flow of a gated burn run).
+▶ **Interactive diagrams** — open any in a browser; each is self-contained (no build,
+no network) and click-through with a detail panel:
+
+| Diagram | View |
+|---|---|
+| [architecture.html](./architecture.html) | Component map — Clients → seam → runtime → durable state |
+| [architecture-uml.html](./architecture-uml.html) | UML class diagram of the real classes + relationships |
+| [architecture-sequence.html](./architecture-sequence.html) | Sequence flow of a gated `burn` run (with the durable go/no-go) |
+| [architecture-run-state.html](./architecture-run-state.html) | Run state machine — the durable `runs` lifecycle |
+| [architecture-plan-flow.html](./architecture-plan-flow.html) | Plan → CAPCOM activity flow (AI-DLC INCEPTION → CONSTRUCTION) |
+| [architecture-data-model.html](./architecture-data-model.html) | ER diagram of the Postgres schema |
+| [architecture-deploy.html](./architecture-deploy.html) | Deployment topology — the three cooperating processes |
 
 ---
 

@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mission Control — Plan → CAPCOM Flow</title>
+<!--
+  A UML activity / swimlane diagram of Mission Control's AI-DLC plan lifecycle:
+  INCEPTION (the interactive PlannerEngine walk) → finalize → CONSTRUCTION
+  (CAPCOM / PlanBuilder's edge-triggered scheduler on the run launch path).
+  Grounded in the real code: service/planner.py, service/plan_builder.py,
+  plans_store.py, aidlc_v2/*. Self-contained: inline CSS + vanilla JS building
+  an inline SVG arrow overlay. No build, no CDN, no network. Renders over file://
+  with no console errors. Companion to architecture.html, architecture-uml.html,
+  architecture-sequence.html.
+-->
+<style>
+  :root {
+    --go: #2fe57a; --inflight: #ffb020; --fault: #ff3b47; --telemetry: #22d3ee; --seam: #7cc7ff;
+    --bg: #0b1016; --bg-2: #0e141c; --surface: #1e2833; --surface-2: #172029;
+    --line: #2a3846; --line-dim: #223040; --text: #c9d5e1; --muted: #8598ab; --dim: #5c6f81;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: radial-gradient(1300px 640px at 50% -10%, #12202e 0%, transparent 60%), var(--bg);
+    color: var(--text); font-family: var(--sans); font-size: 13.5px; line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--seam); }
+  header {
+    padding: 20px 24px 12px; border-bottom: 1px solid var(--line-dim);
+    display: flex; flex-wrap: wrap; gap: 16px 26px; align-items: flex-end;
+  }
+  .title h1 { margin: 0; font-size: 18px; letter-spacing: .3px; font-weight: 650; }
+  .title h1 .mark { color: var(--go); }
+  .title p { margin: 4px 0 0; color: var(--muted); max-width: 72ch; }
+  .title .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .controls { margin-left: auto; display: flex; flex-direction: column; gap: 9px; align-items: flex-end; }
+  .btnrow { display: flex; gap: 8px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 7px; cursor: pointer; font-size: 12px;
+    color: var(--muted); user-select: none; border: 1px solid var(--line);
+    background: var(--surface-2); padding: 6px 12px; border-radius: 7px;
+  }
+  .btn:hover { border-color: var(--seam); color: var(--text); }
+  .btn.on { border-color: var(--go); color: var(--go); }
+  .btn.on.brown { border-color: var(--inflight); color: var(--inflight); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 11px; max-width: 640px; }
+  .legend .item { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); white-space: nowrap; }
+  .legend .g { font-family: var(--mono); color: var(--text); }
+  .legend .chip { font-family: var(--mono); font-size: 10px; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--line); }
+
+  main { display: grid; grid-template-columns: minmax(0,1fr) 330px; align-items: start; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+
+  .canvas-wrap { padding: 14px 16px 50px; overflow: auto; }
+  #canvas { position: relative; }
+  /* SVG arrow overlay sits behind the nodes */
+  #wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; }
+  .lanes { position: relative; z-index: 2; display: grid; gap: 10px; }
+
+  .lane { position: relative; border: 1px solid var(--line-dim); border-radius: 10px;
+    background: linear-gradient(90deg, var(--surface-2) 0 148px, transparent 148px); min-height: 96px; }
+  .lane-hd { position: absolute; left: 0; top: 0; bottom: 0; width: 148px; padding: 12px 12px;
+    display: flex; flex-direction: column; justify-content: center; gap: 4px; border-right: 1px dashed var(--line); }
+  .lane-hd .ttl { font-weight: 650; font-size: 12.5px; }
+  .lane-hd .sub { font-family: var(--mono); font-size: 10px; color: var(--dim); }
+  .lane-hd .badge { font-family: var(--mono); font-size: 9.5px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; align-self: flex-start; }
+  .row { position: relative; margin-left: 148px; height: 100%; }
+
+  /* nodes are absolutely positioned within a lane row */
+  .node { position: absolute; transform: translate(-50%, -50%);
+    display: flex; align-items: center; gap: 7px; cursor: pointer; user-select: none;
+    background: var(--surface); border: 1.4px solid var(--line); color: var(--text);
+    padding: 8px 11px; border-radius: 9px; font-size: 11.5px; max-width: 200px; line-height: 1.25;
+    box-shadow: 0 1px 0 rgba(0,0,0,.3); transition: border-color .12s, box-shadow .12s, opacity .12s; }
+  .node:hover { border-color: var(--seam); }
+  .node .glyph { font-family: var(--mono); font-size: 13px; line-height: 1; }
+  .node .lbl { min-width: 0; }
+  .node .lbl b { font-weight: 600; }
+  .node .tag { display: block; font-family: var(--mono); font-size: 9px; color: var(--dim); margin-top: 2px; }
+
+  /* node kinds — colour + glyph + label, never colour alone */
+  .node.initial, .node.final { background: #12202c; border-color: var(--seam); border-radius: 999px; padding: 8px 13px; }
+  .node.decision { background: #1d1707; border-color: #5a4a20; border-radius: 6px; }
+  .node.decision .glyph { color: var(--inflight); }
+  .node.gate { background: #241016; border-color: #6a2530; }
+  .node.gate .glyph { color: var(--fault); }
+  .node.loop { border-style: dashed; }
+  .node.loop .glyph { color: var(--telemetry); }
+  .node.done { border-color: #2a5a40; }
+  .node.done .glyph { color: var(--go); }
+  .node.sel { border-color: var(--go); box-shadow: 0 0 0 1px var(--go), 0 0 14px rgba(47,229,122,.25); }
+
+  /* path highlight */
+  body.pathmode .node.dim { opacity: .2; }
+  body.pathmode .node.lit { opacity: 1; }
+
+  /* SVG wire styling */
+  #wires .wire { fill: none; stroke: var(--muted); stroke-width: 1.5; }
+  #wires .wire.go { stroke: var(--go); }
+  #wires .wire.fault { stroke: var(--fault); }
+  #wires .wire.inflight { stroke: var(--inflight); }
+  #wires .wire.telemetry { stroke: var(--telemetry); }
+  #wires .wire.loop { stroke: var(--telemetry); stroke-dasharray: 5 4; }
+  #wires .wire.brown { stroke: var(--inflight); }
+  #wires .wire.dimw { opacity: .12; }
+  #wires .glabel { fill: var(--muted); font: 10px var(--mono); }
+  #wires .glabel.go { fill: var(--go); }
+  #wires .glabel.fault { fill: var(--fault); }
+  #wires .glabel.brown { fill: var(--inflight); }
+  #wires .glabel .bg { fill: var(--bg-2); }
+
+  aside {
+    position: sticky; top: 0; align-self: start; height: 100vh; border-left: 1px solid var(--line-dim);
+    background: var(--bg-2); padding: 20px 18px; overflow-y: auto;
+  }
+  aside .placeholder { color: var(--dim); font-size: 13px; }
+  .d-step { font-family: var(--mono); font-size: 11px; color: var(--seam); letter-spacing: 1px; }
+  .d-label { font-size: 16px; font-weight: 650; margin: 6px 0 8px; display: flex; gap: 8px; align-items: baseline; }
+  .d-label .g { color: var(--inflight); font-family: var(--mono); }
+  .d-meta { font-family: var(--mono); font-size: 11.5px; color: var(--muted); margin: 3px 0; }
+  .d-meta .k { color: var(--dim); }
+  .d-file { font-family: var(--mono); font-size: 11.5px; color: var(--seam); word-break: break-all; margin-top: 2px; }
+  .d-desc { color: var(--muted); margin-top: 12px; }
+  .d-status { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .d-status .chip { font-family: var(--mono); font-size: 10.5px; padding: 2px 7px; border-radius: 5px; border: 1px solid var(--line); color: var(--text); }
+  footer { color: var(--dim); font-size: 11.5px; padding: 0 24px 26px; }
+  kbd { font-family: var(--mono); font-size: 11px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title">
+    <h1><span class="mark">▲</span> Mission Control — Plan → CAPCOM Flow</h1>
+    <p>The AI-DLC plan lifecycle as a swimlane activity diagram: the interactive <b>INCEPTION</b> walk (PlannerEngine) → <b>finalize</b> → <b>CONSTRUCTION</b>, where <b>CAPCOM / PlanBuilder</b> schedules units onto the existing run launch path behind the go/no-go gate.</p>
+    <p class="hint">Click any node for what it does, its lane, code ref, and the plan/unit status it sets. Companion to <a href="./architecture.html">architecture.html</a> · <a href="./architecture-uml.html">architecture-uml.html</a> · <a href="./architecture-sequence.html">architecture-sequence.html</a>.</p>
+  </div>
+  <div class="controls">
+    <div class="btnrow">
+      <button class="btn" id="pf-green">Greenfield path</button>
+      <button class="btn" id="pf-brown">Brownfield path</button>
+      <button class="btn" id="pf-reset">Reset</button>
+    </div>
+    <div class="legend" aria-label="Node types and statuses">
+      <span class="item"><span class="g">●</span> initial</span>
+      <span class="item"><span class="g">▭</span> activity</span>
+      <span class="item"><span class="g" style="color:var(--inflight)">◇</span> decision</span>
+      <span class="item"><span class="g" style="color:var(--telemetry)">⟳</span> loop</span>
+      <span class="item"><span class="g" style="color:var(--fault)">⏸</span> go/no-go gate</span>
+      <span class="item"><span class="g" style="color:var(--go)">◎</span> final</span>
+    </div>
+    <div class="legend" aria-label="Statuses">
+      <span class="item">plan:
+        <span class="chip">drafting</span><span class="chip" style="border-color:var(--seam)">ready</span>
+        <span class="chip" style="border-color:var(--inflight)">building</span><span class="chip" style="border-color:var(--go)">done</span></span>
+      <span class="item">unit:
+        <span class="chip">pending</span><span class="chip" style="border-color:var(--fault)">blocked</span>
+        <span class="chip" style="border-color:var(--go)">done</span><span class="chip" style="border-color:var(--dim)">deferred</span></span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="canvas-wrap">
+    <div id="canvas">
+      <svg id="wires" aria-hidden="true"></svg>
+      <div class="lanes" id="lanes"></div>
+    </div>
+    <footer>
+      Renders standalone over <kbd>file://</kbd> — no network, no build. CAPCOM adds <b>no new orchestration</b>: units are translated onto the existing run launch path (sim / gated burn). Committed unit status in git is the authority, so a build resumes portably on any machine.
+    </footer>
+  </div>
+  <aside id="detail" aria-live="polite">
+    <p class="placeholder">Click a node to see what it does, its swimlane, the code reference, and the plan / unit status it sets. Use the path buttons to trace greenfield vs brownfield.</p>
+  </aside>
+</main>
+
+<script>
+"use strict";
+
+// ---- swimlanes (rows, top → bottom) ----
+const LANES = [
+  { id: "op",     ttl: "Operator",     sub: "CLI · Web · Slack", badge: "surface" },
+  { id: "planner",ttl: "PlannerEngine", sub: "INCEPTION",         badge: "planner.py" },
+  { id: "capcom", ttl: "CAPCOM",       sub: "PlanBuilder · CONSTRUCTION", badge: "plan_builder.py" },
+  { id: "rungraph",ttl: "RunGraph",    sub: "runs",               badge: "graph.py" },
+  { id: "store",  ttl: "git + Postgres",sub: "plans · flight-plan.yaml", badge: "plans_store.py" },
+];
+const LANEY = Object.fromEntries(LANES.map((l, i) => [l.id, i]));
+
+// ---- activity nodes ----
+// kind: initial | activity | decision | gate | loop | done | final
+// lane: swimlane id ; x: column (0..1 fraction of the row width)
+// path: which highlight paths this node belongs to ("green","brown",or both via array)
+const NODES = [
+  { id: "start", lane: "op", x: 0.03, kind: "initial", glyph: "●", label: "POST /plans",
+    path: ["green","brown"], where: "Operator", file: "service/app.py → plans_store.create_plan()",
+    sets: [["plan","drafting"]],
+    desc: "The operator creates a plan. It is born in status drafting — an empty INCEPTION conversation waiting for the first turn." },
+
+  { id: "wsdetect", lane: "planner", x: 0.11, kind: "activity", glyph: "▭", label: "Workspace detection",
+    path: ["green","brown"], where: "PlannerEngine", file: "planner.py · _workspace_detection() · detect_existing_code()",
+    sets: [],
+    desc: "The first turn of POST /plans/{id}/turns. Lists tracked files (ignoring docs/metadata) to decide whether the target already contains code — the greenfield vs brownfield fork. An AI-DLC v2 target instead drives its walk from the vendored catalog (_v2_turn)." },
+
+  { id: "ghd", lane: "planner", x: 0.24, kind: "decision", glyph: "◇", label: "greenfield or brownfield?",
+    path: ["green","brown"], where: "PlannerEngine", file: "planner.py · _reply_flow()",
+    sets: [],
+    desc: "Decision node. Existing code → brownfield (reverse-engineer first); empty/new → greenfield (walk the INCEPTION stages)." },
+
+  // greenfield branch
+  { id: "gwalk", lane: "planner", x: 0.40, kind: "activity", glyph: "▭", label: "Walk INCEPTION stages",
+    path: ["green"], where: "PlannerEngine (greenfield)", file: "planner.py · _greenfield_turn() · aidlc.next_inception_stage()",
+    sets: [["unit","pending (INCEPTION)"]],
+    desc: "requirements → [user stories, if warranted] → workflow → units. Each completed stage is laid down as an INCEPTION unit ('in place'). The units-generation step emits the CONSTRUCTION work-list (chained depends_on). Guard label 'greenfield'." },
+
+  // brownfield branch
+  { id: "revsim", lane: "planner", x: 0.40, kind: "activity", glyph: "▭", label: "Launch read-only sim → reverse-engineer",
+    path: ["brown"], where: "PlannerEngine (brownfield)", file: "planner.py · _reverse_engineer() · SimRunner.run_sim()",
+    sets: [["run","sim (read-only)"]],
+    desc: "Reuses the REAL run launch path — a read-only sim reads the codebase (no second code-reading path). Its summary is folded back into requirements (REQ_KEY_RE_SUMMARY). Guard label 'brownfield'." },
+  { id: "clarloop", lane: "op", x: 0.54, kind: "loop", glyph: "⟳", label: "Requirements clarification (operator turns)",
+    path: ["brown"], where: "Operator ⇄ PlannerEngine", file: "planner.py · _brownfield_turn() · aidlc.readiness_report()",
+    sets: [],
+    desc: "The clarification loop: the operator answers criteria (scope, components, acceptance, well-formed units) turn by turn until the requirements-readiness gate is green. _first_unmet() picks the next criterion." },
+
+  // converge
+  { id: "gate", lane: "planner", x: 0.68, kind: "decision", glyph: "◇", label: "readiness gate green?",
+    path: ["green","brown"], where: "PlannerEngine", file: "planner.py · aidlc.readiness_report() / _first_unmet()",
+    sets: [],
+    desc: "Both branches converge here. Not green → loop back for more turns (another stage / another criterion). Green (scope, components, acceptance, well-formed units) → the plan becomes ready." },
+
+  { id: "ready", lane: "planner", x: 0.86, kind: "activity", glyph: "▭", label: "Plan is ready",
+    path: ["green","brown"], where: "PlannerEngine", file: "planner.py · set_status(STATUS_READY)",
+    sets: [["plan","ready"]],
+    desc: "INCEPTION work is in place and the CONSTRUCTION work-list is populated. The plan is ready to finalize. Docs are synced to git at each checkpoint." },
+
+  { id: "finalize", lane: "op", x: 0.86, kind: "activity", glyph: "▭", label: "POST /plans/{id}/finalize",
+    path: ["green","brown"], where: "Operator", file: "service/app.py → PlanBuilder.start_build()",
+    sets: [["plan","building"]],
+    desc: "The operator finalizes. PlanBuilder.start_build() moves the plan to building and dispatches its runnable units. A greenfield plan with no target is BOOTSTRAPPED first (create + seed + push MC_GREENFIELD_REMOTE) — then it's 'a repo with a remote' like brownfield." },
+
+  // CAPCOM lane
+  { id: "translate", lane: "capcom", x: 0.06, kind: "activity", glyph: "▭", label: "Translate units onto run launch path",
+    path: ["green","brown"], where: "CAPCOM / PlanBuilder", file: "plan_builder.py · start_build() → _advance()",
+    sets: [["plan","building"]],
+    desc: "Adds NO new orchestration. INCEPTION/validation units (task_type=sim) → sim runs; CONSTRUCTION/change units (task_type=burn) → gated burn runs. task_type is already on each unit." },
+  { id: "sched", lane: "capcom", x: 0.20, kind: "decision", glyph: "◇", label: "unit RUNNABLE?",
+    path: ["green","brown"], where: "CAPCOM (edge-triggered scheduler)", file: "plan_builder.py · _advance()",
+    sets: [],
+    desc: "The edge-triggered scheduler. A unit is runnable iff status != done AND every unit in its depends_on is done. Committed unit status is the authority — portable across machines. Deferred units count as resolved but are never dispatched." },
+  { id: "designstage", lane: "capcom", x: 0.36, kind: "activity", glyph: "▭", label: "Dispatch design/doc stage (gated=False)",
+    path: ["green","brown"], where: "CAPCOM", file: "plan_builder.py · _dispatch(gated=False)",
+    sets: [["run","sim / ungated burn"]],
+    desc: "A design/doc stage runs as a sim or a writable-but-ungated burn → AUTO-APPLIES with no human gate." },
+  { id: "codestage", lane: "capcom", x: 0.36, kind: "gate", glyph: "⏸", label: "Dispatch code stage (gated=True)",
+    path: ["green","brown"], where: "CAPCOM", file: "plan_builder.py · _dispatch(gated=True)",
+    sets: [["run","burn (gated)"]],
+    desc: "A code-writing stage runs as a burn behind the human go/no-go gate — nothing lands without an approval on record." },
+
+  // RunGraph lane
+  { id: "unitrun", lane: "rungraph", x: 0.52, kind: "activity", glyph: "▭", label: "Execute unit-run",
+    path: ["green","brown"], where: "RunGraph", file: "graph.py (dispatch → worker → gate → apply → teardown)",
+    sets: [],
+    desc: "Each unit-run walks the standard run path (see the sequence diagram): dispatch worktree → run worker → go/no-go gate → apply → teardown. On any terminal state the RunManager calls CAPCOM.on_run_terminal(run_id, plan_id)." },
+  { id: "verify", lane: "capcom", x: 0.52, kind: "decision", glyph: "◇", label: "artifacts landed?",
+    path: ["green","brown"], where: "CAPCOM", file: "plan_builder.py · _produced() / on_run_terminal()",
+    sets: [],
+    desc: "CAPCOM verifies the stage actually produced its artifacts (from the applied diff). A produced-nothing stage is re-dispatched with escalated instruction." },
+  { id: "rerun", lane: "capcom", x: 0.52, kind: "loop", glyph: "⟳", label: "Bounded re-run (escalated)",
+    path: ["green","brown"], where: "CAPCOM", file: "plan_builder.py · _handle_no_output() · MC_STAGE_MAX_ATTEMPTS",
+    sets: [["unit","pending → re-dispatch / blocked at cap"]],
+    desc: "The bounded re-run loop: re-run the producer or the consumer with a diagnosis of missing inputs, capped at MC_STAGE_MAX_ATTEMPTS (default 3). At the cap the unit is HELD (blocked) and surfaced; a hard worker error / egress-secret block retries under the same cap." },
+
+  { id: "outcome", lane: "capcom", x: 0.66, kind: "decision", glyph: "◇", label: "run succeeded?",
+    path: ["green","brown"], where: "CAPCOM", file: "plan_builder.py · on_run_terminal()",
+    sets: [],
+    desc: "Decision on the terminal run. SUCCESS = a sim done, or a burn applied + pushed. NO-GO / FAILED does not advance status; its dependents stay blocked, but the plan continues with other runnable units." },
+
+  { id: "markdone", lane: "capcom", x: 0.80, kind: "done", glyph: "✔", label: "Mark unit done",
+    path: ["green","brown"], where: "CAPCOM", file: "plan_builder.py · _mark_unit_done()",
+    sets: [["unit","done"]],
+    desc: "On SUCCESS: mark the unit done, then push that to git (the portable progress record) before dispatching more." },
+  { id: "docsync", lane: "store", x: 0.80, kind: "activity", glyph: "▭", label: "docs_sync: write flight-plan.yaml + commit + push",
+    path: ["green","brown"], where: "git + Postgres", file: "plan_docs.sync_to_repo()",
+    sets: [["unit","done (committed)"]],
+    desc: "The portable progress record: flight-plan.yaml is written, committed, and pushed. Committed status is the authority a build reconciles from on any machine." },
+  { id: "unblock", lane: "capcom", x: 0.66, kind: "loop", glyph: "⟳", label: "Dispatch newly-unblocked units",
+    path: ["green","brown"], where: "CAPCOM", file: "plan_builder.py · _advance()",
+    sets: [],
+    desc: "Marking a unit done can satisfy a dependent's depends_on. _advance re-scans and dispatches any unit now runnable — the edge trigger that drives the build forward." },
+
+  { id: "nogo", lane: "capcom", x: 0.66, kind: "activity", glyph: "▭", label: "No-go / failed → dependents stay blocked",
+    path: ["green","brown"], where: "CAPCOM", file: "plan_builder.py · _request_changes() / _dead_seqs()",
+    sets: [["unit","blocked (dependents)"]],
+    desc: "A NO-GO records 'request changes' (the unit stays not-done); a failure past its cap is held blocked. Dead status propagates to dependents, but the plan itself CONTINUES with other runnable units." },
+
+  { id: "rollup", lane: "capcom", x: 0.90, kind: "decision", glyph: "◇", label: "all non-deferred units done?",
+    path: ["green","brown"], where: "CAPCOM", file: "plan_builder.py · _all_resolved() · _advance()",
+    sets: [],
+    desc: "Rolls the plan status up. Not all resolved → keep building (loop for more terminal runs). All resolved (done, or dead, deferred counting as resolved) → the plan is done." },
+
+  { id: "deferred", lane: "store", x: 0.20, kind: "activity", glyph: "▭", label: "operation-phase stages DEFERRED",
+    path: ["green","brown"], where: "git + Postgres (AI-DLC v2)", file: "planner.py · _emit_v2_units() · UNIT_DEFERRED",
+    sets: [["unit","deferred"]],
+    desc: "AI-DLC v2 operation-phase stages are parsed and recorded but never dispatched in v1 (they need cloud credentials). Marked deferred with a clear reason ('operation:deferred') in the plan; they count as resolved so the plan can still complete." },
+
+  { id: "done", lane: "capcom", x: 0.97, kind: "final", glyph: "◎", label: "Plan done",
+    path: ["green","brown"], where: "CAPCOM", file: "plan_builder.py · set_status(STATUS_DONE)",
+    sets: [["plan","done"]],
+    desc: "When all non-deferred units are done, the plan rolls up to done — the ringed final node of the activity." },
+];
+const NX = Object.fromEntries(NODES.map(n => [n.id, n]));
+
+// ---- edges: from → to, tone, optional guard label, side hints ----
+// side: which anchor of each box to use — "auto" computed, or forced.
+const EDGES = [
+  { a: "start", b: "wsdetect", path: ["green","brown"] },
+  { a: "wsdetect", b: "ghd", path: ["green","brown"] },
+  { a: "ghd", b: "gwalk", guard: "greenfield", path: ["green"], brown: false },
+  { a: "ghd", b: "revsim", guard: "brownfield", tone: "brown", path: ["brown"] },
+  { a: "gwalk", b: "gate", path: ["green"] },
+  { a: "revsim", b: "clarloop", tone: "brown", path: ["brown"] },
+  { a: "clarloop", b: "gate", tone: "brown", path: ["brown"] },
+  { a: "gate", b: "wsdetect", guard: "no · more turns", tone: "loop", path: ["green","brown"], curve: "up" },
+  { a: "gate", b: "ready", guard: "yes", tone: "go", path: ["green","brown"] },
+  { a: "ready", b: "finalize", path: ["green","brown"] },
+  { a: "finalize", b: "translate", path: ["green","brown"] },
+  { a: "translate", b: "sched", path: ["green","brown"] },
+  { a: "translate", b: "deferred", guard: "op-phase", tone: "loop", path: ["green","brown"] },
+  { a: "sched", b: "designstage", guard: "gated=False", path: ["green","brown"] },
+  { a: "sched", b: "codestage", guard: "gated=True", tone: "fault", path: ["green","brown"] },
+  { a: "designstage", b: "unitrun", path: ["green","brown"] },
+  { a: "codestage", b: "unitrun", path: ["green","brown"] },
+  { a: "unitrun", b: "verify", path: ["green","brown"] },
+  { a: "verify", b: "rerun", guard: "nothing produced", tone: "loop", path: ["green","brown"] },
+  { a: "rerun", b: "sched", tone: "loop", path: ["green","brown"], curve: "up" },
+  { a: "verify", b: "outcome", guard: "landed", path: ["green","brown"] },
+  { a: "outcome", b: "markdone", guard: "success", tone: "go", path: ["green","brown"] },
+  { a: "outcome", b: "nogo", guard: "no-go / failed", tone: "fault", path: ["green","brown"] },
+  { a: "markdone", b: "docsync", tone: "go", path: ["green","brown"] },
+  { a: "markdone", b: "unblock", tone: "go", path: ["green","brown"] },
+  { a: "unblock", b: "sched", tone: "loop", path: ["green","brown"], curve: "up" },
+  { a: "markdone", b: "rollup", tone: "go", path: ["green","brown"] },
+  { a: "nogo", b: "rollup", tone: "fault", path: ["green","brown"] },
+  { a: "rollup", b: "sched", guard: "no · keep building", tone: "loop", path: ["green","brown"], curve: "up" },
+  { a: "rollup", b: "done", guard: "all done", tone: "go", path: ["green","brown"] },
+];
+
+// ---- build the lanes + nodes ----
+const lanesEl = document.getElementById("lanes");
+const rowEls = {};
+LANES.forEach(l => {
+  const lane = document.createElement("div");
+  lane.className = "lane";
+  const hd = document.createElement("div");
+  hd.className = "lane-hd";
+  hd.innerHTML = `<span class="ttl">${l.ttl}</span><span class="sub">${l.sub}</span><span class="badge">${l.badge}</span>`;
+  const row = document.createElement("div");
+  row.className = "row";
+  lane.appendChild(hd); lane.appendChild(row);
+  lanesEl.appendChild(lane);
+  rowEls[l.id] = row;
+});
+
+// vertical stagger within a lane when two nodes share ~same x
+function laneNodes(id) { return NODES.filter(n => n.lane === id); }
+
+const nodeEls = {};
+NODES.forEach(n => {
+  const row = rowEls[n.lane];
+  const div = document.createElement("div");
+  div.className = "node " + n.kind;
+  div.dataset.id = n.id;
+  div.style.left = (n.x * 100) + "%";
+  // stagger vertically if another node in the lane is near the same x
+  const near = laneNodes(n.lane).filter(o => Math.abs(o.x - n.x) < 0.05);
+  const idx = near.indexOf(n);
+  const top = near.length > 1 ? (idx === 0 ? 32 : 70) : 50;
+  div.style.top = top + "%";
+  div.innerHTML = `<span class="glyph">${n.glyph}</span><span class="lbl"><b>${n.label}</b></span>`;
+  div.addEventListener("click", () => selectNode(n.id));
+  row.appendChild(div);
+  nodeEls[n.id] = div;
+});
+
+// ---- SVG wire overlay ----
+const SVGNS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("wires");
+const defs = document.createElementNS(SVGNS, "defs");
+svg.appendChild(defs);
+[["m-mut", "var(--muted)"], ["m-go", "var(--go)"], ["m-fault", "var(--fault)"],
+ ["m-tel", "var(--telemetry)"], ["m-brown", "var(--inflight)"]].forEach(([id, col]) => {
+  const m = document.createElementNS(SVGNS, "marker");
+  Object.entries({ id, markerWidth: 10, markerHeight: 10, refX: 8, refY: 5, orient: "auto", markerUnits: "userSpaceOnUse" })
+    .forEach(([k, v]) => m.setAttribute(k, v));
+  const p = document.createElementNS(SVGNS, "path");
+  p.setAttribute("d", "M0,1 L9,5 L0,9 Z"); p.setAttribute("fill", col);
+  m.appendChild(p); defs.appendChild(m);
+});
+const TONE_MARK = { go: "m-go", fault: "m-fault", loop: "m-tel", brown: "m-brown" };
+const TONE_CLASS = { go: "go", fault: "fault", loop: "loop", brown: "brown", telemetry: "telemetry" };
+
+function centerOf(id) {
+  const canvas = document.getElementById("canvas");
+  const cr = canvas.getBoundingClientRect();
+  const r = nodeEls[id].getBoundingClientRect();
+  return {
+    x: r.left - cr.left, y: r.top - cr.top, w: r.width, h: r.height,
+    cx: r.left - cr.left + r.width / 2, cy: r.top - cr.top + r.height / 2,
+  };
+}
+
+// pick the best pair of anchor points on two boxes (edge midpoints)
+function anchors(A, B) {
+  const pts = box => ({
+    L: { x: box.x, y: box.cy }, R: { x: box.x + box.w, y: box.cy },
+    T: { x: box.cx, y: box.y }, Bo: { x: box.cx, y: box.y + box.h },
+  });
+  const pa = pts(A), pb = pts(B);
+  let best = null, bd = Infinity;
+  for (const ka in pa) for (const kb in pb) {
+    const p = pa[ka], q = pb[kb];
+    const d = Math.hypot(p.x - q.x, p.y - q.y);
+    if (d < bd) { bd = d; best = { p, q, ka, kb }; }
+  }
+  return best;
+}
+
+let wireEls = [];
+function drawWires() {
+  wireEls.forEach(e => e.remove());
+  wireEls = [];
+  const canvas = document.getElementById("canvas");
+  svg.setAttribute("viewBox", `0 0 ${canvas.clientWidth} ${canvas.clientHeight}`);
+  svg.setAttribute("width", canvas.clientWidth);
+  svg.setAttribute("height", canvas.clientHeight);
+
+  EDGES.forEach(e => {
+    const A = centerOf(e.a), B = centerOf(e.b);
+    const { p, q } = anchors(A, B);
+    // build a smooth cubic; loop-back edges arch upward/outward
+    let d;
+    if (e.curve === "up") {
+      const midY = Math.min(p.y, q.y) - 26;
+      d = `M ${p.x} ${p.y} C ${p.x} ${midY}, ${q.x} ${midY}, ${q.x} ${q.y}`;
+    } else {
+      const dx = (q.x - p.x) * 0.4;
+      d = `M ${p.x} ${p.y} C ${p.x + dx} ${p.y}, ${q.x - dx} ${q.y}, ${q.x} ${q.y}`;
+    }
+    const path = document.createElementNS(SVGNS, "path");
+    const toneCls = e.tone ? (TONE_CLASS[e.tone] || "") : "";
+    path.setAttribute("class", "wire " + toneCls);
+    path.setAttribute("d", d);
+    path.setAttribute("marker-end", `url(#${e.tone ? (TONE_MARK[e.tone] || "m-mut") : "m-mut"})`);
+    path.dataset.a = e.a; path.dataset.b = e.b;
+    path.dataset.path = (e.path || []).join(",");
+    svg.appendChild(path); wireEls.push(path);
+
+    if (e.guard) {
+      const mx = (p.x + q.x) / 2, my = e.curve === "up" ? Math.min(p.y, q.y) - 30 : (p.y + q.y) / 2 - 4;
+      const g = document.createElementNS(SVGNS, "g");
+      const bg = document.createElementNS(SVGNS, "rect");
+      const tw = e.guard.length * 5.8 + 8;
+      bg.setAttribute("class", "bg"); bg.setAttribute("x", mx - tw / 2); bg.setAttribute("y", my - 9);
+      bg.setAttribute("width", tw); bg.setAttribute("height", 14); bg.setAttribute("rx", 3);
+      const t = document.createElementNS(SVGNS, "text");
+      const gcls = e.tone === "go" ? "go" : e.tone === "fault" ? "fault" : e.tone === "brown" ? "brown" : "";
+      t.setAttribute("class", "glabel " + gcls);
+      t.setAttribute("x", mx); t.setAttribute("y", my + 2); t.setAttribute("text-anchor", "middle");
+      t.textContent = "[" + e.guard + "]";
+      g.appendChild(bg); g.appendChild(t);
+      g.dataset.a = e.a; g.dataset.b = e.b; g.dataset.path = (e.path || []).join(",");
+      svg.appendChild(g); wireEls.push(g);
+    }
+  });
+  applyPathHighlight();
+}
+
+// ---- detail drawer ----
+const detail = document.getElementById("detail");
+const KIND_NAME = { initial: "● initial node", activity: "▭ activity", decision: "◇ decision",
+  gate: "⏸ go/no-go gate", loop: "⟳ loop", done: "✔ activity (marks done)", final: "◎ final node" };
+
+function selectNode(id) {
+  const n = NX[id];
+  document.querySelectorAll(".node").forEach(d => d.classList.toggle("sel", d.dataset.id === id));
+  const laneTtl = LANES[LANEY[n.lane]].ttl;
+  let html = `<div class="d-step">${esc(KIND_NAME[n.kind] || n.kind)}</div>`;
+  html += `<div class="d-label"><span class="g">${esc(n.glyph)}</span>${esc(n.label)}</div>`;
+  html += `<div class="d-meta"><span class="k">lane</span> ${esc(laneTtl)}</div>`;
+  if (n.where) html += `<div class="d-meta"><span class="k">actor</span> ${esc(n.where)}</div>`;
+  if (n.file) html += `<div class="d-file">${esc(n.file)}</div>`;
+  if (n.desc) html += `<div class="d-desc">${esc(n.desc)}</div>`;
+  if (n.sets && n.sets.length) {
+    html += `<div class="d-status">` + n.sets.map(s =>
+      `<span class="chip">${esc(s[0])}: ${esc(s[1])}</span>`).join("") + `</div>`;
+  }
+  detail.innerHTML = html;
+}
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+
+// ---- path highlight ----
+let activePath = null;
+function setPath(p) {
+  activePath = (activePath === p) ? null : p;
+  document.getElementById("pf-green").classList.toggle("on", activePath === "green");
+  document.getElementById("pf-brown").classList.toggle("on", activePath === "brown");
+  document.getElementById("pf-brown").classList.toggle("brown", activePath === "brown");
+  applyPathHighlight();
+}
+function applyPathHighlight() {
+  const on = !!activePath;
+  document.body.classList.toggle("pathmode", on);
+  NODES.forEach(n => {
+    const el = nodeEls[n.id];
+    const lit = !on || (n.path || []).includes(activePath);
+    el.classList.toggle("lit", lit);
+    el.classList.toggle("dim", on && !lit);
+  });
+  wireEls.forEach(w => {
+    if (!w.dataset.path) return;
+    const paths = w.dataset.path.split(",");
+    const lit = !on || paths.includes(activePath);
+    w.classList.toggle("dimw", on && !lit);
+  });
+}
+document.getElementById("pf-green").addEventListener("click", () => setPath("green"));
+document.getElementById("pf-brown").addEventListener("click", () => setPath("brown"));
+document.getElementById("pf-reset").addEventListener("click", () => { activePath = null; setPath(null); });
+
+// ---- draw + keep in sync ----
+function redraw() { drawWires(); }
+window.addEventListener("load", redraw);
+window.addEventListener("resize", redraw);
+if (window.ResizeObserver) {
+  const ro = new ResizeObserver(() => redraw());
+  ro.observe(document.getElementById("lanes"));
+}
+// initial paint (in case load already fired)
+redraw();
+</script>
+</body>
+</html>

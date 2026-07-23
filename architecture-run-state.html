@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mission Control — Run State Machine</title>
+<!--
+  A UML state machine (statechart) of a Mission Control run's durable lifecycle,
+  grounded in runs_store.py (status constants + COALESCE-guarded ended_at) and
+  graph.py (dispatch → run_worker → gate[interrupt] → apply_burn → teardown).
+  Self-contained: inline CSS + vanilla JS + an inline SVG overlay for the
+  transition arrows. No build, no CDN, no network. Renders over file:// with no
+  console errors. Companion to architecture.html / architecture-uml.html /
+  architecture-sequence.html.
+-->
+<style>
+  :root {
+    --go:        #2fe57a;
+    --inflight:  #ffb020;
+    --fault:     #ff3b47;
+    --telemetry: #22d3ee;
+    --seam:      #7cc7ff;
+
+    --bg:        #0b1016;
+    --bg-2:      #0e141c;
+    --surface:   #1e2833;
+    --surface-2: #172029;
+    --line:      #2a3846;
+    --line-dim:  #223040;
+    --text:      #c9d5e1;
+    --muted:     #8598ab;
+    --dim:       #5c6f81;
+
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: radial-gradient(1300px 640px at 50% -10%, #12202e 0%, transparent 60%), var(--bg);
+    color: var(--text); font-family: var(--sans); font-size: 13.5px; line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--seam); }
+  kbd { font-family: var(--mono); font-size: 11px; background: var(--surface-2);
+        border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+
+  header {
+    padding: 20px 24px 12px; border-bottom: 1px solid var(--line-dim);
+    display: flex; flex-wrap: wrap; gap: 16px 26px; align-items: flex-end;
+  }
+  .title h1 { margin: 0; font-size: 18px; letter-spacing: .3px; font-weight: 650; }
+  .title h1 .mark { color: var(--go); }
+  .title p { margin: 4px 0 0; color: var(--muted); max-width: 70ch; }
+  .title .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+
+  .controls { margin-left: auto; display: flex; flex-direction: column; gap: 10px; align-items: flex-end; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .toggle {
+    display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 12px;
+    color: var(--muted); user-select: none; border: 1px solid var(--line);
+    background: var(--surface-2); padding: 6px 11px; border-radius: 7px;
+  }
+  .toggle:hover { border-color: var(--seam); color: var(--text); }
+  .toggle input { accent-color: var(--seam); width: 15px; height: 15px; margin: 0; }
+
+  /* bucket legend */
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 11px; justify-content: flex-end; }
+  .legend .item { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); white-space: nowrap; }
+  .legend .g { font-family: var(--mono); font-weight: 700; width: 14px; text-align: center; }
+  .legend .g.inflight { color: var(--inflight); }
+  .legend .g.success  { color: var(--go); }
+  .legend .g.notland  { color: var(--fault); }
+  .legend .g.fault    { color: var(--fault); }
+
+  main { display: grid; grid-template-columns: minmax(0,1fr) 336px; align-items: start; }
+  @media (max-width: 940px) { main { grid-template-columns: 1fr; } }
+
+  .canvas-wrap { padding: 22px 20px 60px; overflow: auto; }
+  .canvas { position: relative; min-width: 940px; }
+
+  #wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; overflow: visible; }
+  #wires path { fill: none; }
+  #wires .edge { stroke: var(--muted); stroke-width: 1.4; opacity: .5; transition: opacity .12s, stroke .12s; }
+  #wires .edge.happy { stroke: var(--go); opacity: .6; }
+  #wires .edge.fault { stroke: var(--fault); opacity: .5; }
+  #wires .edge.gate  { stroke: var(--inflight); opacity: .6; }
+  #wires .edge.selected { opacity: 1; stroke-width: 2.4; }
+  #wires .lbl { fill: var(--muted); font-family: var(--mono); font-size: 10px; }
+  #wires .lbl-bg { fill: var(--bg-2); opacity: .82; }
+  /* the overlay ignores pointer events except on the (invisible, widened) hit paths */
+  #wires .hit { stroke: transparent; stroke-width: 12; fill: none; pointer-events: stroke; cursor: pointer; }
+
+  /* tiers */
+  .tier { position: relative; z-index: 1; display: flex; justify-content: center;
+          gap: 18px; margin: 0 auto 46px; flex-wrap: wrap; }
+  .tier.terminals { align-items: flex-start; gap: 26px; }
+
+  .group { border: 1px dashed var(--line-dim); border-radius: 12px; padding: 26px 16px 14px;
+           position: relative; display: flex; gap: 16px; }
+  .group > .glabel { position: absolute; top: 7px; left: 12px; font-family: var(--mono);
+           font-size: 9.5px; letter-spacing: 1.4px; text-transform: uppercase; color: var(--dim); }
+
+  /* state boxes */
+  .state {
+    position: relative; z-index: 2; width: 176px;
+    background: linear-gradient(180deg, var(--surface), var(--surface-2));
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px 11px;
+    cursor: pointer; transition: border-color .12s, box-shadow .12s, opacity .12s, transform .12s;
+  }
+  .state:hover { border-color: var(--seam); transform: translateY(-1px); }
+  .state.selected { box-shadow: 0 0 0 1px currentColor, 0 8px 22px -14px currentColor; }
+  .state .row1 { display: flex; align-items: center; gap: 8px; }
+  .state .glyph { font-family: var(--mono); font-size: 15px; font-weight: 700; line-height: 1; }
+  .state .name { font-family: var(--mono); font-size: 13px; font-weight: 650; letter-spacing: .2px; }
+  .state .bucket { margin-top: 5px; font-size: 10.5px; color: var(--muted); }
+  .state .term-tag { margin-top: 6px; display: inline-block; font-family: var(--mono);
+           font-size: 9px; letter-spacing: 1px; text-transform: uppercase; color: var(--dim);
+           border: 1px solid var(--line-dim); border-radius: 4px; padding: 1px 5px; }
+
+  /* bucket colour = the box's currentColor (drives glyph + border accent + selection glow) */
+  .state.inflight { color: var(--inflight); }
+  .state.success  { color: var(--go); }
+  .state.notland  { color: var(--fault); }
+  .state.fault    { color: var(--fault); }
+  .state .glyph, .state.selected { }
+  .state .glyph { color: currentColor; }
+  .state.selected { border-color: currentColor; }
+  /* terminal = double border */
+  .state.terminal { border-style: double; border-width: 3px; }
+
+  /* initial pseudo-state */
+  .initial { display: flex; align-items: center; justify-content: center; }
+  .initial .dot { width: 22px; height: 22px; border-radius: 50%; background: var(--text);
+           box-shadow: 0 0 0 4px var(--bg-2), 0 0 12px rgba(201,213,225,.4); }
+
+  /* focus / highlight modes */
+  body.only-terminal .state:not(.terminal) { opacity: .22; }
+  body.only-terminal .initial { opacity: .22; }
+  body.dim-notland .state.notland { opacity: .2; }
+  body.dim-notland #wires .edge.fault { opacity: .12; }
+
+  aside#detail {
+    position: sticky; top: 0; height: 100vh; overflow: auto;
+    border-left: 1px solid var(--line-dim); padding: 20px 18px 40px;
+    background: linear-gradient(180deg, rgba(16,25,34,.6), transparent 240px);
+  }
+  #detail .placeholder { color: var(--muted); }
+  #detail h2 { margin: 0 0 2px; font-family: var(--mono); font-size: 15px; letter-spacing: .3px; }
+  #detail .sub { color: var(--muted); font-size: 11.5px; margin: 0 0 14px; }
+  #detail .field { margin: 12px 0; }
+  #detail .k { font-family: var(--mono); font-size: 10px; letter-spacing: 1.2px;
+           text-transform: uppercase; color: var(--dim); margin-bottom: 4px; }
+  #detail .v { color: var(--text); }
+  #detail ul { margin: 4px 0 0; padding-left: 16px; }
+  #detail li { margin: 3px 0; color: var(--muted); }
+  #detail li b { color: var(--text); font-weight: 600; }
+  #detail code, #detail .ref { font-family: var(--mono); font-size: 11.5px; color: var(--seam); }
+  #detail .badge { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono);
+           font-size: 11px; border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; }
+  #detail .badge .glyph { font-weight: 700; }
+
+  .callout {
+    margin: 4px 0 16px; border: 1px solid var(--line-dim); border-left: 3px solid var(--telemetry);
+    border-radius: 8px; background: rgba(34,211,238,.05); padding: 11px 13px;
+  }
+  .callout h3 { margin: 0 0 6px; font-size: 12px; font-family: var(--mono); letter-spacing: .6px;
+           color: var(--telemetry); text-transform: uppercase; }
+  .callout p { margin: 6px 0; font-size: 12px; color: var(--muted); }
+  .callout b { color: var(--text); }
+
+  footer {
+    grid-column: 1 / -1; padding: 12px 24px 22px; color: var(--dim); font-size: 11.5px;
+    border-top: 1px solid var(--line-dim);
+  }
+  footer b { color: var(--muted); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="title">
+    <h1><span class="mark">▲</span> Mission Control — Run State Machine</h1>
+    <p>The durable lifecycle of a single run: the statuses a run row moves through, the triggers that move it, and where each path terminates. Recovery is at node boundaries; the go/no-go gate is a durable interrupt.</p>
+    <p class="hint">Companions: <a href="architecture.html">architecture.html</a> · <a href="architecture-uml.html">architecture-uml.html</a> · <a href="architecture-sequence.html">architecture-sequence.html</a></p>
+  </div>
+  <div class="controls">
+    <div class="legend" aria-label="Bucket legend">
+      <span class="item"><span class="g inflight">◆</span> in-progress / gate (amber)</span>
+      <span class="item"><span class="g success">●</span> success (green)</span>
+      <span class="item"><span class="g notland">△</span> applied, not landed (red)</span>
+      <span class="item"><span class="g fault">▲</span> killed / fault (red)</span>
+    </div>
+    <div class="btnrow">
+      <label class="toggle"><input type="checkbox" id="tglTerminal" /> Highlight terminal states only</label>
+      <label class="toggle"><input type="checkbox" id="tglNotland" /> Dim the did-not-land trio</label>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="canvas-wrap">
+    <div class="canvas" id="canvas">
+      <svg id="wires" aria-hidden="true">
+        <defs>
+          <marker id="ah-plain" markerWidth="11" markerHeight="11" refX="8.5" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+            <path d="M1,1 L9,5 L1,9" fill="none" stroke="#8598ab" stroke-width="1.4"/>
+          </marker>
+          <marker id="ah-happy" markerWidth="11" markerHeight="11" refX="8.5" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+            <path d="M1,1 L9,5 L1,9" fill="none" stroke="#2fe57a" stroke-width="1.4"/>
+          </marker>
+          <marker id="ah-gate" markerWidth="11" markerHeight="11" refX="8.5" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+            <path d="M1,1 L9,5 L1,9" fill="none" stroke="#ffb020" stroke-width="1.4"/>
+          </marker>
+          <marker id="ah-fault" markerWidth="11" markerHeight="11" refX="8.5" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+            <path d="M1,1 L9,5 L1,9" fill="none" stroke="#ff3b47" stroke-width="1.4"/>
+          </marker>
+        </defs>
+      </svg>
+      <div id="board"></div>
+    </div>
+    <footer>
+      A run row is authoritative and idempotent: <b>started_at</b> / <b>ended_at</b> are stamped exactly once (COALESCE-guarded), so a replay after a crash can re-run a node without moving a terminal state. Renders standalone over <kbd>file://</kbd> — no network, no build.
+    </footer>
+  </div>
+
+  <aside id="detail" aria-live="polite">
+    <div class="callout">
+      <h3>Durability &amp; recovery model</h3>
+      <p>Recovery is at <b>node boundaries</b> — a crash re-runs the <b>whole node</b>, so every node (dispatch, run_worker, gate, apply_burn, teardown) is idempotent.</p>
+      <p><b>awaiting_gate</b> is a durable <code>interrupt()</code>: the graph halts before apply_burn, persists to the checkpointer, and resumes after a restart <b>without re-paying</b> for completed steps.</p>
+      <p>Terminal states stamp <b>ended_at</b> exactly once (<code>COALESCE</code>-guarded), so a replay can't move a run that already landed.</p>
+    </div>
+    <p class="placeholder">Select a state box or an arrow to see its bucket, triggers, exits, and code ref.</p>
+  </aside>
+</main>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// State model — sourced from runs_store.py (STATUS_* constants + COALESCE-guarded
+// ended_at) and graph.py (dispatch → run_worker → gate[interrupt] → apply_burn →
+// teardown). Buckets drive colour + glyph + text label (accessible: never colour
+// alone).
+// ---------------------------------------------------------------------------
+
+// bucket → glyph + human label
+const BUCKET = {
+  inflight: { glyph: "◆", label: "in-progress" },
+  gate:     { glyph: "◆", label: "durable go/no-go" },
+  success:  { glyph: "●", label: "success" },
+  notland:  { glyph: "△", label: "did-not-land · applied locally, not on trunk" },
+  killed:   { glyph: "▲", label: "killed" },
+  fault:    { glyph: "▲", label: "fault" },
+};
+// bucket → css class (colour family)
+const CLS = {
+  inflight: "inflight", gate: "inflight",
+  success: "success", notland: "notland", killed: "fault", fault: "fault",
+};
+
+const STATES = {
+  queued: {
+    tier: 1, bucket: "inflight", terminal: false,
+    enters: ["<b>launch()</b> inserts the runs row (a no-op if the row already exists)."],
+    ref: "runs_store.py · STATUS_QUEUED · record_queued()",
+    desc: "Run submitted and durably recorded; no worker dispatched yet.",
+  },
+  running: {
+    tier: 2, bucket: "inflight", terminal: false,
+    enters: ["<b>mark_running()</b> when the <code>dispatch</code> node begins and run_worker starts; stamps started_at once."],
+    ref: "runs_store.py · STATUS_RUNNING · mark_running() · graph.py _dispatch/_run_worker",
+    desc: "Worker is investigating in its isolated worktree.",
+  },
+  awaiting_gate: {
+    tier: 3, bucket: "gate", terminal: false,
+    enters: ["A <b>burn that produced changes</b> reaches the <code>gate</code> node — a durable <code>interrupt()</code>. <b>mark_awaiting_gate()</b>."],
+    ref: "runs_store.py · STATUS_AWAITING_GATE · mark_awaiting_gate() · graph.py _gate (interrupt)",
+    desc: "Halted at the go/no-go gate, persisted to the checkpointer, awaiting a human decision. Resumes after a restart without re-paying for completed steps.",
+  },
+  applied: {
+    tier: 4, group: "success", bucket: "success", terminal: true,
+    enters: ["<b>GO</b> → <code>apply_burn</code> commits + merges + pushes OK (pushed, or skipped when there is no remote)."],
+    ref: "runs_store.py · STATUS_APPLIED · graph.py _apply_burn / _push_result",
+    desc: "The burn was approved and landed. ended_at stamped once.",
+  },
+  done: {
+    tier: 4, group: "success", bucket: "success", terminal: true,
+    enters: [
+      "A read-only <b>sim</b> finished (no gate), OR",
+      "a <b>burn that made no changes</b> (no-op) completed.",
+    ],
+    ref: "runs_store.py · STATUS_DONE · graph.py _terminal_status",
+    desc: "Completed with nothing to apply. ended_at stamped once.",
+  },
+  push_rejected: {
+    tier: 4, group: "notland", bucket: "notland", terminal: true,
+    enters: ["<b>GO</b>, but the push was <b>non-fast-forward</b> (trunk advanced under the branch)."],
+    ref: "runs_store.py · STATUS_PUSH_REJECTED · graph.py _push_result",
+    desc: "Applied locally, not on trunk. ended_at stamped once.",
+  },
+  merge_conflict: {
+    tier: 4, group: "notland", bucket: "notland", terminal: true,
+    enters: ["<b>GO</b>, but integrating the remote advance <b>conflicted</b>."],
+    ref: "runs_store.py · STATUS_MERGE_CONFLICT · graph.py _apply_burn",
+    desc: "Applied locally, not on trunk. ended_at stamped once.",
+  },
+  blocked_secrets: {
+    tier: 4, group: "notland", bucket: "notland", terminal: true,
+    enters: ["<b>GO</b>, but the egress content guard <b>blocked the commit</b> — a secret/PII in staged content."],
+    ref: "runs_store.py · STATUS_BLOCKED_SECRETS · graph.py _apply_burn (content guard)",
+    desc: "Applied locally, not on trunk. ended_at stamped once.",
+  },
+  scrubbed: {
+    tier: 4, group: "kf", bucket: "killed", terminal: true,
+    enters: [
+      "<b>NO-GO</b> (reject) at the gate, OR",
+      "<b>scrub</b> kills at a node boundary → the worktree branch is discarded.",
+    ],
+    ref: "runs_store.py · STATUS_SCRUBBED · graph.py _teardown / _terminal_status",
+    desc: "Rejected or killed; branch discarded. ended_at stamped once.",
+  },
+  failed: {
+    tier: 4, group: "kf", bucket: "fault", terminal: true,
+    enters: ["<b>mark_failed()</b> on any hard / unhandled worker or node error."],
+    ref: "runs_store.py · STATUS_FAILED · mark_failed()",
+    desc: "Hard fault. cost_usd is preserved; ended_at stamped once.",
+  },
+};
+
+// transitions: from → to : trigger, with an edge kind for colour
+const TRANSITIONS = [
+  { id: "t0", from: "__init__", to: "queued",         trig: "launch() inserts row",              kind: "" },
+  { id: "t1", from: "queued",   to: "running",        trig: "mark_running (dispatch begins)",    kind: "" },
+  { id: "t2", from: "running",  to: "done",           trig: "sim done / burn no-op",             kind: "happy" },
+  { id: "t3", from: "running",  to: "awaiting_gate",  trig: "burn w/ changes → gate (interrupt)", kind: "gate" },
+  { id: "t4", from: "running",  to: "failed",         trig: "hard error (mark_failed)",          kind: "fault" },
+  { id: "t5", from: "running",  to: "scrubbed",       trig: "scrub at node boundary",            kind: "fault" },
+  { id: "t6", from: "awaiting_gate", to: "applied",        trig: "GO → apply_burn merged + pushed", kind: "happy" },
+  { id: "t7", from: "awaiting_gate", to: "push_rejected",  trig: "GO, push non-fast-forward",       kind: "fault" },
+  { id: "t8", from: "awaiting_gate", to: "merge_conflict", trig: "GO, remote integration conflict", kind: "fault" },
+  { id: "t9", from: "awaiting_gate", to: "blocked_secrets",trig: "GO, content guard blocked",       kind: "fault" },
+  { id: "t10", from: "awaiting_gate", to: "scrubbed",      trig: "NO-GO (reject) / scrub",          kind: "fault" },
+  { id: "t11", from: "awaiting_gate", to: "failed",        trig: "hard error during apply",         kind: "fault" },
+];
+
+const SVGNS = "http://www.w3.org/2000/svg";
+const board = document.getElementById("board");
+const canvas = document.getElementById("canvas");
+const wires = document.getElementById("wires");
+const detail = document.getElementById("detail");
+
+// ---- build the board (tiers) ----------------------------------------------
+function stateBox(id) {
+  const s = STATES[id];
+  const b = BUCKET[s.bucket];
+  const el = document.createElement("div");
+  el.className = "state " + CLS[s.bucket] + (s.terminal ? " terminal" : "");
+  el.dataset.state = id;
+  el.setAttribute("role", "button");
+  el.setAttribute("tabindex", "0");
+  el.setAttribute("aria-label", id + " — " + b.label + (s.terminal ? " (terminal)" : ""));
+  el.innerHTML =
+    '<div class="row1"><span class="glyph" aria-hidden="true">' + b.glyph + '</span>' +
+    '<span class="name">' + id + '</span></div>' +
+    '<div class="bucket">' + b.glyph + ' ' + b.label + '</div>' +
+    (s.terminal ? '<span class="term-tag">terminal ●○</span>' : '');
+  return el;
+}
+
+function makeTier(cls) { const d = document.createElement("div"); d.className = "tier " + (cls||""); return d; }
+
+// initial pseudo-state
+const tInit = makeTier();
+const initEl = document.createElement("div");
+initEl.className = "initial"; initEl.id = "state-init";
+initEl.innerHTML = '<div class="dot" title="initial pseudo-state" aria-label="initial state"></div>';
+tInit.appendChild(initEl);
+board.appendChild(tInit);
+
+// tiers 1..3 (single boxes)
+["queued", "running", "awaiting_gate"].forEach(id => {
+  const t = makeTier(); t.appendChild(stateBox(id)); board.appendChild(t);
+});
+
+// tier 4: grouped terminals
+const tTerm = makeTier("terminals");
+function group(label, ids) {
+  const g = document.createElement("div"); g.className = "group";
+  const gl = document.createElement("div"); gl.className = "glabel"; gl.textContent = label;
+  g.appendChild(gl);
+  ids.forEach(id => g.appendChild(stateBox(id)));
+  return g;
+}
+tTerm.appendChild(group("Success", ["applied", "done"]));
+tTerm.appendChild(group("Did-not-land", ["push_rejected", "merge_conflict", "blocked_secrets"]));
+tTerm.appendChild(group("Killed / Fault", ["scrubbed", "failed"]));
+board.appendChild(tTerm);
+
+// ---- SVG arrow overlay -----------------------------------------------------
+function elFor(id) {
+  if (id === "__init__") return document.getElementById("state-init");
+  return board.querySelector('.state[data-state="' + id + '"]');
+}
+// remove existing edge groups (keep <defs>)
+function clearWires() {
+  [...wires.querySelectorAll("g.edge-g")].forEach(n => n.remove());
+}
+// anchor point on a rect edge toward a target
+function anchor(r, side) {
+  switch (side) {
+    case "bottom": return { x: r.left + r.width / 2, y: r.bottom };
+    case "top":    return { x: r.left + r.width / 2, y: r.top };
+    case "left":   return { x: r.left, y: r.top + r.height / 2 };
+    case "right":  return { x: r.right, y: r.top + r.height / 2 };
+  }
+}
+
+function drawWires() {
+  clearWires();
+  const cb = canvas.getBoundingClientRect();
+  TRANSITIONS.forEach(tr => {
+    const a = elFor(tr.from), b = elFor(tr.to);
+    if (!a || !b) return;
+    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+    // decide anchors: vertical if b is clearly below, else route out the bottom then across
+    const p1 = anchor(ra, "bottom");
+    const p2 = anchor(rb, "top");
+    const x1 = p1.x - cb.left, y1 = p1.y - cb.top;
+    const x2 = p2.x - cb.left, y2 = p2.y - cb.top;
+
+    const g = document.createElementNS(SVGNS, "g");
+    g.setAttribute("class", "edge-g");
+
+    const path = document.createElementNS(SVGNS, "path");
+    const dx = x2 - x1, dy = y2 - y1;
+    let d;
+    if (Math.abs(dx) < 8) {
+      d = "M" + x1 + "," + y1 + " L" + x2 + "," + y2;
+    } else {
+      // smooth S-curve: drop, curve across, arrive vertically
+      const midY = y1 + Math.max(26, dy * 0.42);
+      d = "M" + x1 + "," + y1 +
+          " C" + x1 + "," + midY + " " + x2 + "," + (y2 - Math.max(26, dy * 0.42)) + " " + x2 + "," + y2;
+    }
+    path.setAttribute("d", d);
+    path.setAttribute("class", "edge " + (tr.kind || ""));
+    const mk = tr.kind === "happy" ? "ah-happy" : tr.kind === "gate" ? "ah-gate" : tr.kind === "fault" ? "ah-fault" : "ah-plain";
+    path.setAttribute("marker-end", "url(#" + mk + ")");
+    path.dataset.tid = tr.id;
+    g.appendChild(path);
+
+    // invisible widened hit path for reliable clicking
+    const hit = document.createElementNS(SVGNS, "path");
+    hit.setAttribute("d", d);
+    hit.setAttribute("class", "hit");
+    hit.dataset.tid = tr.id;
+    g.appendChild(hit);
+
+    // label at curve midpoint
+    const lx = (x1 + x2) / 2, ly = (y1 + y2) / 2;
+    const tw = tr.trig.length * 5.4 + 8;
+    const bg = document.createElementNS(SVGNS, "rect");
+    bg.setAttribute("class", "lbl-bg");
+    bg.setAttribute("x", lx - tw / 2); bg.setAttribute("y", ly - 8);
+    bg.setAttribute("width", tw); bg.setAttribute("height", 15);
+    bg.setAttribute("rx", 4);
+    const txt = document.createElementNS(SVGNS, "text");
+    txt.setAttribute("class", "lbl"); txt.setAttribute("x", lx); txt.setAttribute("y", ly + 3);
+    txt.setAttribute("text-anchor", "middle");
+    txt.textContent = tr.trig;
+    g.appendChild(bg); g.appendChild(txt);
+
+    wires.appendChild(g);
+  });
+  applyEdgeSelection();
+}
+
+// ---- selection / detail drawer --------------------------------------------
+let selected = null; // { kind: "state"|"trans", id }
+
+const DEFAULT_HTML = detail.innerHTML;
+
+function bucketBadge(bucket) {
+  const b = BUCKET[bucket];
+  return '<span class="badge state ' + CLS[bucket] + '"><span class="glyph" aria-hidden="true">' +
+         b.glyph + '</span>' + bucket + ' · ' + b.label + '</span>';
+}
+
+function outTransitions(id) { return TRANSITIONS.filter(t => t.from === id); }
+function inTransitions(id)  { return TRANSITIONS.filter(t => t.to === id); }
+
+function showState(id) {
+  const s = STATES[id];
+  const b = BUCKET[s.bucket];
+  const outs = outTransitions(id), ins = inTransitions(id);
+  let h = "";
+  h += '<h2>' + b.glyph + ' ' + id + '</h2>';
+  h += '<p class="sub">' + s.desc + '</p>';
+  h += '<div class="field"><div class="k">Bucket</div><div class="v">' + bucketBadge(s.bucket) + '</div></div>';
+  h += '<div class="field"><div class="k">Terminal</div><div class="v">' +
+       (s.terminal ? 'Yes — stamps <code>ended_at</code> once (COALESCE-guarded).' : 'No — the run continues.') + '</div></div>';
+  h += '<div class="field"><div class="k">Trigger(s) that enter it</div><ul>' +
+       s.enters.map(e => '<li>' + e + '</li>').join('') + '</ul></div>';
+  if (outs.length) {
+    h += '<div class="field"><div class="k">Transitions that leave it</div><ul>' +
+         outs.map(t => '<li><b>→ ' + t.to + '</b> : ' + t.trig + '</li>').join('') + '</ul></div>';
+  } else {
+    h += '<div class="field"><div class="k">Transitions that leave it</div><div class="v" style="color:var(--muted)">None — terminal state.</div></div>';
+  }
+  h += '<div class="field"><div class="k">Code ref</div><div class="v"><span class="ref">' + s.ref + '</span></div></div>';
+  detail.innerHTML = h;
+}
+
+function showTrans(tid) {
+  const t = TRANSITIONS.find(x => x.id === tid);
+  if (!t) return;
+  const fromLabel = t.from === "__init__" ? "● (initial)" : t.from;
+  let h = "";
+  h += '<h2>transition</h2>';
+  h += '<p class="sub"><span class="ref">' + fromLabel + ' → ' + t.to + '</span></p>';
+  h += '<div class="field"><div class="k">Trigger</div><div class="v">' + t.trig + '</div></div>';
+  if (t.from !== "__init__") {
+    h += '<div class="field"><div class="k">Source state</div><div class="v">' + bucketBadge(STATES[t.from].bucket).replace('badge state', 'badge state') + '</div></div>';
+  }
+  h += '<div class="field"><div class="k">Target state</div><div class="v">' + bucketBadge(STATES[t.to].bucket) + '</div></div>';
+  const target = STATES[t.to];
+  h += '<div class="field"><div class="k">Code ref</div><div class="v"><span class="ref">' + target.ref + '</span></div></div>';
+  detail.innerHTML = h;
+}
+
+function clearSelectionClasses() {
+  board.querySelectorAll(".state.selected").forEach(n => n.classList.remove("selected"));
+}
+function applyEdgeSelection() {
+  wires.querySelectorAll("path.edge").forEach(p => p.classList.remove("selected"));
+  if (selected && selected.kind === "trans") {
+    const p = wires.querySelector('path.edge[data-tid="' + selected.id + '"]');
+    if (p) p.classList.add("selected");
+  } else if (selected && selected.kind === "state") {
+    // highlight edges touching this state
+    outTransitions(selected.id).concat(inTransitions(selected.id)).forEach(t => {
+      const p = wires.querySelector('path.edge[data-tid="' + t.id + '"]');
+      if (p) p.classList.add("selected");
+    });
+  }
+}
+
+function selectState(id) {
+  selected = { kind: "state", id };
+  clearSelectionClasses();
+  const el = board.querySelector('.state[data-state="' + id + '"]');
+  if (el) el.classList.add("selected");
+  showState(id);
+  applyEdgeSelection();
+}
+function selectTrans(tid) {
+  selected = { kind: "trans", id: tid };
+  clearSelectionClasses();
+  showTrans(tid);
+  applyEdgeSelection();
+}
+
+// events
+board.addEventListener("click", e => {
+  const box = e.target.closest(".state");
+  if (box) selectState(box.dataset.state);
+});
+board.addEventListener("keydown", e => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const box = e.target.closest(".state");
+  if (box) { e.preventDefault(); selectState(box.dataset.state); }
+});
+wires.addEventListener("click", e => {
+  const p = e.target.closest("path[data-tid]");
+  if (p && p.dataset.tid) selectTrans(p.dataset.tid);
+});
+
+// toggles
+document.getElementById("tglTerminal").addEventListener("change", e => {
+  document.body.classList.toggle("only-terminal", e.target.checked);
+});
+document.getElementById("tglNotland").addEventListener("change", e => {
+  document.body.classList.toggle("dim-notland", e.target.checked);
+});
+
+// draw + keep in sync
+function redraw() { drawWires(); }
+window.addEventListener("load", redraw);
+window.addEventListener("resize", redraw);
+if (window.ResizeObserver) new ResizeObserver(redraw).observe(canvas);
+// initial draw (also covers the case where load already fired)
+redraw();
+</script>
+</body>
+</html>
