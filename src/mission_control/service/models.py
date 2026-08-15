@@ -34,6 +34,12 @@ class LaunchRequest(BaseModel):
                     "None (default) = no Slack (a silent run); an unknown name is "
                     "rejected at launch.",
     )
+    acceptance_criteria: Optional[list[str]] = Field(
+        None,
+        description="The plan unit's acceptance criteria (how we'll know it's done). When "
+                    "present, the verification node scores the burn's output against them "
+                    "with the judge (advisory unless the policy enforces a bar).",
+    )
 
     @field_validator("task_type")
     @classmethod

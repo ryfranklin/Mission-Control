@@ -42,7 +42,7 @@ def test_sim_feed_merges_transitions_and_telemetry_in_order(target_repo, tmp_pat
     assert "StepMetric" in kinds
 
     nodes = [e.node for e in events if isinstance(e, NodeTransition)]
-    assert nodes == ["dispatch", "run_worker", "gate", "teardown"]
+    assert nodes == ["dispatch", "run_worker", "verify", "gate", "teardown"]
 
     metrics = [e for e in events if isinstance(e, StepMetric)]
     assert metrics and all(isinstance(m.event, StepEvent) for m in metrics)
