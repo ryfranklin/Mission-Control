@@ -180,6 +180,7 @@ def create_app(
     async def launch_run(body: LaunchRequest, mgr: RunManager = Depends(get_manager)) -> RunDetail:
         try:
             run_id = mgr.launch(target=body.target, task_type=body.task_type, prompt=body.prompt,
+                                acceptance_criteria=body.acceptance_criteria,
                                 slack_profile=body.slack_profile)
         except UnknownSlackProfile as exc:
             # Reject an unknown Slack profile early with a clear error (nothing launched).
