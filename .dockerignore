@@ -1,0 +1,18 @@
+# Keep the build context tiny: only pyproject + README + src are needed to install.
+.venv
+.git
+.pytest_cache
+telemetry
+evals
+golden
+tests
+ci
+deploy
+docs
+scripts
+plan-workspaces
+*.html
+uv.lock
+.env
+.env.example
+**/__pycache__
