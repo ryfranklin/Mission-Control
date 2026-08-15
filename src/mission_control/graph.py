@@ -31,16 +31,16 @@ from __future__ import annotations
 import os
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional, TypedDict
+from typing import Callable, Optional, TypedDict
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
-from . import content_guard, live, pricing, project_ref, repo_source, roles, runs_store, worktree
+from . import content_guard, live, pricing, project_ref, repo_source, roles, runs_store, verify, worktree
 from .plans_store import PlanStore
 from .runs_store import RunStore
 from .tasks import Task, TaskType
@@ -88,6 +88,9 @@ class RunState(TypedDict, total=False):
     worker_summary: str
     made_changes: bool
     steps: list  # list[dict] — StepUsage as dicts (cost data preserved for L2)
+    acceptance_criteria: list  # list[str] — the plan unit's "how we know it's done" (optional)
+    verify_status: str  # verify.VERIFY_* — the pre-gate verification verdict (burn only)
+    verify_report: dict  # {checks: list[dict], acceptance: dict|None} — evidence for the gate
     decision: Optional[str]  # roles.GO / roles.NO_GO / None (sim)
     applied: bool
     push_status: str  # one of the PUSH_* labels (only set for an applied burn)
@@ -115,6 +118,13 @@ class _Deps:
     telemetry_dir: Optional[Path] = None
     # The runs ledger (Postgres). None → don't track status/cost (offline runs).
     runs_store: Optional[RunStore] = None
+    # Verification policy: which checks gate a burn and how their verdict steers the
+    # gate. Default is the fail-closed VerifyPolicy (block on red, gate on unverified).
+    verify: verify.VerifyPolicy = field(default_factory=verify.VerifyPolicy)
+    # Factory for the acceptance judge (only built when a run carries acceptance
+    # criteria). Injected in tests; defaults to the real LlmJudge, imported lazily so
+    # importing this module makes no SDK calls.
+    judge_factory: Optional[Callable] = None
 
 
 # -- state <-> domain helpers ---------------------------------------------
@@ -127,6 +137,7 @@ def _task(state: RunState) -> Task:
         greenfield=state.get("greenfield", False),
         gated=state.get("gated", True),
         stage_slug=state.get("stage_slug"),
+        acceptance_criteria=tuple(state.get("acceptance_criteria") or ()),
     )
 
 
@@ -261,28 +272,131 @@ def _record_failure_cost(deps: _Deps, state: RunState, steps) -> None:
         store.record_cost(run_id, cost)
 
 
+def _verify(deps: _Deps, state: RunState) -> dict:
+    """Run the target repo's OWN checks on the burn's output, before the gate.
+
+    Only a burn that CHANGED something is verifiable — a sim or a no-op burn short-
+    circuits to VERIFY_SKIPPED. Deterministic checks (the repo's own test/build/lint)
+    are the hard signal; when the run carries acceptance criteria the LLM judge scores
+    them too (advisory unless the policy enforces a bar). The judge's own token usage is
+    folded into the run's priced steps so its cost stays visible. Verification never
+    applies or pushes anything — the gate remains the only side-effect boundary.
+
+    Idempotent: it reads the (still-present) worktree and returns a verdict; re-running
+    at a node boundary just recomputes it with no side effects."""
+    if not deps.verify.enabled or state["task_type"] != roles.BURN or not state.get("made_changes"):
+        return {"verify_status": verify.VERIFY_SKIPPED}
+
+    wt = _worktree(deps, state).path
+    try:
+        det_status, checks = verify.run_deterministic(wt, deps.verify)
+    except Exception as exc:  # noqa: BLE001 — malformed override / detection failure → fail closed
+        return {"verify_status": verify.VERIFY_ERROR,
+                "verify_report": {"checks": [], "acceptance": {"error": str(exc)[:300]}}}
+
+    acceptance: Optional[dict] = None
+    steps = list(state.get("steps") or [])
+    criteria = state.get("acceptance_criteria") or []
+    if criteria:
+        acceptance, judge_usage = _score_acceptance(deps, state, criteria)
+        if judge_usage is not None:
+            steps.append(judge_usage)  # price the judge into the run's total cost
+
+    status = verify.overall_status(det_status, acceptance, deps.verify)
+    out: dict = {"verify_status": status,
+                 "verify_report": {"checks": checks, "acceptance": acceptance}}
+    if criteria:
+        out["steps"] = steps
+    return out
+
+
+def _verify_block_detail(state: RunState) -> str:
+    """A short, human-legible reason a run was blocked by verification (for the ledger)."""
+    report = state.get("verify_report") or {}
+    parts: list = []
+    failed = [c.get("name") for c in (report.get("checks") or []) if c.get("exit_code")]
+    if failed:
+        parts.append("failed checks: " + ", ".join(n for n in failed if n))
+    acc = report.get("acceptance")
+    if isinstance(acc, dict):
+        if acc.get("error"):
+            parts.append("acceptance judge error")
+        elif acc.get("enforced") and acc.get("score") is not None:
+            parts.append(f"acceptance {acc['score']:.2f} < {acc.get('threshold')}")
+    return ("blocked by verification — " + "; ".join(parts))[:500] if parts else "blocked by verification"
+
+
+def _default_judge_factory():
+    from .judge import LlmJudge  # lazy: importing graph.py makes no SDK calls
+
+    return LlmJudge()
+
+
+def _score_acceptance(deps: _Deps, state: RunState, criteria) -> tuple:
+    """Score the worker output against the plan unit's acceptance criteria with the judge.
+
+    A SOFT signal (the judge is noisy — see ``eval_gate``): the judge failing is advisory
+    (recorded, never blocking), so a broken judge never blocks a build. Returns
+    ``(acceptance_dict, judge_usage_dict | None)``."""
+    try:
+        judge = (deps.judge_factory or _default_judge_factory)()
+        result = judge.score(
+            task_prompt=state.get("prompt", ""),
+            worker_output=state.get("worker_summary", ""),
+            rubric=verify.acceptance_rubric(criteria),
+        )
+        acceptance = {
+            "score": result.score,
+            "threshold": deps.verify.acceptance_threshold,
+            "enforced": deps.verify.acceptance_enforced,
+            "rationale": result.rationale,
+            "per_criterion": result.per_criterion,
+        }
+        return acceptance, asdict(result.usage)
+    except Exception as exc:  # noqa: BLE001 — advisory only; never block a build on the judge
+        return {"error": str(exc)[:300]}, None
+
+
 def _gate(deps: _Deps, state: RunState) -> dict:
-    """Durable go/no-go (``roles.GO`` / ``roles.NO_GO``). Read-only sims never gate, and
-    a writable-but-ungated stage (``gated=False``) auto-approves without halting.
+    """Durable go/no-go (``roles.GO`` / ``roles.NO_GO``), now verification-aware.
+
+    Order (fail closed): a red/errored verification blocks outright when the policy is
+    ``block`` — even for a ``gated=False`` stage, and WITHOUT halting a human for a doomed
+    run. A writable-but-ungated stage then auto-approves. ``unverified`` (no checks found)
+    blocks only if the policy says so; otherwise it falls through to the human gate.
 
     For a gated burn this calls LangGraph ``interrupt()``: the graph HALTS here (before
-    apply_burn), persists to the checkpointer, and waits for a human decision
-    supplied on resume via ``Command(resume=...)``. Anything that isn't an explicit
-    go is treated as no-go — a gated burn is never applied without an approval on record.
+    apply_burn), persists to the checkpointer, and waits for a human decision on resume
+    via ``Command(resume=...)`` — with the verification evidence in the interrupt payload.
+    Anything that isn't an explicit go is treated as no-go.
     """
     if state["task_type"] != roles.BURN:
         return {"decision": None}
+
+    vs = state.get("verify_status")
+    # Red always blocks (fail closed), overriding even gated=False — never apply a build
+    # whose own checks went red, and never halt a human for a doomed run.
+    if vs in (verify.VERIFY_FAILED, verify.VERIFY_ERROR) and deps.verify.on_failed == "block":
+        return {"decision": roles.NO_GO}
+
     if not state.get("gated", True):
-        # Writable-but-ungated (a v2 design/doc stage): it produced artifacts and is
-        # low-risk, so auto-approve — apply + push without halting for a human. The
-        # human go/no-go is reserved for code-writing stages (gated=True).
+        # Writable-but-ungated (a v2 design/doc stage): low-risk, auto-approve.
         return {"decision": roles.GO}
+
+    # No checks detected: block or require a human per policy (default: gate).
+    if vs == verify.VERIFY_UNVERIFIED and deps.verify.on_unverified == "block":
+        return {"decision": roles.NO_GO}
+
     store, run_id = _ledger(deps, state)
     if store is not None:  # about to halt for a human — reflect that in the ledger
         store.mark_awaiting_gate(run_id)
-    verdict = interrupt(
-        {"gate": "go/no-go", "task_id": state["task_id"], "summary": state.get("worker_summary", "")}
-    )
+    verdict = interrupt({
+        "gate": "go/no-go",
+        "task_id": state["task_id"],
+        "summary": state.get("worker_summary", ""),
+        "verify_status": vs,
+        "verify_report": state.get("verify_report"),
+    })
     approved = verdict in (roles.GO, True)
     return {"decision": roles.GO if approved else roles.NO_GO}
 
@@ -419,6 +533,11 @@ def _teardown(deps: _Deps, state: RunState) -> dict:
         # worker summary.
         if push_status in (PUSH_REJECTED, PUSH_ERROR, PUSH_CONFLICT, PUSH_BLOCKED):
             detail = (state.get("push_detail") or "push did not land")[:500]
+        elif state.get("verify_status") in (verify.VERIFY_FAILED, verify.VERIFY_ERROR) \
+                and state.get("decision") != roles.GO:
+            # A run the verification gate blocked: name what went red, so a scrubbed run
+            # is legibly "the build's own checks failed" and not just "no-go".
+            detail = _verify_block_detail(state)
         elif state.get("guard_override"):
             detail = state["guard_override"][:500]
         else:
@@ -493,6 +612,8 @@ def build_run_graph(
     interrupt_before=None,
     telemetry_dir: Optional[Path] = None,
     runs_store: Optional[RunStore] = None,
+    verify_policy: Optional[verify.VerifyPolicy] = None,
+    judge_factory: Optional[Callable] = None,
 ):
     """Compile the durable run graph.
 
@@ -533,18 +654,22 @@ def build_run_graph(
         worker=worker if worker is not None else StubWorker(),
         telemetry_dir=Path(telemetry_dir) if telemetry_dir is not None else None,
         runs_store=runs_store,
+        verify=verify_policy if verify_policy is not None else verify.VerifyPolicy(),
+        judge_factory=judge_factory,
     )
 
     g = StateGraph(RunState)
     g.add_node("dispatch", lambda s: _dispatch(deps, s))
     g.add_node("run_worker", lambda s: _run_worker(deps, s))
+    g.add_node("verify", lambda s: _verify(deps, s))
     g.add_node("gate", lambda s: _gate(deps, s))
     g.add_node("apply_burn", lambda s: _apply_burn(deps, s))
     g.add_node("teardown", lambda s: _teardown(deps, s))
 
     g.add_edge(START, "dispatch")
     g.add_edge("dispatch", "run_worker")
-    g.add_edge("run_worker", "gate")
+    g.add_edge("run_worker", "verify")
+    g.add_edge("verify", "gate")
     g.add_conditional_edges(
         "gate", _route_after_gate, {"apply_burn": "apply_burn", "teardown": "teardown"}
     )
@@ -656,6 +781,8 @@ def initial_state(task: Task, *, run_id: Optional[str] = None) -> RunState:
         state["workstream"] = task.workstream
     if task.stage_slug:
         state["stage_slug"] = task.stage_slug
+    if task.acceptance_criteria:
+        state["acceptance_criteria"] = list(task.acceptance_criteria)
     if not task.gated:  # writable-but-ungated stage (auto-applies, no human gate)
         state["gated"] = False
     if task.allow_secrets:

@@ -55,3 +55,8 @@ class Task:
     # the human gate for code-writing stages. Ignored for read-only tasks (they never
     # reach the gate).
     gated: bool = True
+    # The plan unit's acceptance criteria ("how will we know it's done"), carried from the
+    # Flight Plan. When present, the verification node scores the burn's output against
+    # them with the judge and feeds the result to the gate. Empty → deterministic checks
+    # only (no judged acceptance). A tuple so the frozen Task stays hashable.
+    acceptance_criteria: tuple = ()

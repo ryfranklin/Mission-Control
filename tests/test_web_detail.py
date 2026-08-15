@@ -95,7 +95,7 @@ def test_completed_run_sse_replays_full_timeline_then_terminal(mem_store, make_s
 
     events = _read_sse(client, f"/ui/runs/{run_id}/events")           # bounded: terminal closes it
     nodes = [e for e in events if e["event"] == "node_transition"]
-    assert len(nodes) == 4                                            # dispatch, run_worker, gate, teardown
+    assert len(nodes) == 5                                            # dispatch, run_worker, verify, gate, teardown
     assert all("phase-history" in e["data"] for e in nodes)          # a completed run: all history
     assert any(e["event"] == "step_metric" and "running $" in e["data"] for e in events)
     terminal = [e for e in events if e["event"] == "terminal"]
@@ -143,7 +143,7 @@ def test_reopen_after_restart_reconstructs_full_timeline(mem_store, make_service
     svc_b = make_service(mem_store)
     events = _read_sse(svc_b, f"/ui/runs/{run_id}/events")
     nodes = [e for e in events if e["event"] == "node_transition"]
-    assert len(nodes) == 4                                            # full timeline, not just resume leg
+    assert len(nodes) == 5                                            # full timeline (incl. verify), not just resume leg
     assert all("phase-history" in e["data"] for e in nodes)          # rebuilt from the durable store
     assert any(e["event"] == "step_metric" for e in events)
     assert any(e["event"] == "terminal" and "done" in e["data"] for e in events)
