@@ -7,7 +7,7 @@
 <!--
   A UML state machine (statechart) of a Mission Control run's durable lifecycle,
   grounded in runs_store.py (status constants + COALESCE-guarded ended_at) and
-  graph.py (dispatch → run_worker → gate[interrupt] → apply_burn → teardown).
+  graph.py (dispatch → run_worker → verify → gate[interrupt] → apply_burn → teardown).
   Self-contained: inline CSS + vanilla JS + an inline SVG overlay for the
   transition arrows. No build, no CDN, no network. Renders over file:// with no
   console errors. Companion to architecture.html / architecture-uml.html /
@@ -227,7 +227,7 @@
   <aside id="detail" aria-live="polite">
     <div class="callout">
       <h3>Durability &amp; recovery model</h3>
-      <p>Recovery is at <b>node boundaries</b> — a crash re-runs the <b>whole node</b>, so every node (dispatch, run_worker, gate, apply_burn, teardown) is idempotent.</p>
+      <p>Recovery is at <b>node boundaries</b>: a crash re-runs the <b>whole node</b>, so every node (dispatch, run_worker, verify, gate, apply_burn, teardown) is idempotent.</p>
       <p><b>awaiting_gate</b> is a durable <code>interrupt()</code>: the graph halts before apply_burn, persists to the checkpointer, and resumes after a restart <b>without re-paying</b> for completed steps.</p>
       <p>Terminal states stamp <b>ended_at</b> exactly once (<code>COALESCE</code>-guarded), so a replay can't move a run that already landed.</p>
     </div>
@@ -240,9 +240,11 @@
 
 // ---------------------------------------------------------------------------
 // State model — sourced from runs_store.py (STATUS_* constants + COALESCE-guarded
-// ended_at) and graph.py (dispatch → run_worker → gate[interrupt] → apply_burn →
-// teardown). Buckets drive colour + glyph + text label (accessible: never colour
-// alone).
+// ended_at) and graph.py (dispatch → run_worker → verify → gate[interrupt] →
+// apply_burn → teardown). The verify node evaluates a burn BEFORE the gate; it
+// adds no ledger status of its own, but a red/errored verdict auto-blocks (NO-GO)
+// straight to scrubbed, and its evidence rides into awaiting_gate. Buckets drive
+// colour + glyph + text label (accessible: never colour alone).
 // ---------------------------------------------------------------------------
 
 // bucket → glyph + human label
@@ -269,15 +271,16 @@ const STATES = {
   },
   running: {
     tier: 2, bucket: "inflight", terminal: false,
-    enters: ["<b>mark_running()</b> when the <code>dispatch</code> node begins and run_worker starts; stamps started_at once."],
-    ref: "runs_store.py · STATUS_RUNNING · mark_running() · graph.py _dispatch/_run_worker",
-    desc: "Worker is investigating in its isolated worktree.",
+    enters: ["<b>mark_running()</b> when the <code>dispatch</code> node begins and run_worker starts; stamps started_at once.",
+             "A burn's output is then <b>verified</b> (<code>verify</code> node) before the gate: the target repo's own test/build checks run in the worktree, plus a judged pass on any acceptance criteria."],
+    ref: "runs_store.py · STATUS_RUNNING · mark_running() · graph.py _dispatch/_run_worker/_verify",
+    desc: "Worker is investigating in its isolated worktree; a burn is then verified (its own checks + any acceptance criteria) before reaching the gate.",
   },
   awaiting_gate: {
     tier: 3, bucket: "gate", terminal: false,
-    enters: ["A <b>burn that produced changes</b> reaches the <code>gate</code> node — a durable <code>interrupt()</code>. <b>mark_awaiting_gate()</b>."],
+    enters: ["A <b>burn that produced changes</b> and did NOT auto-block in verify reaches the <code>gate</code> node (a durable <code>interrupt()</code>), carrying the verification verdict + evidence. <b>mark_awaiting_gate()</b>."],
     ref: "runs_store.py · STATUS_AWAITING_GATE · mark_awaiting_gate() · graph.py _gate (interrupt)",
-    desc: "Halted at the go/no-go gate, persisted to the checkpointer, awaiting a human decision. Resumes after a restart without re-paying for completed steps.",
+    desc: "Halted at the go/no-go gate, persisted to the checkpointer, awaiting a human decision, with the verification evidence attached (a passing or unverified build; a red one never reaches here). Resumes after a restart without re-paying for completed steps.",
   },
   applied: {
     tier: 4, group: "success", bucket: "success", terminal: true,
@@ -316,10 +319,11 @@ const STATES = {
     tier: 4, group: "kf", bucket: "killed", terminal: true,
     enters: [
       "<b>NO-GO</b> (reject) at the gate, OR",
+      "<b>verification auto-block</b>: the burn's own checks went red (or errored), a NO-GO without halting a human for a doomed run (overrides even an ungated stage), OR",
       "<b>scrub</b> kills at a node boundary → the worktree branch is discarded.",
     ],
-    ref: "runs_store.py · STATUS_SCRUBBED · graph.py _teardown / _terminal_status",
-    desc: "Rejected or killed; branch discarded. ended_at stamped once.",
+    ref: "runs_store.py · STATUS_SCRUBBED · graph.py _gate (verify auto-block) / _teardown / _terminal_status",
+    desc: "Rejected, auto-blocked by verification, or killed; branch discarded. ended_at stamped once (a verification block records which checks failed as the detail).",
   },
   failed: {
     tier: 4, group: "kf", bucket: "fault", terminal: true,
@@ -334,9 +338,9 @@ const TRANSITIONS = [
   { id: "t0", from: "__init__", to: "queued",         trig: "launch() inserts row",              kind: "" },
   { id: "t1", from: "queued",   to: "running",        trig: "mark_running (dispatch begins)",    kind: "" },
   { id: "t2", from: "running",  to: "done",           trig: "sim done / burn no-op",             kind: "happy" },
-  { id: "t3", from: "running",  to: "awaiting_gate",  trig: "burn w/ changes → gate (interrupt)", kind: "gate" },
+  { id: "t3", from: "running",  to: "awaiting_gate",  trig: "burn verified (pass/unverified) → gate", kind: "gate" },
   { id: "t4", from: "running",  to: "failed",         trig: "hard error (mark_failed)",          kind: "fault" },
-  { id: "t5", from: "running",  to: "scrubbed",       trig: "scrub at node boundary",            kind: "fault" },
+  { id: "t5", from: "running",  to: "scrubbed",       trig: "verify red → auto-block / scrub",   kind: "fault" },
   { id: "t6", from: "awaiting_gate", to: "applied",        trig: "GO → apply_burn merged + pushed", kind: "happy" },
   { id: "t7", from: "awaiting_gate", to: "push_rejected",  trig: "GO, push non-fast-forward",       kind: "fault" },
   { id: "t8", from: "awaiting_gate", to: "merge_conflict", trig: "GO, remote integration conflict", kind: "fault" },

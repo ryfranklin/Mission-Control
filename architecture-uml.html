@@ -203,7 +203,7 @@ const CLASSES = {
   TaskType: { pkg: "domain", stereo: K.E, file: "tasks.py",
     attrs: ["READ_ONLY = sim", "SIDE_EFFECTFUL = burn"], methods: ["+is_side_effectful: bool"] },
   Task: { pkg: "domain", stereo: K.D, file: "tasks.py",
-    attrs: ["task_id: str", "task_type: TaskType", "prompt: str", "greenfield: bool", "workstream: str?", "stage_slug: str?", "gated: bool"], methods: [] },
+    attrs: ["task_id: str", "task_type: TaskType", "prompt: str", "greenfield: bool", "workstream: str?", "stage_slug: str?", "gated: bool", "acceptance_criteria: tuple"], methods: [] },
   Worker: { pkg: "domain", stereo: K.I, file: "worker.py",
     attrs: [], methods: ["+investigate(task, workdir): WorkerResult"] },
   WorkerResult: { pkg: "domain", stereo: K.D, file: "worker.py",
@@ -215,9 +215,9 @@ const CLASSES = {
 
   // ---- Orchestration (durable graph) ----
   RunGraph: { pkg: "orch", stereo: K.G, file: "graph.py",
-    attrs: ["nodes: dispatch → run_worker →", "  gate → apply_burn → teardown"], methods: ["+build_run_graph(deps): StateGraph", "durable interrupt() go/no-go"] },
+    attrs: ["nodes: dispatch → run_worker → verify →", "  gate → apply_burn → teardown"], methods: ["+build_run_graph(deps): StateGraph", "durable interrupt() go/no-go"] },
   RunState: { pkg: "orch", stereo: K.TD, file: "graph.py",
-    attrs: ["run_id: str", "task_type: str", "decision: str?  (go/no-go)", "applied: bool", "steps: dict[]", "outcome: str"], methods: [] },
+    attrs: ["run_id: str", "task_type: str", "acceptance_criteria: str[]", "verify_status: str?", "verify_report: dict?", "decision: str?  (go/no-go)", "applied: bool", "steps: dict[]", "outcome: str"], methods: [] },
   Deps: { pkg: "orch", stereo: K.D, file: "graph.py",
     attrs: ["worker: Worker", "target_ref: str?", "telemetry_dir: Path?", "runs_store: RunStore?"], methods: [] },
   Orchestrator: { pkg: "orch", stereo: K.C, file: "orchestrator.py",
