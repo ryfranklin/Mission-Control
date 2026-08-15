@@ -11,10 +11,11 @@
 
 FROM python:3.12-slim
 
-# git (worktrees + target-repo clone/push) and Node (the Claude Code CLI the SDK
-# spawns). Node via NodeSource; the CLI installed globally onto PATH as `claude`.
+# git (worktrees + target-repo clone/push), libpq5 (psycopg3 needs libpq at
+# runtime for the Postgres ledger), and Node (the Claude Code CLI the SDK spawns).
+# Node via NodeSource; the CLI installed globally onto PATH as `claude`.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates curl gnupg \
+ && apt-get install -y --no-install-recommends git ca-certificates curl gnupg libpq5 \
  && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && npm install -g @anthropic-ai/claude-code \
