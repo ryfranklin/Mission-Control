@@ -25,6 +25,8 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir .
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Fargate binds all interfaces (the port is VPC-internal only, and MC_API_TOKEN is
 # required). Real SDK worker, routed to Claude via Bedrock.
@@ -33,4 +35,7 @@ ENV MC_SERVICE_HOST=0.0.0.0 \
     MC_SERVICE_SDK=1 \
     CLAUDE_CODE_USE_BEDROCK=1
 EXPOSE 8000
+# The entrypoint wires git auth from GITHUB_TOKEN (env-based, never on disk), then
+# runs the service.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["python", "-m", "mission_control.service"]
