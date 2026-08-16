@@ -1,0 +1,83 @@
+name: ci
+
+# Offline PR gate for Mission Control: secret scan + unit tests, with no cloud
+# credentials and no services. Deployment stays in the Jenkins pipeline
+# (Jenkinsfile); this workflow only gates changes on pull requests and pushes.
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  secret-scan:
+    name: gitleaks secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          # Authenticate the action's owner-type lookup so it is not rate-limited
+          # (unauthenticated it can fail and then wrongly demand an org license).
+          # This does not change what is scanned; the full history is still scanned.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
+  unit-tests:
+    name: unit tests (offline, no cloud credentials)
+    runs-on: ubuntu-latest
+    # Backstop: the suite runs in ~1 min against a reachable Postgres. If it exceeds
+    # this, something is wedged; fail instead of hanging for hours.
+    timeout-minutes: 15
+    # Much of the suite is Postgres-backed (the durable checkpointer / run store).
+    # Without a reachable Postgres those tests stall on connection retries and some
+    # fail, so provide one — the same shape a developer runs locally (mc/mc, port
+    # 5432). The conftest derives an isolated ``mission_control_test`` DB from this URL.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: mc
+          POSTGRES_PASSWORD: mc
+          POSTGRES_DB: mission_control
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure a git identity
+        # The suite makes real git commits in throwaway repos (worktrees, clones under
+        # /tmp). The runner has no global user.name/email, so `git commit` fails with
+        # exit 128 ("unable to auto-detect email"). A developer's machine has this set,
+        # which is why the suite is green locally. Also default new repos to `main` to
+        # match the repos the tests build.
+        run: |
+          git config --global user.email "ci@mission-control.invalid"
+          git config --global user.name "Mission Control CI"
+          git config --global init.defaultBranch main
+      - name: Set up uv + Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install dependencies (locked, with dev extras)
+        run: uv sync --frozen --extra dev
+      - name: Run pytest
+        # MC_POSTGRES_URL points the suite at the service container (conftest isolates
+        # onto a *_test database). Live-LLM/web tests still skip when their creds are
+        # absent. -p no:randomly pins a deterministic order (the suite has some
+        # cross-test state leakage under random shuffling — a tracked follow-up).
+        # --timeout (pytest-timeout, ad-hoc via `uv run --with`) fails any single test
+        # that blocks >120s with a traceback, so a wedge can never hang the job.
+        env:
+          MC_POSTGRES_URL: postgresql://mc:mc@localhost:5432/mission_control?sslmode=disable
+        run: uv run --with pytest-timeout pytest -k "not postgres" -p no:randomly --timeout=120 -q
