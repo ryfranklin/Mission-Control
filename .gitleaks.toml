@@ -1,0 +1,20 @@
+# gitleaks config for Mission Control.
+#
+# Mission Control is secret-tooling: its egress content guard is TESTED with planted
+# FAKE secrets (e.g. `xoxb-super-secret-value`, the AWS docs example key
+# `AKIAIOSFODNN7EXAMPLE...`, `sk-live-...`), and its source comments / steering prose
+# DESCRIBE secret shapes. gitleaks' default rules flag those examples as findings.
+#
+# Allowlist the paths that legitimately contain secret-shaped fixtures and pattern
+# descriptions. No real credential lives in the repo: the real `.env` is git-ignored,
+# and every flagged string has been confirmed a fixture/example, not a live secret.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures and secret-shape pattern/prose are examples, not real secrets."
+paths = [
+  '''tests/''',
+  '''src/mission_control/content_guard\.py''',
+  '''src/mission_control/aidlc_v2/steering\.py''',
+]
