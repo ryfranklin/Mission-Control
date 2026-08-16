@@ -31,6 +31,9 @@ jobs:
   unit-tests:
     name: unit tests (offline, no cloud credentials)
     runs-on: ubuntu-latest
+    # Backstop: the offline suite runs in ~1 min. If it exceeds this, a test is
+    # blocking on a resource the runner lacks; fail fast instead of hanging for hours.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Set up uv + Python 3.12
@@ -50,4 +53,9 @@ jobs:
         # intermittently (a test passes in isolation and in file order, but a random
         # order can fail it). Fixing that isolation is a follow-up; until then CI runs
         # a fixed order so it is not flaky.
-        run: uv run pytest -k "not postgres" -p no:randomly -q
+        #
+        # --timeout (pytest-timeout, pulled in ad-hoc via `uv run --with`) fails any
+        # single test that blocks for >120s and dumps its traceback, so a CI-only hang
+        # (a test waiting on a service/subprocess the runner lacks) surfaces the exact
+        # culprit instead of hanging the job.
+        run: uv run --with pytest-timeout pytest -k "not postgres" -p no:randomly --timeout=120 -q
