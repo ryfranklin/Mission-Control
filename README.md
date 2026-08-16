@@ -23,6 +23,9 @@ re-implementing any orchestration.
  (orchestrator)                        │                        (Claude Agent SDK)
                                        │  per-step telemetry (JSONL: tokens, $, latency)
                                        ▼
+                                    verify (repo's own checks + judged acceptance)
+                                       │  red → auto no-go · pass/unverified → human
+                                       ▼
                            go / no-go gate ──► apply change (burn)  ─┐
                                        └────►  scrub (discard)       │
                                        ▼                             │
@@ -51,6 +54,7 @@ no network) and click-through with a detail panel:
 | 🧭 **Isolated by default** | Every task runs in a throwaway `git worktree`; teardown leaves no leaks. |
 | 💵 **Cost is first-class** | Per-step JSONL telemetry (input/output/cache tokens, `cost_usd`, latency) priced from a single model→price table. |
 | ✅ **Human-gated side effects** | A `go`/`no-go` gate; nothing is applied without an approval on record. |
+| 🔎 **Verified before the gate** | A `verify` node runs the target repo's OWN test/build checks in the worktree and (when the unit carries acceptance criteria) has the judge score them; a red result auto-blocks, a passing one reaches the human gate with the evidence attached. Verification can only ADD a block, never turn a no-go into a go. |
 | ♻️ **Durable & resumable** | Runs are a LangGraph state machine checkpointed to Postgres — kill it mid-flight, resume, **don't re-pay** for completed steps. |
 | 🧪 **Evals + regression gate** | Golden tasks scored by deterministic asserts **and** an LLM judge; a k·σ noise band tells a real regression from variance. |
 | 🔌 **Portable tools (MCP)** | The eval-gate is exposed as an MCP server; any agent/IDE can call it — same exit-code contract. |
@@ -137,7 +141,35 @@ See `scripts/e2e_phase8.py` for the end-to-end run and `docs/PHASE8_FINDINGS.md`
 - **Durable** (`graph.py`, LangGraph `StateGraph`) — the same lifecycle as nodes,
   checkpointed to Postgres, resumable, with an `interrupt()`-based go/no-go that
   survives a restart. Nodes are idempotent (recovery is at node boundaries), and
-  **apply-burn is its own node** so a crash never half-applies a change.
+  **apply-burn is its own node** so a crash never half-applies a change. The full
+  lifecycle is dispatch → run_worker → **verify** → gate → (apply_burn) → teardown.
+
+**Verification (before the gate).** A `verify` node (`verify.py`) evaluates a burn's
+output BEFORE the go/no-go, on two fail-closed axes:
+- **Deterministic checks**: the target repo's OWN test/build/lint commands,
+  auto-detected from the worktree (pytest, npm/pnpm/yarn, go, cargo, make; a repo can
+  override via a committed `.mission-control/verify.yml`), run in the disposable worktree
+  under per-check and wall-clock caps. A non-zero exit is `VERIFY_FAILED`; NO detectable
+  checks is `VERIFY_UNVERIFIED`, a distinct state, never a silent pass.
+- **Acceptance criteria (judged)**: when a run carries acceptance criteria (the plan
+  unit's definition of done), the LLM judge scores the output against them. Advisory by
+  default (the judge is noisy), enforcing only when the policy sets a bar; the judge's own
+  tokens are folded into the run's priced steps.
+
+The gate honors the verdict, preserving the invariant that **verification can only ADD a
+block, never turn a no-go into a go**: a red/errored verification auto-blocks (NO-GO)
+without halting a human for a doomed run (overriding even an ungated stage); an unverified
+build still goes to the human gate by default; a passing build reaches the human gate with
+the verification evidence attached.
+
+**Acceptance criteria carry across the Homebase seam.** `Task` and `RunState` carry
+`acceptance_criteria`; `POST /runs` accepts them; `manager.launch` threads them to the
+`Task`. The Homebase planner sends each plan unit's PER-UNIT acceptance criteria on
+`POST /runs`, so Mission Control judges every unit against its own definition of done.
+
+**Where a build lives.** A build's durable home is a git remote (each project's own target
+repo), NOT the database: the container clones into an ephemeral worktree and pushes gated
+results back to the remote. Postgres holds run state / telemetry, not code.
 
 **Telemetry & cost.** Every model request is one JSONL row (tokens, cache split,
 `cost_usd`, latency, model, step ids). Pricing lives in exactly one module.
@@ -165,7 +197,7 @@ launches / resolves / streams / queries runs, but owns **no orchestration logic*
 
 | Endpoint | What it does |
 |---|---|
-| `POST /runs` | Launch a run against a target; kicks off the graph in a background task keyed by `thread_id`. |
+| `POST /runs` | Launch a run against a target; kicks off the graph in a background task keyed by `thread_id`. Accepts optional `acceptance_criteria` (a unit's definition of done) that the `verify` node judges the output against. |
 | `POST /runs/{id}/approve` · `/reject` | Resolve the durable go/no-go by **resuming the existing `interrupt()`** (approve → apply-burn; reject → scrub). |
 | `POST /runs/{id}/scrub` | Scrub (kill) a run with clean teardown. |
 | `GET /runs` · `GET /runs/{id}` | List runs (status/target filters) · run detail, from the Postgres registry. |
@@ -237,6 +269,7 @@ src/mission_control/
   sdk_worker.py       Claude Agent SDK worker (explicit context, AI-DLC steering)
   orchestrator.py     imperative dispatch → gate → apply/scrub → teardown
   graph.py            durable LangGraph shell + PostgresSaver + interrupt() gate
+  verify.py           pre-gate verification (repo's own checks + judged acceptance)
   live.py             the merged live feed (node transitions + priced telemetry)
   runs_store.py       the Postgres runs registry (status/cost ledger)
   service/            FastAPI seam wrapping graph.py (5a) + web/ control-room UI (5b)

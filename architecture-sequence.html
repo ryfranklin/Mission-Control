@@ -172,7 +172,9 @@ const M = [
   { from: "wrk", to: "graph",kind: "return", label: "WorkerResult(made_changes, steps)", file: "worker.py", desc: "The worker reports what it did plus per-model-request usage (StepUsage) for pricing." },
   { from: "graph", to: "pg", kind: "async",  tone: "telemetry", label: "append_event · step_metric (priced)", node: "run_events + JSONL", file: "telemetry.py · pricing.py", desc: "Each step becomes one priced JSONL row (tokens, cost_usd, latency) — priced from the single model→price table — and a durable run_events row backing SSE replay." },
 
-  { from: "graph", to: "pg", kind: "async",  tone: "inflight", label: "interrupt() · checkpoint (awaiting_gate)", node: "gate node", file: "graph.py · _gate()", desc: "A burn pauses at a durable interrupt(). The whole run state is checkpointed — this is the go/no-go gate, and it survives a process restart." },
+  { from: "graph", to: "wt", kind: "sync",   label: "run repo's own checks + judge acceptance", node: "verify node", file: "graph.py · _verify() · verify.py", desc: "BEFORE the gate, the burn's output is verified in its worktree on two fail-closed axes: the target repo's own test/build/lint checks (auto-detected, or declared in .mission-control/verify.yml) run under per-check and wall-clock caps, and (when the run carries acceptance criteria) the LLM judge scores the output against them (advisory unless the policy enforces a bar; the judge's tokens are priced into the run). No detectable checks is UNVERIFIED, never a silent pass. Verification can only ADD a block, never turn a no-go into a go." },
+
+  { from: "graph", to: "pg", kind: "async",  tone: "inflight", label: "interrupt() · checkpoint (awaiting_gate)", node: "gate node", file: "graph.py · _gate()", desc: "A burn that verified pass/unverified pauses at a durable interrupt(), with the verification verdict + evidence attached. The whole run state is checkpointed (this is the go/no-go gate), and it survives a process restart. A red/errored verification instead auto-blocks (NO-GO) here without halting a human." },
   { from: "graph", to: "mgr",kind: "async",  tone: "inflight", label: "GateWaiting", file: "live.py · GateWaiting", desc: "The merged live feed surfaces that the run is waiting on a human decision." },
   { from: "mgr", to: "op",   kind: "async",  tone: "inflight", label: "SSE: gate-waiting ◆", node: "GET /runs/{id}/events", file: "service/manager.py · events()", desc: "The operator sees the pending gate over the live SSE feed. Nothing is applied without an approval on record." },
 
@@ -195,17 +197,17 @@ const M = [
 
 // fragments over message index ranges (1-based, inclusive)
 const FRAGS = [
-  { label: "alt", start: 17, end: 23, guardTop: "[ GO — approve ]", divAfter: 21, guardBot: "[ NO-GO / scrub ]" },
+  { label: "alt", start: 18, end: 24, guardTop: "[ GO — approve ]", divAfter: 22, guardBot: "[ NO-GO / scrub ]" },
 ];
 // notes: {rows:[a,b] cols:[from,to], text}
 const NOTES = [
-  { start: 14, end: 15, from: "op", to: "svc", text: "Durable here: a crash or restart resumes at interrupt() — no re-pay for completed steps, no worktree leak." },
+  { start: 15, end: 16, from: "op", to: "svc", text: "Durable here: a crash or restart resumes at interrupt() — no re-pay for completed steps, no worktree leak." },
 ];
 // activation bars: {col, from, to}
 const ACT = [
   { col: "svc", from: 1, to: 6 }, { col: "mgr", from: 2, to: 5 },
-  { col: "graph", from: 4, to: 25 }, { col: "wrk", from: 10, to: 12 },
-  { col: "svc", from: 17, to: 18 }, { col: "mgr", from: 18, to: 19 },
+  { col: "graph", from: 4, to: 26 }, { col: "wrk", from: 10, to: 12 },
+  { col: "svc", from: 18, to: 19 }, { col: "mgr", from: 19, to: 20 },
 ];
 
 // ---- geometry ----

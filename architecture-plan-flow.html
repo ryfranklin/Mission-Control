@@ -249,7 +249,7 @@ const NODES = [
   { id: "translate", lane: "capcom", x: 0.06, kind: "activity", glyph: "▭", label: "Translate units onto run launch path",
     path: ["green","brown"], where: "CAPCOM / PlanBuilder", file: "plan_builder.py · start_build() → _advance()",
     sets: [["plan","building"]],
-    desc: "Adds NO new orchestration. INCEPTION/validation units (task_type=sim) → sim runs; CONSTRUCTION/change units (task_type=burn) → gated burn runs. task_type is already on each unit." },
+    desc: "Adds NO new orchestration. INCEPTION/validation units (task_type=sim) → sim runs; CONSTRUCTION/change units (task_type=burn) → gated burn runs. task_type is already on each unit. Each unit's PER-UNIT acceptance criteria (its definition of done) ride along on POST /runs so the run's verify node can judge that unit against its own bar." },
   { id: "sched", lane: "capcom", x: 0.20, kind: "decision", glyph: "◇", label: "unit RUNNABLE?",
     path: ["green","brown"], where: "CAPCOM (edge-triggered scheduler)", file: "plan_builder.py · _advance()",
     sets: [],
@@ -265,9 +265,9 @@ const NODES = [
 
   // RunGraph lane
   { id: "unitrun", lane: "rungraph", x: 0.52, kind: "activity", glyph: "▭", label: "Execute unit-run",
-    path: ["green","brown"], where: "RunGraph", file: "graph.py (dispatch → worker → gate → apply → teardown)",
+    path: ["green","brown"], where: "RunGraph", file: "graph.py (dispatch → worker → verify → gate → apply → teardown)",
     sets: [],
-    desc: "Each unit-run walks the standard run path (see the sequence diagram): dispatch worktree → run worker → go/no-go gate → apply → teardown. On any terminal state the RunManager calls CAPCOM.on_run_terminal(run_id, plan_id)." },
+    desc: "Each unit-run walks the standard run path (see the sequence diagram): dispatch worktree → run worker → verify → go/no-go gate → apply → teardown. The verify node runs the target repo's own checks and, when the unit carries acceptance criteria (its definition of done), has the LLM judge score the output against them before the gate. On any terminal state the RunManager calls CAPCOM.on_run_terminal(run_id, plan_id)." },
   { id: "verify", lane: "capcom", x: 0.52, kind: "decision", glyph: "◇", label: "artifacts landed?",
     path: ["green","brown"], where: "CAPCOM", file: "plan_builder.py · _produced() / on_run_terminal()",
     sets: [],

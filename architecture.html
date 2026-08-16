@@ -342,11 +342,11 @@ const NODES = {
   },
   graph: {
     tier: "Runtime core", name: "LangGraph StateGraph", sub: "graph.py · durable shell", status: "inflight",
-    role: "The run lifecycle as a durable LangGraph StateGraph, checkpointed to Postgres and resumable. Nodes are idempotent (recovery is at node boundaries); apply-burn is its own node so a crash never half-applies a change. The durable interrupt() go/no-go survives a restart.",
-    files: ["graph.py", "orchestrator.py (imperative twin)"],
-    pipeline: ["dispatch", "run_worker", "gate", "apply_burn", "teardown"],
+    role: "The run lifecycle as a durable LangGraph StateGraph, checkpointed to Postgres and resumable. Nodes are idempotent (recovery is at node boundaries); apply-burn is its own node so a crash never half-applies a change. A verify node evaluates a burn (its own checks + any acceptance criteria) before the durable interrupt() go/no-go, which survives a restart.",
+    files: ["graph.py", "verify.py", "orchestrator.py (imperative twin)"],
+    pipeline: ["dispatch", "run_worker", "verify", "gate", "apply_burn", "teardown"],
     metaphor: "The Flight Director (orchestrator). The gate is go / no-go; killing a run is a scrub.",
-    detail: [["gate ◆", "interrupt()-based, durable across restart"], ["apply_burn ●", "own node; commit/merge no-op if already applied"], ["scrub ▲", "kill + idempotent teardown, no worktree leak"]],
+    detail: [["verify ◇", "target repo's own tests/build + judged acceptance criteria; can only ADD a block (red → auto no-go)"], ["gate ◆", "interrupt()-based, durable across restart"], ["apply_burn ●", "own node; commit/merge no-op if already applied"], ["scrub ▲", "kill + idempotent teardown, no worktree leak"]],
   },
   worker: {
     tier: "Runtime core", name: "Worker", sub: "SdkWorker / StubWorker", status: null,
