@@ -31,9 +31,27 @@ jobs:
   unit-tests:
     name: unit tests (offline, no cloud credentials)
     runs-on: ubuntu-latest
-    # Backstop: the offline suite runs in ~1 min. If it exceeds this, a test is
-    # blocking on a resource the runner lacks; fail fast instead of hanging for hours.
+    # Backstop: the suite runs in ~1 min against a reachable Postgres. If it exceeds
+    # this, something is wedged; fail instead of hanging for hours.
     timeout-minutes: 15
+    # Much of the suite is Postgres-backed (the durable checkpointer / run store).
+    # Without a reachable Postgres those tests stall on connection retries and some
+    # fail, so provide one — the same shape a developer runs locally (mc/mc, port
+    # 5432). The conftest derives an isolated ``mission_control_test`` DB from this URL.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: mc
+          POSTGRES_PASSWORD: mc
+          POSTGRES_DB: mission_control
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - name: Set up uv + Python 3.12
@@ -44,18 +62,12 @@ jobs:
       - name: Install dependencies (locked, with dev extras)
         run: uv sync --frozen --extra dev
       - name: Run pytest
-        # Postgres durability tests need Docker Postgres; live-LLM and web tests
-        # need credentials. Both skip when unavailable, and the Postgres set is
-        # de-selected explicitly so the gate stays fully offline (see README).
-        #
-        # -p no:randomly pins a deterministic order. The suite currently has some
-        # cross-test state leakage that pytest-randomly's shuffling exposes
-        # intermittently (a test passes in isolation and in file order, but a random
-        # order can fail it). Fixing that isolation is a follow-up; until then CI runs
-        # a fixed order so it is not flaky.
-        #
-        # --timeout (pytest-timeout, pulled in ad-hoc via `uv run --with`) fails any
-        # single test that blocks for >120s and dumps its traceback, so a CI-only hang
-        # (a test waiting on a service/subprocess the runner lacks) surfaces the exact
-        # culprit instead of hanging the job.
+        # MC_POSTGRES_URL points the suite at the service container (conftest isolates
+        # onto a *_test database). Live-LLM/web tests still skip when their creds are
+        # absent. -p no:randomly pins a deterministic order (the suite has some
+        # cross-test state leakage under random shuffling — a tracked follow-up).
+        # --timeout (pytest-timeout, ad-hoc via `uv run --with`) fails any single test
+        # that blocks >120s with a traceback, so a wedge can never hang the job.
+        env:
+          MC_POSTGRES_URL: postgresql://mc:mc@localhost:5432/mission_control?sslmode=disable
         run: uv run --with pytest-timeout pytest -k "not postgres" -p no:randomly --timeout=120 -q
