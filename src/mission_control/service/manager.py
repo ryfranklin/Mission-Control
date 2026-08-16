@@ -211,12 +211,16 @@ class RunManager:
 
     # -- graph wiring ------------------------------------------------------
 
-    def _graph_for(self, target: Path):
+    def _graph_for(self, target: Path, ref: Optional[str] = None):
+        # ``ref`` (the portable remote identity) is passed for a remote target whose
+        # local checkout does not exist yet: dispatch clones from it. For a local target
+        # it is None and the graph derives the identity from the path (unchanged).
         key = str(Path(target).resolve())
         graph = self._graphs.get(key)
         if graph is None:
             graph = build_run_graph(
                 Path(key),
+                target_ref=ref,
                 worker=self._worker_factory(),
                 checkpointer=self._checkpointer,
                 runs_store=self._store,
@@ -271,8 +275,8 @@ class RunManager:
         ``target`` may be a local path OR a remote URL. Its PORTABLE identity (a
         normalized remote ref) is stored as the run's ``target``; the derived
         machine-local working dir is stored separately as ``local_path`` and is what
-        the run executes in. No clone is done in this slice, so a URL with no local
-        checkout is rejected below."""
+        the run executes in. A remote URL is cloned lazily by the graph's dispatch node
+        (off the event loop); a local target must already be a git repo root."""
         # Resolve the Slack selector: an explicit profile wins; otherwise inherit the
         # fleet default (MC_DEFAULT_SLACK_PROFILE), which is None when unset (silent).
         # Validate FIRST — an unknown profile must fail before any run row / worktree
@@ -281,15 +285,26 @@ class RunManager:
             slack_profile = self._default_slack_profile
         self._slack_registry.validate(slack_profile)
         ref, local_path = project_ref.resolve_target(target)
-        target_path = local_path if local_path is not None else Path(target).expanduser()
-        if not target_path.is_dir():
-            raise RunConflict(f"target is not a directory: {target}", status="rejected")
-        # Must be its OWN git repo root — never a subdir of a parent repo (a worktree
-        # carved there would land in the PARENT). Refuse rather than pollute it.
-        if not worktree.is_git_repo(target_path):
-            raise RunConflict(
-                f"target is not a git repository root (init it, or it is nested inside "
-                f"a parent repo): {target}", status="rejected")
+        if project_ref.is_remote_url(target):
+            # A remote URL: resolve_target does no I/O, so the derived cache dir does not
+            # exist yet. The graph's dispatch node clones it (ensure_local) off the event
+            # loop, then validates — so DON'T run the local is_dir/is_git_repo checks here
+            # (they assume a present checkout). An unreachable/invalid remote surfaces as
+            # a failed run, not a launch-time 400. ``ref`` is threaded to the graph so
+            # dispatch acquires from it (the cache dir alone can't yield the identity
+            # before it is cloned). resolve_target always yields the cache dir for a
+            # remote (never None); the fallback just satisfies the type checker.
+            target_path = local_path if local_path is not None else project_ref.cache_dir_for(ref)
+        else:
+            # A local target must already be its OWN git repo root — never a subdir of a
+            # parent repo (a worktree carved there would land in the PARENT).
+            target_path = local_path if local_path is not None else Path(target).expanduser()
+            if not target_path.is_dir():
+                raise RunConflict(f"target is not a directory: {target}", status="rejected")
+            if not worktree.is_git_repo(target_path):
+                raise RunConflict(
+                    f"target is not a git repository root (init it, or it is nested inside "
+                    f"a parent repo): {target}", status="rejected")
         tt = _TASK_TYPE[task_type]  # validated by the request model
 
         run_id = f"run-{uuid4().hex}"
@@ -307,7 +322,7 @@ class RunManager:
         self._notify(run_id, NOTIFY_RUN_LAUNCHED, node="launch")
 
         self._channel_for(run_id)
-        self._spawn(self._drive(run_id, target_path, initial_state(task, run_id=run_id)))
+        self._spawn(self._drive(run_id, target_path, initial_state(task, run_id=run_id), ref=ref))
         return run_id
 
     # -- plan-child run queries (the plan owns its runs) -------------------
@@ -430,12 +445,13 @@ class RunManager:
             raise RunConflict("gate decision already in progress", status=row.status)
         self._resolving.add(run_id)
         self._channel_for(run_id)
-        self._spawn(self._resume(run_id, Path(_work_path(row)), Command(resume=decision)))
+        self._spawn(self._resume(run_id, Path(_work_path(row)), Command(resume=decision),
+                                 ref=row.target))
         return self._require(run_id)
 
-    async def _resume(self, run_id: str, target: Path, payload) -> None:
+    async def _resume(self, run_id: str, target: Path, payload, *, ref: Optional[str] = None) -> None:
         try:
-            await self._drive(run_id, target, payload)
+            await self._drive(run_id, target, payload, ref=ref)
         finally:
             self._resolving.discard(run_id)
 
@@ -458,14 +474,14 @@ class RunManager:
 
     # -- the background driver --------------------------------------------
 
-    async def _drive(self, run_id: str, target: Path, payload) -> None:
+    async def _drive(self, run_id: str, target: Path, payload, *, ref: Optional[str] = None) -> None:
         """Drive one leg of the graph, persisting + fanning out its merged feed.
 
         A leg that ends at the gate leaves the feed open (more comes on resume). A
         leg that ends terminal emits an explicit terminal event and closes. A leg
         stopped by cancel breaks at the next node boundary, then tears down + marks
         scrubbed. A leg that errors is marked failed (best-effort teardown)."""
-        graph = self._graph_for(target)
+        graph = self._graph_for(target, ref=ref)
         config = {"configurable": {"thread_id": run_id}}
         channel = self._channels[run_id]
         loop = asyncio.get_running_loop()

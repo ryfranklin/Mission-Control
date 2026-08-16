@@ -194,6 +194,17 @@ def test_launch_bad_target_is_400(client, tmp_path):
     assert r.status_code == 400
 
 
+def test_launch_remote_url_is_accepted(client):
+    # Regression: a remote URL target must be ACCEPTED at launch — the graph's dispatch
+    # node clones it lazily (off the event loop). Before the fix, launch ran an is_dir()
+    # check on the not-yet-cloned cache dir and 400'd EVERY remote ("target is not a
+    # directory"), so no run against a git URL could ever start. The launch is what's
+    # under test; the run itself then fails async on the unreachable remote (harmless).
+    r = client.post("/runs", json={"target": "file:///tmp/mc-nonexistent.git", "task_type": roles.SIM})
+    assert r.status_code == 201, r.text
+    assert r.json()["run_id"]
+
+
 def _tracked(repo: Path) -> list[str]:
     return subprocess.run(["git", "-C", str(repo), "ls-files"],
                           check=True, capture_output=True, text=True).stdout.split()
