@@ -29,13 +29,23 @@ RUN pip install --no-cache-dir .
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# Run as a NON-ROOT user. Claude Code refuses --dangerously-skip-permissions (the
+# worker's permission_mode=bypassPermissions) under root/sudo, which would fail every
+# worker. The service clones target repos and writes under $HOME/.mission-control and
+# spawns the CLI (which writes ~/.claude), so mc owns its home and the app dir.
+RUN useradd --create-home --uid 10001 mc \
+ && mkdir -p /home/mc/.mission-control \
+ && chown -R mc:mc /app /home/mc
+
 # Fargate binds all interfaces (the port is VPC-internal only, and MC_API_TOKEN is
 # required). Real SDK worker, routed to Claude via Bedrock.
-ENV MC_SERVICE_HOST=0.0.0.0 \
+ENV HOME=/home/mc \
+    MC_SERVICE_HOST=0.0.0.0 \
     MC_SERVICE_PORT=8000 \
     MC_SERVICE_SDK=1 \
     CLAUDE_CODE_USE_BEDROCK=1
 EXPOSE 8000
+USER mc
 # The entrypoint wires git auth from GITHUB_TOKEN (env-based, never on disk), then
 # runs the service.
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
