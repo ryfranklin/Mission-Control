@@ -58,6 +58,13 @@ _RULES: tuple[tuple[str, re.Pattern], ...] = (
     ("connection-string-password",
      re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://(?P<usr>[^\s:/@]+):(?P<pw>[^\s:/@]{3,})"
                 r"@(?P<host>[^\s/:]+)")),
+    # A hardcoded provider secret-key VALUE, matched by its prefix regardless of the
+    # identifier it is assigned to. This catches ``const KEY = "sk-live-..."`` where the
+    # variable name (``KEY``) is not itself a secret keyword, without the false positives
+    # of broadening the identifier list to bare ``key``/``token`` (which flags benign
+    # ``key: <literal>`` in config/spec files). Stripe-style ``sk``/``rk`` live/test keys.
+    ("provider-secret-key",
+     re.compile(r"(?i)\b(?:sk|rk)[-_](?:live|test)[-_][0-9A-Za-z]{6,}")),
     # A sensitive key assigned a non-trivial value. Catches a real hardcoded credential
     # (``PASSWORD=hunter2secret``, ``api_key: sk-...``) but the value is post-filtered
     # (see scan_text) to skip a CODE EXPRESSION rather than a literal: an env/config read

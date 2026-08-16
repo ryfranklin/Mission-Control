@@ -86,7 +86,7 @@ def test_scan_skips_generated_code_false_positives(text):
 
 
 @pytest.mark.parametrize("text,rule", [
-    ('const KEY = "sk-live-abcdef123456"', "secret-assignment"),          # hardcoded literal
+    ('const KEY = "sk-live-abcdef123456"', "provider-secret-key"),        # hardcoded key literal
     ("db = postgres://admin:Xk9zP2qW@prod-db.corp.net:5432/app",          # real remote DSN
      "connection-string-password"),
 ])
