@@ -76,8 +76,9 @@ jobs:
         # onto a *_test database). Live-LLM/web tests still skip when their creds are
         # absent. -p no:randomly pins a deterministic order (the suite has some
         # cross-test state leakage under random shuffling — a tracked follow-up).
-        # --timeout (pytest-timeout, ad-hoc via `uv run --with`) fails any single test
-        # that blocks >120s with a traceback, so a wedge can never hang the job.
+        # --timeout (pytest-timeout, a dev dep) fails any single test that blocks >120s
+        # with a traceback, so a wedge can never hang the job. The MCP-subprocess tests
+        # carry @pytest.mark.flaky (pytest-rerunfailures) to retry their spawn race.
         env:
           MC_POSTGRES_URL: postgresql://mc:mc@localhost:5432/mission_control?sslmode=disable
-        run: uv run --with pytest-timeout pytest -k "not postgres" -p no:randomly --timeout=120 -q
+        run: uv run pytest -k "not postgres" -p no:randomly --timeout=120 -q

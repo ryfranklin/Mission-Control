@@ -23,6 +23,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "pytest-rerunfailures>=16.5",
+    "pytest-timeout>=2.5.0",
 ]
 
 [project.scripts]
