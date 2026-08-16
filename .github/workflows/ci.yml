@@ -54,6 +54,16 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
+      - name: Configure a git identity
+        # The suite makes real git commits in throwaway repos (worktrees, clones under
+        # /tmp). The runner has no global user.name/email, so `git commit` fails with
+        # exit 128 ("unable to auto-detect email"). A developer's machine has this set,
+        # which is why the suite is green locally. Also default new repos to `main` to
+        # match the repos the tests build.
+        run: |
+          git config --global user.email "ci@mission-control.invalid"
+          git config --global user.name "Mission Control CI"
+          git config --global init.defaultBranch main
       - name: Set up uv + Python 3.12
         uses: astral-sh/setup-uv@v5
         with:
