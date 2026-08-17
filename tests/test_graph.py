@@ -150,3 +150,24 @@ def test_thread_id_state_is_retrievable(target_repo):
     run_via_graph(graph, Task("sim-tid", TaskType.READ_ONLY, "look"), thread_id="fixed-thread")
     snap = graph.get_state({"configurable": {"thread_id": "fixed-thread"}})
     assert snap.values["outcome"] == "completed"
+
+
+def test_summary_detail_keeps_full_summary_and_marks_truncation():
+    from mission_control.graph import _summary_detail, WORKER_SUMMARY_MAX
+
+    # An empty/whitespace summary becomes None (no ledger detail), not "".
+    assert _summary_detail("") is None
+    assert _summary_detail("   \n ") is None
+
+    # A normal multi-paragraph summary (well over the old 500-char clamp) survives whole.
+    body = "## Repository Summary\n\n" + ("mc-smoketest is a minimal repo. " * 40)
+    assert len(body) > 500
+    kept = _summary_detail(body)
+    assert kept == body.strip()
+    assert "truncated" not in kept
+
+    # Only a genuinely oversized summary is cut, and it says so (rather than ending mid-word).
+    huge = "x" * (WORKER_SUMMARY_MAX + 500)
+    cut = _summary_detail(huge)
+    assert cut is not None and len(cut) <= WORKER_SUMMARY_MAX + 40
+    assert cut.endswith("_(result truncated)_")

@@ -310,6 +310,24 @@ def _verify(deps: _Deps, state: RunState) -> dict:
     return out
 
 
+# The worker's summary is the run's headline result (the ledger `detail`, a TEXT
+# column). Keep it whole up to a generous bound instead of a one-sentence clamp;
+# when a summary genuinely overruns, mark it truncated so the control room shows
+# "… (result truncated)" rather than ending mid-word. Error strings (push/guard)
+# keep their own short clamps.
+WORKER_SUMMARY_MAX = 8000
+
+
+def _summary_detail(summary: str, limit: int = WORKER_SUMMARY_MAX) -> str | None:
+    """Clamp a worker summary for the ledger, appending a visible marker when cut."""
+    text = (summary or "").strip()
+    if not text:
+        return None
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n\n… _(result truncated)_"
+
+
 def _verify_block_detail(state: RunState) -> str:
     """A short, human-legible reason a run was blocked by verification (for the ledger)."""
     report = state.get("verify_report") or {}
@@ -541,7 +559,7 @@ def _teardown(deps: _Deps, state: RunState) -> dict:
         elif state.get("guard_override"):
             detail = state["guard_override"][:500]
         else:
-            detail = (state.get("worker_summary") or "")[:500] or None
+            detail = _summary_detail(state.get("worker_summary") or "")
         store.finish(
             run_id,
             status=_terminal_status(
