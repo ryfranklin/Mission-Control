@@ -313,9 +313,25 @@ def _verify(deps: _Deps, state: RunState) -> dict:
         if judge_usage is not None:
             steps.append(judge_usage)  # price the judge into the run's total cost
 
+    # Enrich each per-criterion score with the criterion STATEMENT (the judge returns a
+    # 0-based index) so the surfaced report is self-contained for the UI ("Contrail").
+    if acceptance and isinstance(acceptance.get("per_criterion"), list):
+        for pc in acceptance["per_criterion"]:
+            idx = pc.get("index")
+            if isinstance(idx, int) and 0 <= idx < len(criteria):
+                pc.setdefault("statement", str(criteria[idx]))
+
     status = verify.overall_status(det_status, acceptance, deps.verify)
-    out: dict = {"verify_status": status,
-                 "verify_report": {"checks": checks, "acceptance": acceptance}}
+    report = {"checks": checks, "acceptance": acceptance}
+    # Persist the report so the evaluation survives worktree teardown and can be surfaced
+    # in the run detail. Best-effort: persistence must never change the verdict.
+    store, run_id = _ledger(deps, state)
+    if store is not None:
+        try:
+            store.set_verify(run_id, report)
+        except Exception:  # noqa: BLE001 — additive persistence, never fail the gate on it
+            pass
+    out: dict = {"verify_status": status, "verify_report": report}
     if criteria:
         out["steps"] = steps
     return out

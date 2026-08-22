@@ -67,10 +67,14 @@ class RunDetail(BaseModel):
     subject: Optional[str] = None
     # The per-run Slack profile selected at launch (None = a silent run).
     slack_profile: Optional[str] = None
+    # The verification/evaluation report (deterministic checks + acceptance-criteria judge
+    # scores: per-criterion score + reason + overall grade). None until the verify node
+    # runs (and for sims / skipped verify). Surfaced as the run's "Contrail" evaluation.
+    evaluation: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: RunRow) -> "RunDetail":
-        return cls(**row.__dict__)
+        return cls(**row.__dict__, evaluation=row.verify_json)
 
 
 class RunList(BaseModel):

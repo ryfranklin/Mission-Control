@@ -96,6 +96,11 @@ _DDL = (
     # show what it changed, after the live worktree is gone. Nullable: only a burn
     # that actually changed files gets one; sims and no-change runs stay NULL.
     "ALTER TABLE runs ADD COLUMN IF NOT EXISTS changes_json JSONB",
+    # The pre-gate verification/evaluation report (deterministic checks + the judge's
+    # acceptance-criteria scoring: per-criterion score + reason + an overall grade).
+    # Computed by the verify node and persisted so the UI can surface the evaluation
+    # ("Contrail") after the worktree is gone. Nullable: sims / skipped verify stay NULL.
+    "ALTER TABLE runs ADD COLUMN IF NOT EXISTS verify_json JSONB",
     # A short human description of the task (e.g. the plan unit's title), set at launch
     # so the UI can show what a run is doing while it dispatches — before any worker
     # output or terminal summary. Nullable: standalone/legacy runs may not carry one.
@@ -174,6 +179,9 @@ class RunRow:
     # at apply time and persisted so it survives worktree teardown. None for sims,
     # no-change burns, and rows created before this column.
     changes_json: Optional[dict] = None
+    # The pre-gate verification/evaluation report (deterministic checks + acceptance-
+    # criteria judge scores). None for sims, skipped verify, and pre-column rows.
+    verify_json: Optional[dict] = None
     # A short human description of the task, set at launch (e.g. the plan unit's title),
     # so the UI has a subject to show while the run dispatches. Defaulted for rows /
     # mock stores created before this column.
@@ -305,6 +313,21 @@ class RunStore:
                 ON CONFLICT (run_id) DO UPDATE SET changes_json = EXCLUDED.changes_json
                 """,
                 {"run_id": run_id, "status": STATUS_RUNNING, "changes": Jsonb(changes)},
+            )
+
+    def set_verify(self, run_id: str, report: dict) -> None:
+        """Persist the verification/evaluation report for ``run_id`` (the payload the
+        verify node produces: deterministic checks + acceptance judge scores). Idempotent
+        like :meth:`set_changes` — a re-run of verify re-writes the same report. Additive:
+        touches only ``verify_json``, never the row's status/stamps."""
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO runs (run_id, thread_id, status, cost_usd, created_at, verify_json)
+                VALUES (%(run_id)s, %(run_id)s, %(status)s, 0, now(), %(verify)s)
+                ON CONFLICT (run_id) DO UPDATE SET verify_json = EXCLUDED.verify_json
+                """,
+                {"run_id": run_id, "status": STATUS_RUNNING, "verify": Jsonb(report)},
             )
 
     def finish(
