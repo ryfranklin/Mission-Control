@@ -39,7 +39,7 @@ class _RecordingWorker(StubWorker):
     def __init__(self) -> None:
         self.calls = 0
 
-    def investigate(self, task, workdir) -> WorkerResult:
+    def investigate(self, task, workdir, on_activity=None) -> WorkerResult:
         self.calls += 1
         return super().investigate(task, workdir)
 

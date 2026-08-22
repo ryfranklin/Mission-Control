@@ -28,6 +28,7 @@ L2; Postgres is stood up now via ``docker-compose.yml``.
 
 from __future__ import annotations
 
+import inspect
 import os
 import time
 import uuid
@@ -246,8 +247,18 @@ def _run_worker(deps: _Deps, state: RunState) -> dict:
     cost it incurred is recorded — priced telemetry emitted to the spine and the run's
     cost written to the ledger — BEFORE the failure propagates, so a failed run is never
     silently reported as ``$0``."""
+    # Live progress from inside the worker: push one activity event per model turn to
+    # the custom stream (same channel as priced step metrics). No-op outside the graph.
+    # Passed only to workers that accept it, so a stub/legacy worker is never broken.
     try:
-        result = deps.worker.investigate(_task(state), _worktree(deps, state).path)
+        writer = get_stream_writer()
+    except RuntimeError:
+        writer = None
+    kwargs = {}
+    if writer is not None and "on_activity" in inspect.signature(deps.worker.investigate).parameters:
+        kwargs["on_activity"] = lambda a: writer(live.encode_worker_activity(a))
+    try:
+        result = deps.worker.investigate(_task(state), _worktree(deps, state).path, **kwargs)
     except WorkerError as exc:
         _record_failure_cost(deps, state, getattr(exc, "steps", None))
         raise

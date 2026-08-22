@@ -32,6 +32,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
     TextBlock,
+    ToolUseBlock,
     query,
 )
 
@@ -122,12 +123,14 @@ class SdkWorker:
 
     # -- Worker interface --------------------------------------------------
 
-    def investigate(self, task: Task, workdir: Path) -> WorkerResult:
+    def investigate(self, task: Task, workdir: Path, on_activity=None) -> WorkerResult:
         """Run ``task`` in ``workdir`` and report a :class:`WorkerResult`.
 
-        Synchronous by contract; bridges to the async SDK internally.
+        Synchronous by contract; bridges to the async SDK internally. ``on_activity``
+        (optional) is called once per model turn with a {turn, model, tools, text}
+        dict so a caller can surface live progress; best-effort, never fatal.
         """
-        return asyncio.run(self._investigate(task, Path(workdir)))
+        return asyncio.run(self._investigate(task, Path(workdir), on_activity))
 
     # -- internals ---------------------------------------------------------
 
@@ -166,7 +169,7 @@ class SdkWorker:
             mcp_servers=self._mcp_servers(),
         )
 
-    async def _investigate(self, task: Task, workdir: Path) -> WorkerResult:
+    async def _investigate(self, task: Task, workdir: Path, on_activity=None) -> WorkerResult:
         texts: list[str] = []
         result: ResultMessage | None = None
         model = self.model  # updated to the resolved (dated) id once seen
@@ -193,6 +196,15 @@ class SdkWorker:
                 last_mark = now
                 model = message.model or model
                 texts.extend(b.text for b in message.content if isinstance(b, TextBlock))
+                # Live progress: one activity event per turn (tools invoked + a short
+                # text snippet). Best-effort — a bad callback must never fail the run.
+                if on_activity is not None:
+                    try:
+                        tools = [b.name for b in message.content if isinstance(b, ToolUseBlock)]
+                        snippet = next((b.text.strip() for b in message.content if isinstance(b, TextBlock) and b.text.strip()), "")
+                        on_activity({"turn": len(turn_latencies_ms), "model": model, "tools": tools, "text": snippet[:160]})
+                    except Exception:  # noqa: BLE001 - observability must not break the worker
+                        pass
             elif isinstance(message, ResultMessage):
                 result = message
         total_latency_ms = int((perf_counter() - start) * 1000)
