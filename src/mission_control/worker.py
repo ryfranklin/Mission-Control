@@ -41,14 +41,14 @@ class Worker(Protocol):
     orchestrator detects and gates those changes via git.
     """
 
-    def investigate(self, task: Task, workdir: Path) -> WorkerResult: ...
+    def investigate(self, task: Task, workdir: Path, on_activity=None) -> WorkerResult: ...
 
 
 class StubWorker:
     """Canned worker — no LLM. Read-only tasks touch nothing; side-effectful
     tasks write a single marker file so approval gating has something to gate."""
 
-    def investigate(self, task: Task, workdir: Path) -> WorkerResult:
+    def investigate(self, task: Task, workdir: Path, on_activity=None) -> WorkerResult:
         workdir = Path(workdir)
         # One canned step so telemetry has identical shape to a real worker.
         step = StepUsage(

@@ -35,7 +35,7 @@ from langgraph.types import Command
 
 from .. import project_ref, roles, worktree
 from ..graph import build_run_graph, initial_state, run_tracked, worker_cost_usd
-from ..live import GateWaiting, NodeTransition, StepMetric, stream_run_sync
+from ..live import GateWaiting, NodeTransition, StepMetric, WorkerActivity, stream_run_sync
 from ..runs_store import (
     NOTIFY_COST_THRESHOLD,
     NOTIFY_GATE_AWAITING,
@@ -145,6 +145,8 @@ def _serialize(event) -> dict:
         return {"event": "step_metric", "data": {"event": asdict(event.event)}}
     if isinstance(event, GateWaiting):
         return {"event": "gate_waiting", "data": {"value": event.value}}
+    if isinstance(event, WorkerActivity):
+        return {"event": "worker_activity", "data": {"turn": event.turn, "model": event.model, "tools": event.tools, "text": event.text}}
     return {"event": "message", "data": {"value": str(event)}}
 
 

@@ -28,6 +28,7 @@ from .telemetry import StepEvent
 
 # Tag distinguishing our custom-stream payloads from any other custom events.
 _STEP_METRIC = "step_metric"
+_WORKER_ACTIVITY = "worker_activity"
 
 # Sentinel node key LangGraph uses in the `updates` stream for an interrupt.
 _INTERRUPT_KEY = "__interrupt__"
@@ -62,7 +63,20 @@ class GateWaiting:
     value: Any
 
 
-LiveEvent = Union[NodeTransition, StepMetric, GateWaiting]
+@dataclass
+class WorkerActivity:
+    """Live progress from INSIDE the worker step (one per model turn), so a long
+    run_worker node shows what the agent is doing instead of a silent gap. Carries
+    the turn index, model, the tool names invoked that turn, and a short text
+    snippet. Advisory/observability only — not priced (StepMetric carries cost)."""
+
+    turn: int
+    model: str
+    tools: list
+    text: str
+
+
+LiveEvent = Union[NodeTransition, StepMetric, GateWaiting, WorkerActivity]
 
 
 # -- custom-stream payload contract (shared by emitter + consumer) ---------
@@ -76,9 +90,18 @@ def encode_step_metric(event: StepEvent) -> dict:
     return {"type": _STEP_METRIC, "event": asdict(event)}
 
 
+def encode_worker_activity(activity: dict) -> dict:
+    """Encode a live worker-activity record as a custom-stream payload. ``activity``
+    is a plain dict {turn, model, tools, text}, mirroring encode_step_metric's shape."""
+    return {"type": _WORKER_ACTIVITY, "activity": activity}
+
+
 def _decode_custom(payload: Any) -> Optional[LiveEvent]:
     if isinstance(payload, dict) and payload.get("type") == _STEP_METRIC:
         return StepMetric(event=StepEvent(**payload["event"]))
+    if isinstance(payload, dict) and payload.get("type") == _WORKER_ACTIVITY:
+        a = payload["activity"]
+        return WorkerActivity(turn=a.get("turn", 0), model=a.get("model", ""), tools=a.get("tools", []), text=a.get("text", ""))
     return None
 
 
