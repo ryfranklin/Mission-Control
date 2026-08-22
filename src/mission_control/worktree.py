@@ -64,6 +64,19 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+# Git refuses to `commit` (and to make a `--no-ff` merge commit) without a committer
+# identity, failing with "Author identity unknown" (exit 128). The worker container sets
+# none, so we pass a Mission Control bot identity per-command rather than relying on
+# global/container git config. Override via MC_GIT_AUTHOR_NAME / MC_GIT_AUTHOR_EMAIL; this
+# is the author recorded on the target repo's history.
+_AUTHOR_NAME = os.environ.get("MC_GIT_AUTHOR_NAME", "Mission Control")
+_AUTHOR_EMAIL = os.environ.get("MC_GIT_AUTHOR_EMAIL", "bot@mission-control.local")
+
+
+def _identity_args() -> list[str]:
+    return ["-c", f"user.name={_AUTHOR_NAME}", "-c", f"user.email={_AUTHOR_EMAIL}"]
+
+
 def is_git_repo(target) -> bool:
     """True ONLY when ``target`` is its OWN git work-tree root — never merely a folder
     nested inside an ancestor repository.
@@ -184,7 +197,7 @@ def commit_changes(worktree: Worktree, message: str, *,
         return False
     _git(worktree.path, "add", "-A")
     content_guard.enforce_staged(worktree.path, allow=allow_secrets, audit=audit)
-    _git(worktree.path, "commit", "-m", message)
+    _git(worktree.path, *_identity_args(), "commit", "-m", message)
     return True
 
 
@@ -197,6 +210,7 @@ def merge_into_target(worktree: Worktree, message: str) -> None:
     with _repo_lock(worktree.target_repo):
         _git(
             worktree.target_repo,
+            *_identity_args(),
             "merge",
             "--no-ff",
             "--no-edit",
